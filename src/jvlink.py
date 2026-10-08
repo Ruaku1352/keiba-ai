@@ -127,8 +127,8 @@ ERROR_ADVICE = {
     -302: "利用キーの有効期限切れ",
     -303: "利用キーが未設定",
     -305: "利用規約に同意していない",
-    -402: "ダウンロードしたファイルが異常（サイズ0）。該当ファイルを削除したので再実行してください",
-    -403: "ダウンロードしたファイルが異常（データ内容）。該当ファイルを削除したので再実行してください",
+    -402: "ダウンロードしたファイルが異常（サイズ0）。該当ファイルを削除した",
+    -403: "ダウンロードしたファイルが異常（データ内容）。該当ファイルを削除した",
     -502: "ダウンロード失敗（通信・ディスクエラー、サーバー混雑時のタイムアウト）。時間をおいて再実行",
     -503: "読み込むべきファイルが見つからない。JVOpen からやり直す",
 }
@@ -368,6 +368,9 @@ class FetchResult:
     skipped_files: dict = field(default_factory=dict)  # JVSkip した種別ごとのファイル数
     files_switched: int = 0
     short_records: int = 0
+    files_done: int = 0       # 今回読み終えたファイル数
+    resumed_files: int = 0    # 前回までに読み終えていたので飛ばしたファイル数
+    reopened: int = 0         # エラーで JVOpen し直した回数
     seconds: float = 0.0
 
     def summary(self) -> str:
@@ -376,6 +379,7 @@ class FetchResult:
             f"ダウンロード={self.download_count} 最新ファイル時刻={self.last_file_timestamp}",
             f"保存レコード: {self.records}",
             f"JVSkipしたファイル（種別ごと）: {self.skipped_files}",
+            f"再開で飛ばしたファイル: {self.resumed_files}  開き直し: {self.reopened}回",
             f"短すぎるレコード: {self.short_records}  所要: {self.seconds:.0f}秒",
         ]
         return "\n".join(lines)
@@ -429,13 +433,57 @@ def wait_for_download(client: JVLinkClient, download_count: int, poll_sec: float
         waited += poll_sec
 
 
+class Progress:
+    """読み終えたファイル名を1行ずつ記録する（中断からの再開用）。
+
+    セットアップは数時間かかるので、途中で止まったときに最初から読み直したくない。
+    仕様書の「セットアップデータの中断・再開」は「最後に読み込んだファイル名を保持し、
+    同じパラメータで JVOpen して、そのファイルまで JVSkip する」方式。
+    ここではそれを少し一般化して、読み終えたファイル名の集合を持ち、
+    再開時に集合に含まれるファイルを JVSkip で飛ばす。
+
+    記録は「CSV への書き出し（flush）が終わってから」行う。
+    先にファイル名を記録すると、停電などで書き出し前のレコードが消えたのに
+    「読み終えた」扱いになり、そのファイルのデータが欠けたままになるため。
+
+    進捗ファイルは (dataspec, option, fromtime) ごとに別。完走したら消す。
+    """
+
+    def __init__(self, out_dir: Path, dataspec: str, option: int, fromtime: str):
+        safe = re.sub(r"[^0-9A-Za-z_-]", "_", f"{dataspec}_{option}_{fromtime}")
+        self.path = out_dir / f"progress_{safe}.txt"
+        self.done: set[str] = set()
+        if self.path.exists():
+            self.done = {line.strip() for line in self.path.read_text(encoding="utf-8").splitlines()
+                         if line.strip()}
+
+    def __contains__(self, fname: str) -> bool:
+        return bool(fname) and fname in self.done
+
+    def mark(self, fname: str) -> None:
+        if not fname or fname in self.done:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(fname + "\n")
+        self.done.add(fname)
+
+    def clear(self) -> None:
+        if self.path.exists():
+            self.path.unlink()
+
+
+# JVOpen からやり直せば解消しうるエラー（仕様書の対処に「JVOpen からやりなおす」とあるもの）
+REOPEN_CODES = {-402, -403, -502, -503}
+
+
 def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
           out_dir: str | os.PathLike | None = None,
           record_types: tuple[str, ...] = ("RA", "SE", "HR"),
           client: JVLinkClient | None = None, struct_module: ModuleType | None = None,
           sid: str = "UNKNOWN", retry_sleep_sec: float = 1.0,
-          max_retry_sec: float = 600, sleep=time.sleep, log=print,
-          progress_every: int = 50_000) -> FetchResult:
+          max_retry_sec: float = 600, max_reopen: int = 3, reopen_wait_sec: float = 10.0,
+          sleep=time.sleep, log=print, progress_every: int = 50_000) -> FetchResult:
     """JV-Link から取得して、レコード種別ごとの CSV に追記する。
 
     Parameters
@@ -445,6 +493,12 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
                ※ これは**データの提供時刻**であってレース日ではない。
                  レース日で絞るのは読み込んだ後（jvmap 側）で行う。
     option   : 1=通常（差分更新） / 2=今週 / 4=ダイアログ無しセットアップ（初回のみダイアログ）
+    max_reopen : -402/-403/-502/-503 のとき、自動で JVClose → JVOpen し直す回数。
+                 読み終えたファイルは飛ばすので、やり直しても最初から読み直しにはならない。
+
+    中断からの再開:
+      同じ dataspec / fromtime / option でもう一度実行すると、読み終えたファイルを
+      JVSkip で飛ばして続きから読む（Progress を参照）。
     """
     out_dir = Path(out_dir or config.JV_DATA_DIR)
     struct_module = struct_module or load_struct_module()
@@ -456,78 +510,42 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
 
     writers = {rt: CsvAppender(out_dir / f"{rt}.csv", ["_seq"] + columns_for(rt, struct_module))
                for rt in record_types}
-    # 追記する CSV の通し番号（データ区分の「後から来た方」を判定するのに使う）
-    seq = _next_seq(out_dir, record_types)
+    # 追記する CSV の通し番号（同じ作成日のレコードの前後関係を決めるのに使う）
+    counter = {"seq": _next_seq(out_dir, record_types), "total": 0}
+    progress = Progress(out_dir, dataspec, option, fromtime)
+    if progress.done:
+        log(f"前回の続きから再開します（読み終えたファイル {len(progress.done)} 個を飛ばす）")
 
     result = FetchResult(dataspec, fromtime, option, open_code=0)
     started = time.time()
     client.init(sid)
-    log(f"JVOpen({dataspec!r}, {fromtime!r}, option={option})")
     try:
-        opened = client.open(dataspec, fromtime, option)
-        result.open_code = opened.code
-        result.read_count = opened.read_count
-        result.download_count = opened.download_count
-        result.last_file_timestamp = opened.last_file_timestamp
-
-        if opened.code == -1:
-            log("該当データなし（エラーではありません）")
-            return result
-        if opened.code < 0:
-            raise JVLinkError("JVOpen", opened.code, ERROR_ADVICE.get(opened.code, ""))
-        log(f"  読込対象ファイル {opened.read_count} / ダウンロード {opened.download_count}")
-
-        wait_for_download(client, opened.download_count, sleep=sleep, log=log)
-
-        waited = 0.0
-        total = 0
+        attempt = 0
         while True:
-            code, raw, fname = client.gets()
-
-            if code > 0:
-                waited = 0.0
-                record_type = raw[:2].decode("ascii", errors="replace")
-                if record_type not in writers:
-                    # 1ファイル=1レコード種別なので、残りは読まずに次のファイルへ
-                    result.skipped_files[record_type] = result.skipped_files.get(record_type, 0) + 1
-                    client.skip()
-                    continue
-                if len(raw) < RECORD_LENGTHS[record_type] - 2:
-                    result.short_records += 1
-                parsed = parse_record(raw, struct_module)
-                if parsed is None:
-                    continue
-                _, row = parsed
-                row["_seq"] = seq
-                seq += 1
-                writers[record_type].append(row)
-                result.records[record_type] = result.records.get(record_type, 0) + 1
-                total += 1
-                if total % progress_every == 0:
-                    log(f"  {total:,} 件  {result.records}")
-
-            elif code == -1:          # ファイルの切り替わり。エラーではない
-                result.files_switched += 1
-            elif code == 0:           # 全ファイル読み終わり
+            try:
+                _read_all(client, dataspec, fromtime, option, writers, struct_module,
+                          progress, counter, result, retry_sleep_sec, max_retry_sec,
+                          sleep, log, progress_every)
                 break
-            elif code == -3:          # ダウンロード中。待って再試行（サンプルはここで止まる）
-                if waited >= max_retry_sec:
-                    raise JVLinkError("JVGets", code,
-                                      f"{max_retry_sec:.0f} 秒待ってもダウンロードが終わりません")
-                sleep(retry_sleep_sec)
-                waited += retry_sleep_sec
-            elif code in (-402, -403):
-                client.delete_file(fname)
-                raise JVLinkError("JVGets", code, ERROR_ADVICE[code] + f"（{fname}）")
-            else:
-                raise JVLinkError("JVGets", code, ERROR_ADVICE.get(code, ""))
+            except JVLinkError as e:
+                if e.code not in REOPEN_CODES or attempt >= max_reopen:
+                    raise
+                attempt += 1
+                result.reopened += 1
+                log(f"  {e}\n  → JVClose して開き直します（{attempt}/{max_reopen}回目）")
+                for w in writers.values():
+                    w.flush()
+                client.close()
+                sleep(reopen_wait_sec)
 
-        for w in writers.values():
-            w.flush()
-        _save_state(out_dir, dataspec, result)
+        if result.open_code != -1:
+            for w in writers.values():
+                w.flush()
+            _save_state(out_dir, dataspec, result)
+            progress.clear()  # 完走したので再開用の記録は不要
         return result
     finally:
-        # 途中で例外が出ても、書けた分は残し、必ず JVClose する
+        # 途中で例外が出ても（Ctrl+C を含む）、書けた分は残し、必ず JVClose する
         for w in writers.values():
             try:
                 w.flush()
@@ -535,6 +553,92 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
                 pass
         client.close()
         result.seconds = time.time() - started
+
+
+def _read_all(client, dataspec, fromtime, option, writers, struct_module, progress,
+              counter, result, retry_sleep_sec, max_retry_sec, sleep, log, progress_every):
+    """JVOpen から EOF まで読む（1回分）。"""
+    log(f"JVOpen({dataspec!r}, {fromtime!r}, option={option})")
+    opened = client.open(dataspec, fromtime, option)
+    result.open_code = opened.code
+    result.read_count = opened.read_count
+    result.download_count = opened.download_count
+    result.last_file_timestamp = opened.last_file_timestamp
+
+    if opened.code == -1:
+        log("該当データなし（エラーではありません）")
+        return
+    if opened.code < 0:
+        raise JVLinkError("JVOpen", opened.code, ERROR_ADVICE.get(opened.code, ""))
+    log(f"  読込対象ファイル {opened.read_count} / ダウンロード {opened.download_count}")
+
+    wait_for_download(client, opened.download_count, sleep=sleep, log=log)
+
+    def finish(fname: str) -> None:
+        """1ファイル読み終わり：先に CSV へ書き出してから、読み終えたと記録する。"""
+        if not fname:
+            return
+        for w in writers.values():
+            w.flush()
+        progress.mark(fname)
+        result.files_done += 1
+
+    current = ""   # いま読んでいるファイル名
+    waited = 0.0
+    while True:
+        code, raw, fname = client.gets()
+
+        if code > 0:
+            waited = 0.0
+            if fname != current:          # 次のファイルに入った
+                finish(current)
+                current = fname
+            if fname in progress:         # 前回までに読み終えたファイル
+                result.resumed_files += 1
+                client.skip()
+                current = ""
+                continue
+            record_type = raw[:2].decode("ascii", errors="replace")
+            if record_type not in writers:
+                # 1ファイル=1レコード種別なので、残りは読まずに次のファイルへ
+                result.skipped_files[record_type] = result.skipped_files.get(record_type, 0) + 1
+                client.skip()
+                finish(current)
+                current = ""
+                continue
+            if len(raw) < RECORD_LENGTHS[record_type] - 2:
+                result.short_records += 1
+            parsed = parse_record(raw, struct_module)
+            if parsed is None:
+                continue
+            _, row = parsed
+            row["_seq"] = counter["seq"]
+            counter["seq"] += 1
+            writers[record_type].append(row)
+            result.records[record_type] = result.records.get(record_type, 0) + 1
+            counter["total"] += 1
+            if counter["total"] % progress_every == 0:
+                log(f"  {counter['total']:,} 件  {result.records}  "
+                    f"（ファイル {result.files_done + result.resumed_files}/{opened.read_count}）")
+
+        elif code == -1:          # ファイルの切り替わり。エラーではない
+            result.files_switched += 1
+            finish(current)
+            current = ""
+        elif code == 0:           # 全ファイル読み終わり
+            finish(current)
+            return
+        elif code == -3:          # ダウンロード中。待って再試行（サンプルはここで止まる）
+            if waited >= max_retry_sec:
+                raise JVLinkError("JVGets", code,
+                                  f"{max_retry_sec:.0f} 秒待ってもダウンロードが終わりません")
+            sleep(retry_sleep_sec)
+            waited += retry_sleep_sec
+        elif code in (-402, -403):
+            client.delete_file(fname)
+            raise JVLinkError("JVGets", code, ERROR_ADVICE[code] + f"（{fname}）")
+        else:
+            raise JVLinkError("JVGets", code, ERROR_ADVICE.get(code, ""))
 
 
 def _next_seq(out_dir: Path, record_types) -> int:
@@ -601,6 +705,16 @@ def _cmd_summary(args) -> int:
         if rt == "RA":
             print("  グレードコード:", df["GradeCD"].value_counts().sort_index().to_dict())
             print("  トラックコード:", df["TrackCD"].value_counts().sort_index().to_dict())
+            # 取得期間より明らかに古い開催年のレコード（過去レースの訂正など）を一覧する
+            newest = pd.to_numeric(df["id.Year"], errors="coerce").max()
+            old = df.loc[pd.to_numeric(df["id.Year"], errors="coerce") < newest - 1]
+            if len(old):
+                print(f"  開催年が古いレコード {len(old)} 件（データ作成日が新しければ過去レースの訂正）:")
+                show = old.assign(
+                    作成日=old["head.MakeDate.Year"] + old["head.MakeDate.Month"] + old["head.MakeDate.Day"])
+                cols = ["id.Year", "id.MonthDay", "id.JyoCD", "id.RaceNum", "head.DataKubun",
+                        "作成日", "GradeCD", "RaceInfo.Hondai"]
+                print(show[cols].head(20).to_string(index=False))
         if rt == "SE":
             print("  異常区分:", df["IJyoCD"].value_counts().sort_index().to_dict())
             print("  脚質判定:", df["KyakusituKubun"].value_counts().sort_index().to_dict())

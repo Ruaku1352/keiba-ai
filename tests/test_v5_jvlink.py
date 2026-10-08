@@ -42,19 +42,30 @@ class FakeJVLink:
     script は JVGets が順に返すもののリスト:
       bytes            → 正のレコード（戻り値 = 長さ）
       int（-1,0,-3...）→ その戻り値
-    "files" ごとに区切りたいときは -1 を挟む。
+    ファイルの区切りは -1。ファイル名は区切りごとに F000.jvd, F001.jvd … と変わる
+    （本物の JVGets も読み込み中のファイル名を返す）。
     JVSkip が呼ばれたら、次の -1 まで（＝そのファイルの残り）を読み飛ばす。
+    reopen_scripts を渡すと、2回目以降の JVOpen でその script に差し替わる
+    （エラーで開き直したときに、本物と同じく先頭から読み直す動きを再現する）。
     """
 
     def __init__(self, script, open_ret=(0, 3, 0, "20261008120000"), status_seq=None,
-                 init_ret=0):
+                 init_ret=0, reopen_scripts=None):
+        self.initial = list(script)
         self.script = list(script)
+        self.reopen_scripts = [list(x) for x in (reopen_scripts or [])]
         self.open_ret = open_ret
         self.status_seq = list(status_seq or [])
         self.init_ret = init_ret
         self.calls = []
         self.closed = 0
+        self.opened = 0
         self.deleted = []
+        self.file_index = 0
+
+    @property
+    def fname(self):
+        return f"F{self.file_index:03d}.jvd"
 
     def JVInit(self, sid):
         self.calls.append(("JVInit", sid))
@@ -62,6 +73,10 @@ class FakeJVLink:
 
     def JVOpen(self, dataspec, fromtime, option, a, b, c):
         self.calls.append(("JVOpen", dataspec, fromtime, option))
+        if self.opened > 0:
+            self.script = self.reopen_scripts.pop(0) if self.reopen_scripts else list(self.initial)
+        self.opened += 1
+        self.file_index = 0
         return self.open_ret
 
     def JVStatus(self):
@@ -72,8 +87,12 @@ class FakeJVLink:
             return 0, None, ""
         item = self.script.pop(0)
         if isinstance(item, (bytes, bytearray)):
-            return len(item), memoryview(bytes(item)), "RAxxxx.jvd"
-        return item, None, "RAxxxx.jvd"
+            return len(item), memoryview(bytes(item)), self.fname
+        if item == -1:
+            name = self.fname
+            self.file_index += 1
+            return -1, None, name
+        return item, None, self.fname
 
     def JVSkip(self):
         self.calls.append(("JVSkip",))
@@ -153,13 +172,72 @@ def test_open_accepts_non_tuple_return(tmp_path):
     assert res.open_code == 0
 
 
-def test_corrupt_file_is_deleted(tmp_path):
-    """-402/-403（ダウンロードしたファイルが異常）なら JVFiledelete して例外。"""
+def test_corrupt_file_is_deleted_and_reopened(tmp_path):
+    """-402（ダウンロードしたファイルが異常）なら JVFiledelete して、自動で開き直す。"""
+    fake = FakeJVLink([-402], reopen_scripts=[[b"O1" + b" " * 10, -1, 0]])
+    res = _fetch_no_parse(fake, tmp_path)
+    assert fake.deleted == ["F000.jvd"]
+    assert res.reopened == 1
+    assert fake.opened == 2
+    assert res.skipped_files == {"O1": 1}   # 開き直した後は最後まで読めている
+
+
+def test_corrupt_file_raises_when_reopen_disabled(tmp_path):
     fake = FakeJVLink([-402])
     with pytest.raises(jvlink.JVLinkError, match="-402"):
-        _fetch_no_parse(fake, tmp_path)
-    assert fake.deleted == ["RAxxxx.jvd"]
-    assert fake.closed == 1
+        jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=(),
+                     client=_client(fake), struct_module=object(), max_reopen=0,
+                     sleep=lambda s: None, log=lambda *a: None)
+    assert fake.closed >= 1
+
+
+def test_reopen_gives_up_after_limit(tmp_path):
+    """開き直しても同じエラーが続くなら、上限回数で止める。"""
+    fake = FakeJVLink([-502], reopen_scripts=[[-502]] * 10)
+    with pytest.raises(jvlink.JVLinkError, match="-502"):
+        jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=(),
+                     client=_client(fake), struct_module=object(), max_reopen=2,
+                     sleep=lambda s: None, log=lambda *a: None)
+    assert fake.opened == 3   # 最初の1回 + 開き直し2回
+
+
+def test_progress_file_records_finished_files_and_is_cleared(tmp_path):
+    """読み終えたファイルが記録され、完走したら記録が消えること。"""
+    fake = FakeJVLink([b"O1" + b" " * 10, -1, b"O2" + b" " * 10, -1, 0])
+    _fetch_no_parse(fake, tmp_path)
+    assert not list(tmp_path.glob("progress_*.txt"))   # 完走したので消えている
+
+
+def test_resume_skips_finished_files(tmp_path):
+    """途中で止まったら、次は読み終えたファイルを飛ばして続きから読むこと。"""
+    files = [b"O1" + b" " * 10, -1, b"O2" + b" " * 10, -1, b"O3" + b" " * 10, -1, 0]
+    # 1回目: 1つ目を読み終えて、2つ目に入ったところで通信エラー（開き直しなし）
+    first = FakeJVLink(files[:2] + [-502])
+    with pytest.raises(jvlink.JVLinkError):
+        jvlink.fetch(fromtime="19860101000000", option=4, out_dir=tmp_path, record_types=(),
+                     client=_client(first), struct_module=object(), max_reopen=0,
+                     sleep=lambda s: None, log=lambda *a: None)
+    progress = list(tmp_path.glob("progress_*.txt"))
+    assert len(progress) == 1
+    assert progress[0].read_text(encoding="utf-8").split() == ["F000.jvd"]
+
+    # 2回目: 同じパラメータで再実行 → 1つ目は飛ばし、2つ目以降を読む
+    second = FakeJVLink(files)
+    res = jvlink.fetch(fromtime="19860101000000", option=4, out_dir=tmp_path, record_types=(),
+                       client=_client(second), struct_module=object(),
+                       sleep=lambda s: None, log=lambda *a: None)
+    assert res.resumed_files == 1
+    assert res.skipped_files == {"O2": 1, "O3": 1}   # O1 は種別を見る前に飛ばされた
+    assert not list(tmp_path.glob("progress_*.txt"))
+
+
+def test_resume_is_per_parameters(tmp_path):
+    """fromtime や option が違う取得の記録は、別の取得の再開に使われないこと。"""
+    p1 = jvlink.Progress(tmp_path, "RACE", 4, "19860101000000")
+    p1.mark("F000.jvd")
+    p2 = jvlink.Progress(tmp_path, "RACE", 1, "20260901000000")
+    assert "F000.jvd" not in p2
+    assert "F000.jvd" in jvlink.Progress(tmp_path, "RACE", 4, "19860101000000")
 
 
 def test_waits_for_download_before_reading(tmp_path):
@@ -200,8 +278,11 @@ def test_gitignore_excludes_jv_data():
 # 合成の生データ（jvlink が保存する CSV と同じ列名・すべて文字列）
 # ===========================================================================
 def _race_key(year, jyo, kai, nichi, race_no, monthday):
+    """レースのキーと、データ作成年月日（ここではレース当日にしておく）。"""
     return {"id.Year": f"{year:04d}", "id.MonthDay": monthday, "id.JyoCD": jyo,
-            "id.Kaiji": f"{kai:02d}", "id.Nichiji": f"{nichi:02d}", "id.RaceNum": f"{race_no:02d}"}
+            "id.Kaiji": f"{kai:02d}", "id.Nichiji": f"{nichi:02d}", "id.RaceNum": f"{race_no:02d}",
+            "head.MakeDate.Year": f"{year:04d}", "head.MakeDate.Month": monthday[:2],
+            "head.MakeDate.Day": monthday[2:]}
 
 
 def _time_str(seconds: float) -> str:
@@ -372,6 +453,66 @@ def test_kubun_zero_deletes():
     assert out.empty
 
 
+def test_kubun_newer_make_date_wins_regardless_of_fetch_order():
+    """訂正版（作成日が新しい）を先に取得し、元の版（作成日が古い）を後から取得しても、
+    訂正版が残ること。
+
+    直近1ヶ月を先に取ってから全期間のセットアップをすると、この順番で届く。
+    取得順（_seq）で並べていた旧実装では、古い元の版が訂正版を上書きしていた。
+    """
+    base = _race_key(1987, "05", 4, 2, 11, "1004")
+    df = pd.DataFrame([
+        {**base, "_seq": "0", "head.DataKubun": "7", "head.MakeDate.Year": "2026",
+         "head.MakeDate.Month": "09", "head.MakeDate.Day": "15", "v": "訂正版"},
+        {**base, "_seq": "1", "head.DataKubun": "7", "head.MakeDate.Year": "1987",
+         "head.MakeDate.Month": "10", "head.MakeDate.Day": "05", "v": "元の版"},
+    ])
+    out = jvmap.apply_data_kubun(df, jvmap.RACE_KEY, jvmap.RACE_KUBUN_PRIORITY)
+    assert list(out["v"]) == ["訂正版"]
+
+
+def test_kubun_same_make_date_falls_back_to_fetch_order():
+    """作成日が同じなら、取得した順（後の方）を採ること。"""
+    base = _race_key(2026, "05", 4, 2, 11, "1004")
+    md = {"head.MakeDate.Year": "2026", "head.MakeDate.Month": "10", "head.MakeDate.Day": "05"}
+    df = pd.DataFrame([
+        {**base, **md, "_seq": "5", "head.DataKubun": "7", "v": "後"},
+        {**base, **md, "_seq": "2", "head.DataKubun": "7", "v": "先"},
+    ])
+    out = jvmap.apply_data_kubun(df, jvmap.RACE_KEY, jvmap.RACE_KUBUN_PRIORITY)
+    assert list(out["v"]) == ["後"]
+
+
+def test_build_reports_races_without_horses():
+    """RA だけ届いた過去レース（訂正など）は、どこで何件落ちたかを報告すること。"""
+    raw = make_raw(n_races=10, years=1)
+    extra = raw["RA"].iloc[[0, 1, 2]].copy()
+    extra["id.Year"] = "1987"            # SE が届いていない過去レースの RA
+    extra["_seq"] = ["900", "901", "902"]
+    raw["RA"] = pd.concat([raw["RA"], extra], ignore_index=True)
+
+    ds = jvmap.build_dataset(raw=raw)
+    steps = dict(ds.report.steps)
+    assert steps["RA のうち馬のデータが無く除外したレース"] == 3
+    assert steps["最終レース数"] == 10
+    assert any("1987: 3" in what for what, n in ds.report.steps if n is None)
+    assert steps["最終レースのうち 3連単払戻あり"] == 10
+
+
+def test_jump_grade_labels_match_kaggle():
+    """障害重賞は Kaggle と同じ「J.G1」表記。"""
+    assert [jvmap.GRADE_LABELS[c] for c in "FGH"] == ["J.G1", "J.G2", "J.G3"]
+
+
+def test_no_runtime_warning_when_run_as_module():
+    """`py -m src.jvlink` で RuntimeWarning（二重読み込みの警告）が出ないこと。"""
+    import subprocess
+    r = subprocess.run([sys.executable, "-W", "error::RuntimeWarning", "-m", "src.jvlink", "--help"],
+                       cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "RuntimeWarning" not in r.stderr
+
+
 def test_cancelled_and_partial_races_are_excluded():
     """中止(9)と、3着/5着までしか無い速報(3/4)のレースは学習に使わない。"""
     raw = make_raw(n_races=12, years=1)
@@ -414,9 +555,20 @@ def test_payout_irregular_flags_exclude():
     hr.loc[1, "TokubaraiFlag[9]"] = "1"
     hr.loc[2, "HenkanFlag[9]"] = "1"
     hr.loc[3, "HenkanFlag[1]"] = "1"   # 単勝の返還は3連単に関係ない
-    pay = jvmap.prepare_payout(hr)
+    pay = jvmap.prepare_payout(hr, exclude_irregular=True)
     assert pay["3連単払戻"].isna().sum() == 3
     assert pay.loc[3, "3連単払戻"] > 0
+
+
+def test_payout_keeps_irregular_by_default():
+    """既定では不成立・特払・返還があっても除外しない（v4 と条件を揃える）。"""
+    raw = make_raw(n_races=6, years=1)
+    hr = raw["HR"].copy()
+    hr.loc[2, "HenkanFlag[9]"] = "1"
+    report = jvmap.BuildReport()
+    pay = jvmap.prepare_payout(hr, report)
+    assert pay["3連単払戻"].notna().all()
+    assert ("HR 3連単 不成立・特払・返還あり（除外しない）", 1) in report.steps
 
 
 def test_payout_uses_hundred_yen_units():
@@ -772,8 +924,9 @@ def test_sdk_fetch_writes_csv_and_maps(tmp_path):
     h = horses.iloc[0]
     assert h["着順"] == 3 and h["タイム"] == pytest.approx(144.5)
     assert h["場体重増減"] == -6 and h["単勝オッズ"] == pytest.approx(12.3)
-    pay = jvmap.prepare_payout(raw["HR"])
+    pay = jvmap.prepare_payout(raw["HR"], exclude_irregular=True)
     assert np.isnan(pay.loc[0, "3連単払戻"])  # 特払フラグで除外
+    assert jvmap.prepare_payout(raw["HR"]).loc[0, "3連単払戻"] == 123450  # 既定は除外しない
 
 
 def test_sdk_fetch_appends_and_keeps_order(tmp_path):

@@ -52,12 +52,12 @@ CENTRAL_JYO = set(JYO_NAMES)
 
 # 2003.グレードコード -> Kaggle の「リステッド・重賞競走」列の表記
 #   A=G1 B=G2 C=G3 D=グレードのない重賞（Kaggle の "G" に相当）
-#   F/G/H = 障害の J・G1/J・G2/J・G3、L = リステッド、E = 重賞以外の特別
+#   F/G/H = 障害の J.G1/J.G2/J.G3（Kaggle と同じ表記）、L = リステッド、E = 重賞以外の特別
 # 障害重賞とリステッドは config.GRADED_VALUES に含まれないので「重賞」扱いにならない。
 # 詳しくは README v5 の「グレードの対応」を参照（Kaggle 側の定義を確認する手順あり）。
 GRADE_LABELS = {
     "A": "G1", "B": "G2", "C": "G3", "D": "G",
-    "F": "J・G1", "G": "J・G2", "H": "J・G3",
+    "F": "J.G1", "G": "J.G2", "H": "J.G3",
     "L": "L",
 }
 # 障害重賞を平地と同じ G1/G2/G3 として数えたい場合に使う対応（既定では使わない）
@@ -206,23 +206,43 @@ def load_raw(data_dir: str | os.PathLike | None = None,
     return out
 
 
+def _make_date_key(df: pd.DataFrame) -> pd.Series:
+    """レコードヘッダーの「データ作成年月日」を YYYYMMDD の整数にする（無ければ 0）。"""
+    cols = ["head.MakeDate.Year", "head.MakeDate.Month", "head.MakeDate.Day"]
+    if not all(c in df.columns for c in cols):
+        return pd.Series(0, index=df.index)
+    text = df[cols[0]].astype(str).str.zfill(4) + df[cols[1]].astype(str).str.zfill(2) \
+        + df[cols[2]].astype(str).str.zfill(2)
+    return pd.to_numeric(text, errors="coerce").fillna(0).astype("int64")
+
+
 def apply_data_kubun(df: pd.DataFrame, key_cols: list[str],
                      priority: dict[str, int]) -> pd.DataFrame:
     """データ区分のルールで重複を解消し、1キー1行にする。
 
-    届いた順（_seq の昇順）に1行ずつ見て:
+    **データ作成年月日の古い順**（同じ日なら取得した順 _seq）に1行ずつ見て:
       - 区分 "0"（該当レコード削除）→ そのキーの既存行を消す
       - それ以外 → 既存より優先度が**同じか高ければ**置き換える
-                  （同じ優先度なら後から届いた方が訂正版なので新しい方を採る）
+                  （同じ優先度なら作成日の新しい方＝訂正版を採る）
 
-    なぜ「最後の行を残す」だけではダメか:
-      通常データ（option=1）の差分取得で、月曜確定(7)の後に別ファイル経由で
-      速報(3)が遅れて届くことがありうる。その場合に確定版を速報で上書きしないよう、
-      優先度で比べる。
+    なぜ取得した順（_seq）だけで並べないのか:
+      取得の順番は提供の順番と一致しない。例えば直近1ヶ月を先に取ってから
+      全期間のセットアップをすると、「1987年のレースの訂正版（今月作成）」が先に入り、
+      「1987年のレースの元の版（1987年作成）」が後から届く。取得順で並べると、
+      同じ区分7どうしなので古い元の版が訂正版を上書きしてしまう。
+      ヘッダーのデータ作成年月日で並べれば、取得の順番に関係なく新しい版が勝つ。
+
+    なぜ「作成日が最新のものを残す」だけにしないのか:
+      確定(7)の後に、作成日の新しい速報(3)が別ファイルで届くことがありうる。
+      確定版を速報で上書きしないよう、優先度でも比べる。
     """
     if df.empty:
         return df
-    df = df.sort_values("_seq", key=lambda s: pd.to_numeric(s, errors="coerce"), kind="mergesort")
+    order = pd.DataFrame({
+        "date": _make_date_key(df).to_numpy(),
+        "seq": pd.to_numeric(df["_seq"], errors="coerce").fillna(-1).to_numpy(),
+    })
+    df = df.iloc[np.lexsort((order["seq"].to_numpy(), order["date"].to_numpy()))]
     keys = list(zip(*(df[c].to_numpy() for c in key_cols)))
     kubun = df["head.DataKubun"].to_numpy()
 
@@ -272,8 +292,13 @@ class BuildReport:
     def add(self, what: str, n: int) -> None:
         self.steps.append((what, n))
 
+    def note(self, text: str) -> None:
+        """件数ではない補足（内訳など）を1行足す。"""
+        self.steps.append((text, None))
+
     def __str__(self) -> str:
-        return "\n".join(f"  {what:<40} {n:>12,}" for what, n in self.steps)
+        return "\n".join(f"  {what:<40} {n:>12,}" if n is not None else f"      └ {what}"
+                         for what, n in self.steps)
 
 
 def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
@@ -400,11 +425,13 @@ def prepare_pace(races: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
-                   exclude_irregular: bool = True) -> pd.DataFrame:
+                   exclude_irregular: bool = False) -> pd.DataFrame:
     """trifecta.build_race_table() が期待する払戻表（100円あたり）を作る。
 
     exclude_irregular=True なら、その券種で不成立・特払・返還があったレースの払戻を NaN にする
-    （検証から外れる）。依頼書の指示どおり。
+    （検証から外れる）。既定は False（除外しない）。v4（Kaggle）では除外していなかったので、
+    比較の条件を揃えるため（開発者の判断）。
+    なお不成立・特払で組番が "000000" のときは、除外の設定に関係なく NaN になる（当たり目が無い）。
     同着で的中組が複数ある場合は、1番目の組の払戻を使う（Kaggle 版も1列だった）。
     """
     report = report or BuildReport()
@@ -421,12 +448,14 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
         n_hits = sum((hr[f"{prefix}[{i}].Kumi"].astype(str).str.strip()
                       .pipe(lambda s: ~s.isin({"", "000000"}))).astype(int)
                      for i in range(1, 4))
+        i = FLAG_INDEX[kind]
+        irregular = ((hr[f"FuseirituFlag[{i}]"] == "1") | (hr[f"TokubaraiFlag[{i}]"] == "1")
+                     | (hr[f"HenkanFlag[{i}]"] == "1"))
         if exclude_irregular:
-            i = FLAG_INDEX[kind]
-            irregular = ((hr[f"FuseirituFlag[{i}]"] == "1") | (hr[f"TokubaraiFlag[{i}]"] == "1")
-                         | (hr[f"HenkanFlag[{i}]"] == "1"))
             report.add(f"HR {kind} 不成立・特払・返還で除外", int(irregular.sum()))
             pay = pay.where(~irregular)
+        else:
+            report.add(f"HR {kind} 不成立・特払・返還あり（除外しない）", int(irregular.sum()))
         out[f"{kind}払戻"] = pay.astype("float64").to_numpy()
         out[f"{kind}的中組数"] = np.asarray(n_hits)
     return out
@@ -458,7 +487,7 @@ def build_dataset(data_dir: str | os.PathLike | None = None,
                   raw: dict[str, pd.DataFrame] | None = None,
                   start: str | None = None, end: str | None = None,
                   jump_as_flat: bool = False,
-                  exclude_irregular_payout: bool = True) -> JVDataset:
+                  exclude_irregular_payout: bool = False) -> JVDataset:
     """生 CSV から、既存パイプラインに渡せる3つの表を作る。
 
     start / end（"YYYY-MM-DD"）でレース日を絞れる。JVOpen は「提供時刻」でしか
@@ -473,11 +502,31 @@ def build_dataset(data_dir: str | os.PathLike | None = None,
     horses = prepare_horses(raw["SE"], races, report)
     payout = prepare_payout(raw["HR"], report, exclude_irregular=exclude_irregular_payout)
 
+    # RA はあるのに、使える馬が1頭も残らなかったレース（＝ここで落ちる）
+    with_horses = set(horses["レースID"])
+    dropped = races.loc[~races["レースID"].isin(with_horses)]
+    report.add("RA のうち馬のデータが無く除外したレース", len(dropped))
+    if len(dropped):
+        by_year = dropped["レース日付"].dt.year.value_counts().sort_index().to_dict()
+        report.note(f"開催年の内訳: {by_year}")
+        report.note("SE が届いていない（過去レースの訂正で RA だけ届いた等）か、"
+                    "全馬が取消・除外・中止だったレース")
+
     if start is not None:
         horses = horses.loc[horses["レース日付"] >= pd.Timestamp(start)]
     if end is not None:
         horses = horses.loc[horses["レース日付"] <= pd.Timestamp(end)]
     races = races.loc[races["レースID"].isin(set(horses["レースID"]))]
+    report.add("最終レース数", len(races))
+
+    # 払戻の有無の内訳（検証に使えるのは 3連単払戻があるレースだけ）
+    pay = payout.set_index("レースID")["3連単払戻"]
+    ids = races["レースID"]
+    no_hr = int((~ids.isin(pay.index)).sum())
+    no_pay = int(ids.isin(pay.index).sum() - pay.reindex(ids).notna().sum())
+    report.add("最終レースのうち 3連単払戻あり", len(ids) - no_hr - no_pay)
+    if no_hr or no_pay:
+        report.note(f"払戻なしの内訳: HR が未着 {no_hr} / 不成立・特払・返還など {no_pay}")
 
     return JVDataset(
         race_result=horses.reset_index(drop=True),

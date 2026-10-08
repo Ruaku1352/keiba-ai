@@ -20,7 +20,7 @@ from . import config, jvmap
 
 def _build(args) -> jvmap.JVDataset:
     ds = jvmap.build_dataset(args.data, jump_as_flat=args.jump_as_flat,
-                             exclude_irregular_payout=not args.keep_irregular)
+                             exclude_irregular_payout=args.exclude_irregular)
     return ds
 
 
@@ -67,9 +67,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="py -m src.v5")
     parser.add_argument("--data", default=None, help="JV-Data CSV の場所（既定: data/jvlink）")
     parser.add_argument("--jump-as-flat", action="store_true",
-                        help="障害重賞(J・G1〜3)を平地と同じ G1〜3 として数える")
+                        help="障害重賞(J.G1〜3)を平地と同じ G1〜3 として数える")
+    parser.add_argument("--exclude-irregular", action="store_true",
+                        help="不成立・特払・返還のあったレースを検証から外す（既定は外さない＝v4と同じ）")
     parser.add_argument("--keep-irregular", action="store_true",
-                        help="不成立・特払・返還のあったレースも検証に含める")
+                        help="（既定の動作と同じ。互換のために残してある）")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("build").set_defaults(func=_cmd_build)
