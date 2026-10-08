@@ -3,3 +3,8 @@ numpy>=1.24
 lightgbm>=4.0
 matplotlib>=3.7
 pytest>=7.0
+# v5（JRA-VAN）: 40年分の SE を文字列で読むので、pyarrow があると pandas 3 の
+# 文字列列が省メモリな形式になる（無くても動くがメモリを数倍使う）
+pyarrow>=14.0
+# JV-Link（COM）は Windows 専用
+pywin32>=306; sys_platform == "win32"

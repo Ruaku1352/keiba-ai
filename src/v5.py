@@ -1,0 +1,89 @@
+"""v5 の実行入口（Windows で1コマンドずつ確認するため）。
+
+    py -m src.v5 build                 保存済み CSV を変換して中身を確認する
+    py -m src.v5 grades                年 × 格付けのレース数（Kaggle 側との突き合わせ用）
+    py -m src.v5 validate              v4 と同じ時系列CVを回し、v4 と比較する
+    py -m src.v5 validate --ablation   公式脚質特徴量の有無で AUC も比べる（時間は約2倍）
+
+取得（JV-Link を叩く部分）は `py -m src.jvlink` 側。
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+from . import config, jvmap
+
+
+def _build(args) -> jvmap.JVDataset:
+    ds = jvmap.build_dataset(args.data, jump_as_flat=args.jump_as_flat,
+                             exclude_irregular_payout=not args.keep_irregular)
+    return ds
+
+
+def _cmd_build(args) -> int:
+    ds = _build(args)
+    print(ds.summary())
+    rr = ds.race_result
+    print("\n  列:", list(rr.columns))
+    print("\n  先頭3行:")
+    with pd.option_context("display.max_columns", 12, "display.width", 200):
+        print(rr.head(3))
+    return 0
+
+
+def _cmd_grades(args) -> int:
+    ds = _build(args)
+    with pd.option_context("display.max_rows", 100):
+        print(jvmap.grade_count_by_year(ds.race_result))
+    return 0
+
+
+def _cmd_validate(args) -> int:
+    from . import validate
+
+    ds = _build(args)
+    folds = validate.V5_FOLDS[: args.folds] if args.folds else validate.V5_FOLDS
+    out = validate.run_v5(ds, folds=folds, since=args.since, ablation=args.ablation)
+
+    # 結果を CSV にも残す（data/ 配下なので git には入らない）
+    save = Path(args.data or config.JV_DATA_DIR) / "v5_results"
+    save.mkdir(parents=True, exist_ok=True)
+    out["fold_summary"].to_csv(save / "fold_summary.csv", index=False, encoding="utf-8-sig")
+    out["grade_table"].to_csv(save / "grade_table.csv", index=False, encoding="utf-8-sig")
+    out["comparison"].to_csv(save / "comparison_v4.csv", index=False, encoding="utf-8-sig")
+    out["style_importance"].to_csv(save / "style_importance.csv", index=False, encoding="utf-8-sig")
+    pd.Series(out["recent"]).to_csv(save / "recent_check.csv", encoding="utf-8-sig")
+    if "ablation" in out:
+        out["ablation"].to_csv(save / "ablation.csv", index=False, encoding="utf-8-sig")
+    print(f"\n結果を保存しました: {save}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="py -m src.v5")
+    parser.add_argument("--data", default=None, help="JV-Data CSV の場所（既定: data/jvlink）")
+    parser.add_argument("--jump-as-flat", action="store_true",
+                        help="障害重賞(J・G1〜3)を平地と同じ G1〜3 として数える")
+    parser.add_argument("--keep-irregular", action="store_true",
+                        help="不成立・特払・返還のあったレースも検証に含める")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("build").set_defaults(func=_cmd_build)
+    sub.add_parser("grades").set_defaults(func=_cmd_grades)
+
+    p = sub.add_parser("validate")
+    p.add_argument("--since", default="2021-08-01")
+    p.add_argument("--ablation", action="store_true")
+    p.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか（動作確認用）")
+    p.set_defaults(func=_cmd_validate)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

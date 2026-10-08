@@ -6,6 +6,9 @@ Kaggle の JRA データセットはカラム名の表記ゆれがあるため�
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -19,14 +22,32 @@ CORNER_CSV = f"{DATA_DIR}/20020615-20210731_corner_passing_order.csv"
 
 
 # ---------------------------------------------------------------------------
+# JRA-VAN（v5以降。Windows ローカルで使う）
+# ---------------------------------------------------------------------------
+# SDK の展開先。**SDK のファイルはリポジトリに入れない**（公開リポジトリのため、
+# コミットすると JRA システムサービスの著作物の再配布になる）。
+# 環境変数 JVSDK_DIR があればそれを優先し、なければ開発者の想定パスを使う。
+JVSDK_DIR = os.environ.get(
+    "JVSDK_DIR", r"C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
+)
+# SDK 内の Python 版構造体の相対位置
+JVSDK_STRUCT_RELPATH = Path("JV-Data構造体") / "Python版" / "JVData_Struct.py"
+
+# 取得した JV-Data の保存先。**再配布禁止なので .gitignore 済み**
+JV_DATA_DIR = os.environ.get("JV_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data" / "jvlink"))
+
+
+# ---------------------------------------------------------------------------
 # 論理名 -> 実カラム名の候補（先に見つかったものを採用する）
 # ---------------------------------------------------------------------------
 COLUMN_CANDIDATES: dict[str, list[str]] = {
     "race_id": ["レースID", "レースキー", "race_id"],
     "date": ["レース日付", "年月日", "日付"],
     "horse": ["馬名", "血統登録番号", "馬ID"],
-    "jockey": ["騎手", "騎手名"],
-    "trainer": ["調教師", "調教師名"],
+    # 末尾の「〜コード」は JRA-VAN 用。Kaggle には無い列なので、
+    # 先頭の候補が見つかる Kaggle データの挙動は変わらない。
+    "jockey": ["騎手", "騎手名", "騎手コード"],
+    "trainer": ["調教師", "調教師名", "調教師コード"],
     "rank": ["着順"],
     "post": ["馬番"],
     "bracket": ["枠番"],

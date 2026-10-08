@@ -124,6 +124,43 @@ def past_conditional_mean(df: pd.DataFrame, keys: list[str], value: pd.Series,
     return mean.where(n >= min_count).astype("float32")
 
 
+def past_count_excluding_race(df: pd.DataFrame, keys: list[str], race_col: str) -> pd.Series:
+    """自分より前の行数。ただし**同じレースの行は自分より前でも数えない**。
+
+    なぜ必要か:
+      調教師は1レースに複数頭を出すことがある。cumcount() のままだと、
+      同じレースで先に並んでいる同厩馬の行が「過去」として数えられてしまう。
+      それはそのレースの結果を見ているのと同じでリークになる
+      （ペースで _race_frame を使ったのと同じ種類の問題）。
+
+    仕組み:
+      (キー単位の累積) - (キー×レース単位の累積) = 前のレースまでの分
+      行が「日付→レースID」順に並んでいれば、同じレースの行はキーの中で連続するので、
+      引き算で「今のレースの分」だけがきれいに消える。
+    """
+    whole = df.groupby(keys, observed=True, sort=False).cumcount()
+    same_race = df.groupby(keys + [race_col], observed=True, sort=False).cumcount()
+    return whole - same_race
+
+
+def past_sum_excluding_race(df: pd.DataFrame, keys: list[str], value: pd.Series,
+                            race_col: str) -> pd.Series:
+    """自分より前の合計。同じレースの行は含めない（past_count_excluding_race と同じ考え方）。"""
+    tmp = value.fillna(0)
+    whole = tmp.groupby(_grouper(df, keys), observed=True, sort=False).cumsum()
+    same_race = tmp.groupby(_grouper(df, keys + [race_col]), observed=True, sort=False).cumsum()
+    return whole - same_race
+
+
+def past_rate_excluding_race(df: pd.DataFrame, keys: list[str], value: pd.Series,
+                             race_col: str, min_count: int = 1) -> pd.Series:
+    """同じレースを除いた過去の率。1レースに同じキーが複数行ありうるキー（調教師など）用。"""
+    cnt = past_count_excluding_race(df, keys, race_col)
+    tot = past_sum_excluding_race(df, keys, value, race_col)
+    rate = tot / cnt.replace(0, np.nan)
+    return rate.where(cnt >= min_count)
+
+
 def label_encode(s: pd.Series) -> pd.Series:
     """groupby キー用に文字列/カテゴリを整数コード化する（速度・メモリ対策）。"""
     if isinstance(s.dtype, pd.CategoricalDtype):

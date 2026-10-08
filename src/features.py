@@ -149,12 +149,17 @@ def add_jockey_features(df: pd.DataFrame, strict_daily_lag: bool = False) -> pd.
     win = (df[rank] == 1).astype("float32")
     df["_jockey_code"] = _label_encode(df[jockey])
 
+    # 騎手は1レース1頭なので本来は同一レースの重複は起きないが、
+    # データの誤りに備えて調教師と同じくレース単位で除外する版を使う
+    race_id = cols["race_id"]
     if strict_daily_lag:
         df["騎手通算勝率"] = _daily_lagged_rate(df, ["_jockey_code"], win, date)
     else:
-        df["騎手通算勝率"] = _past_rate(df, ["_jockey_code"], win).astype("float32")
+        df["騎手通算勝率"] = leakfree.past_rate_excluding_race(
+            df, ["_jockey_code"], win, race_id).astype("float32")
 
-    df["騎手通算騎乗数"] = _past_count(df, ["_jockey_code"]).astype("int32")
+    df["騎手通算騎乗数"] = leakfree.past_count_excluding_race(
+        df, ["_jockey_code"], race_id).astype("int32")
     df[f"騎手直近{config.JOCKEY_RECENT_WINDOW}走勝率"] = _past_window_mean(
         df, ["_jockey_code"], win, config.JOCKEY_RECENT_WINDOW
     )
@@ -182,12 +187,17 @@ def add_trainer_features(df: pd.DataFrame, strict_daily_lag: bool = False) -> pd
     win = (df[rank] == 1).astype("float32")
     df["_trainer_code"] = _label_encode(df[trainer])
 
+    # 調教師は1レースに複数頭を出すので、同じレースの同厩馬の結果を「過去」に
+    # 含めないよう、レース単位で除外する版を使う（v5で修正。v1〜v4では漏れていた）
+    race_id = cols["race_id"]
     if strict_daily_lag:
         df["調教師通算勝率"] = _daily_lagged_rate(df, ["_trainer_code"], win, date)
     else:
-        df["調教師通算勝率"] = _past_rate(df, ["_trainer_code"], win).astype("float32")
+        df["調教師通算勝率"] = leakfree.past_rate_excluding_race(
+            df, ["_trainer_code"], win, race_id).astype("float32")
 
-    df["調教師通算出走数"] = _past_count(df, ["_trainer_code"]).astype("int32")
+    df["調教師通算出走数"] = leakfree.past_count_excluding_race(
+        df, ["_trainer_code"], race_id).astype("int32")
     return df
 
 
@@ -280,8 +290,17 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
 
     # 依頼A：脚質・展開（ペースの想定に使うので先に計算する）
     if corner_df is not None:
+        # Kaggle：通過順の文字列をパースした表を結合する
         df = corner_mod.attach_corner_position(df, corner_df)
         df = corner_mod.add_running_style_features(df)
+    elif "_4コーナー順位" in df.columns:
+        # JRA-VAN：SE に数値で入っている4コーナー順位をそのまま使う（jvmap が作る列）
+        df = corner_mod.attach_corner_from_columns(df)
+        df = corner_mod.add_running_style_features(df)
+
+    # JRA-VAN の公式脚質判定（過去走だけで集計）
+    if "_脚質判定" in df.columns:
+        df = corner_mod.add_official_style_features(df)
 
     # 依頼B：ペース
     if lap_df is not None:
@@ -330,6 +349,7 @@ def feature_columns(df: pd.DataFrame, include_odds: bool = False) -> list[str]:
     from . import corner as corner_mod
     from . import pace as pace_mod
     engineered += corner_mod.running_style_feature_columns()
+    engineered += corner_mod.official_style_feature_columns()
     engineered += pace_mod.pace_feature_columns()
 
     result = [cols[k] for k in base_logical if k in cols]

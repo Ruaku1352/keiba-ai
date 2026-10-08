@@ -2,3 +2,14 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 *.csv
+
+# --- JRA-VAN（再配布禁止。公開リポジトリなので絶対にコミットしない）---
+# 取得したデータ
+data/
+*.jvd
+# SDK 一式（構造体・仕様書・サンプル）。SDK は JVSDK_DIR から実行時に読み込む
+JVData_Struct.py
+JRA-VAN Data Lab.*/
+JVDTLABSDK*.zip
+JV-Data仕様書*
+JV-Link*.pdf

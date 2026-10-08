@@ -154,6 +154,74 @@ def attach_corner_position(df: pd.DataFrame, corner_df: pd.DataFrame,
     return df
 
 
+def attach_corner_from_columns(df: pd.DataFrame, rank_col: str = "_4コーナー順位",
+                               field_size_col: str = "公式出走頭数") -> pd.DataFrame:
+    """JRA-VAN 用：SE の4コーナー順位（数値）から4角相対位置を作る。
+
+    Kaggle 版は通過順の文字列をパースしていたが、JRA-VAN は馬ごとの順位が
+    数値で直接入っているのでパースは不要。ここから先（相対位置 → 脚質スコア）は
+    attach_corner_position() と同じ列を作るので、下流のロジックはそのまま使える。
+
+    分母の出走頭数は RA の公式値を優先する。race_result 側の行数で数えると、
+    競走中止で除いた馬のぶん頭数が減り、相対位置が1を超えることがあるため。
+    """
+    cols = config.resolve_columns(df)
+    race_id, post = cols["race_id"], cols["post"]
+
+    df = df.copy()
+    rank_in_corner = pd.to_numeric(df[rank_col], errors="coerce").astype("float32")
+    rank_in_corner = rank_in_corner.where(rank_in_corner > 0)  # 00 は「通過していない」
+
+    if field_size_col in df.columns:
+        n_runners = pd.to_numeric(df[field_size_col], errors="coerce")
+    else:
+        n_runners = df.groupby(race_id, observed=True, sort=False)[post].transform("size")
+    denom = (n_runners - 1).replace(0, np.nan)
+    df["_4角相対位置"] = ((rank_in_corner - 1) / denom).clip(0, 1).astype("float32")
+    df["_4角通過順位"] = rank_in_corner
+    return df
+
+
+def add_official_style_features(df: pd.DataFrame, col: str = "_脚質判定") -> pd.DataFrame:
+    """JRA-VAN の公式脚質判定（1:逃 2:先 3:差 4:追）を、過去走だけで集計する。
+
+    ⚠ 公式脚質判定は「今回レース」の判定なので、**そのレース自身の値はリーク**。
+       自前の脚質スコアと同じく、leakfree の過去集計だけから特徴量を作る。
+
+    自前の脚質スコア（4角相対位置の過去平均）と並べて学習し、
+    どちらが効くかは gain 重要度で比べる（validate.style_importance_table）。
+    """
+    cols = config.resolve_columns(df)
+    horse, race_id = cols["horse"], cols["race_id"]
+    df = df.copy()
+
+    kubun = pd.to_numeric(df[col], errors="coerce")
+    kubun = kubun.where(kubun.between(1, 4)).astype("float32")  # 0 は初期値
+
+    df["公式脚質_過去平均"] = leakfree.past_mean_ignore_nan(df, [horse], kubun)
+    # 逃げた率・追い込んだ率（値がある過去走のうち）
+    df["公式脚質_逃げ率"] = leakfree.past_mean_ignore_nan(
+        df, [horse], (kubun == 1).astype("float32").where(kubun.notna()))
+    df["公式脚質_追込率"] = leakfree.past_mean_ignore_nan(
+        df, [horse], (kubun == 4).astype("float32").where(kubun.notna()))
+    df["公式脚質_前走"] = df.groupby(horse, observed=True, sort=False)[col].shift(1)
+    df["公式脚質_前走"] = pd.to_numeric(df["公式脚質_前走"], errors="coerce").where(
+        lambda s: s.between(1, 4)).astype("float32")
+
+    # レース内での相対値（自前の「脚質スコア_レース内平均差」に対応する比較対象）
+    df["公式脚質_レース内平均差"] = (
+        df["公式脚質_過去平均"]
+        - df.groupby(race_id, observed=True, sort=False)["公式脚質_過去平均"].transform("mean")
+    ).astype("float32")
+    return df
+
+
+def official_style_feature_columns() -> list[str]:
+    """公式脚質判定から作った特徴量の列名（JRA-VAN データのときだけ存在する）。"""
+    return ["公式脚質_過去平均", "公式脚質_逃げ率", "公式脚質_追込率",
+            "公式脚質_前走", "公式脚質_レース内平均差"]
+
+
 def add_running_style_features(df: pd.DataFrame) -> pd.DataFrame:
     """馬ごとの脚質（過去実績から）とレース内の展開特徴量を追加する。
 

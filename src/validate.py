@@ -116,7 +116,7 @@ def _slice_years(df: pd.DataFrame, years: tuple[int, int]) -> pd.DataFrame:
 
 
 def _default_model_fn(train_df, test_df, feature_cols):
-    """既定の学習器（LightGBM）。戻り値は (予測確率, valid AUC)。"""
+    """既定の学習器（LightGBM）。戻り値は (予測確率, valid AUC, gain重要度)。"""
     from . import train as train_mod
 
     model = train_mod.train_lgb(train_df, test_df, feature_cols)
@@ -126,7 +126,7 @@ def _default_model_fn(train_df, test_df, feature_cols):
         auc = float(model.best_score["valid"]["auc"])
     except (KeyError, TypeError):
         pass
-    return pred, auc
+    return pred, auc, train_mod.importance_table(model, feature_cols)
 
 
 def run_fold(df: pd.DataFrame, fold: Fold, payout_df: pd.DataFrame,
@@ -142,11 +142,14 @@ def run_fold(df: pd.DataFrame, fold: Fold, payout_df: pd.DataFrame,
     if train_df.empty or test_df.empty:
         return {"fold": fold, "race": pd.DataFrame(), "auc": None}
 
-    pred, auc = model_fn(train_df, test_df, feature_cols)
+    # 学習器は (pred, auc) か (pred, auc, 重要度) を返す（テスト用の偽物は前者でよい）
+    out = model_fn(train_df, test_df, feature_cols)
+    pred, auc = out[0], out[1]
+    importance = out[2] if len(out) > 2 else None
 
     race = trifecta.build_race_table(test_df, pred, payout_df)
     race = selection.attach_difficulty(race, test_df, pred)
-    return {"fold": fold, "race": race, "auc": auc,
+    return {"fold": fold, "race": race, "auc": auc, "importance": importance,
             "n_train": len(train_df), "n_test": len(test_df)}
 
 
@@ -453,6 +456,13 @@ def test_h4(results: list[dict],
 # ---------------------------------------------------------------------------
 # 依頼C：結論の要約
 # ---------------------------------------------------------------------------
+def _last_test_date(results: list[dict]) -> str:
+    """検証に使ったレースの最終日（限界の説明に使う）。"""
+    dates = [pd.to_datetime(r["race"]["日付"]).max()
+             for r in results if not r["race"].empty and "日付" in r["race"]]
+    return f"{max(dates):%Y-%m-%d}" if dates else "不明"
+
+
 def recommend(results: list[dict], h1: dict, h2: dict, h3: dict, h4: dict) -> dict:
     """検証結果から実戦戦略を1つに絞る（依頼C）。
 
@@ -468,7 +478,7 @@ def recommend(results: list[dict], h1: dict, h2: dict, h3: dict, h4: dict) -> di
     else:
         target = "重賞のみ（暫定）"
         target_reason = (f"プールしても有意差なし（p={h1.get('p値', float('nan')):.4f}）。"
-                         "v3の重賞優位は再現しなかった")
+                         "重賞優位は再現しなかった")
 
     # G1に絞るべきか
     if h2.get("有意") and (h2.get("差") or 0) > 0:
@@ -508,9 +518,9 @@ def recommend(results: list[dict], h1: dict, h2: dict, h3: dict, h4: dict) -> di
         "選別条件を使うか": ("使わない" if not h4.get("全foldで下限が改善した条件")
                              else f"使う: {h4['全foldで下限が改善した条件']}"),
         "限界": [
-            "配当データは2004年以降のみ。それ以前の期間は検証できていない",
+            "3連単の発売は2004年から。それ以前の期間は検証できていない",
             "パドック評価の効果は未検証（過去データが存在しないため）",
-            "2021年7月までのデータ。直近の馬場・レース体系の変化は反映されていない",
+            f"検証データは {_last_test_date(results)} まで。それ以降の馬場・レース体系の変化は反映されていない",
             "達成率の区間はfoldをプールした値。fold間のばらつきは別途 fold_summary を見ること",
             "3連単の配当は分布の裾が重い。少数の大穴が達成率を左右する点に注意",
         ],
@@ -607,3 +617,204 @@ def print_v4(out: dict) -> None:
             print(f"  {k}: {v:.2%}")
         else:
             print(f"  {k}: {v}")
+
+
+# ===========================================================================
+# v5：JRA-VAN データでの再検証
+# ===========================================================================
+# データ期間が 2026 年まで延びたので fold を1つ増やす（依頼書 v5 の例どおり）。
+# 学習開始年は v4 と同じ 2003 年に揃える（比較のため）。
+V5_FOLDS = [
+    Fold("1", (2003, 2010), (2011, 2013)),
+    Fold("2", (2003, 2013), (2014, 2016)),
+    Fold("3", (2003, 2016), (2017, 2019)),
+    Fold("4", (2003, 2019), (2020, 2022)),
+    Fold("5", (2003, 2022), (2023, 2026)),
+]
+
+# v4（Kaggle データ・4fold）で確定した値。依頼書 v5 の表より。
+# 達成率の熱い当たり数は 6.13% × 1,337 から逆算した 82（82/1337 = 6.133%）。
+# 正確な件数が手元にあれば V4_REFERENCE["pooled_hits"] を書き換えること。
+V4_REFERENCE = {
+    "pooled_hits": 82,
+    "pooled_n": 1337,
+    "pooled_rate": 0.0613,
+    "pooled_ci": (0.0497, 0.0755),
+    "H1_graded": 0.0613,
+    "H1_flat": 0.0347,
+    "H1_p": 2.7e-07,
+    "H2_G1": 0.0574,
+    "H2_G2G3": 0.0627,
+    "H3": "4/4",
+    "H4_consistent": 0,
+}
+
+# 自前の脚質特徴量と、JRA-VAN 公式の脚質判定から作った特徴量（重要度の比較用）
+OWN_STYLE_FEATURES = ["脚質スコア", "脚質スコア直近3走", "前走4角相対位置",
+                      "好走時脚質スコア", "脚質スコア_レース内平均差", "脚質安定度"]
+
+
+def recent_period_check(results: list[dict], since: str = "2021-08-01",
+                        v4_hits: int | None = None, v4_n: int | None = None) -> dict:
+    """依頼書 v5 セクション8 の成功判定。
+
+    2021年8月以降（Kaggle データに無かった期間）の重賞・上位6頭BOXの達成率が、
+    v4 のプール値より**有意に低くないか**を、v4 と同じ two_proportion_test で判定する。
+
+    「下限5%を超えたか」のような固定値では判定しない（依頼書の指示）。
+    比べる相手は v4 の点推定と母数で、差の検定を行う。
+    """
+    v4_hits = V4_REFERENCE["pooled_hits"] if v4_hits is None else v4_hits
+    v4_n = V4_REFERENCE["pooled_n"] if v4_n is None else v4_n
+    cutoff = pd.Timestamp(since)
+
+    def recent(race: pd.DataFrame) -> pd.DataFrame:
+        return race.loc[pd.to_datetime(race["日付"]) >= cutoff]
+
+    gh, gn = _pool(results, lambda r: recent(r).loc[lambda x: x["重賞"]], MAIN_STRATEGY)
+    fh, fn = _pool(results, lambda r: recent(r).loc[lambda x: ~x["重賞"]], MAIN_STRATEGY)
+
+    vs_v4 = trifecta.two_proportion_test(gh, gn, v4_hits, v4_n)
+    h1_recent = trifecta.two_proportion_test(gh, gn, fh, fn)
+    lo, hi = trifecta.wilson_interval(gh, gn)
+
+    collapsed = bool(vs_v4["有意"] and vs_v4["差"] < 0)
+    h1_kept = bool(h1_recent["差"] > 0) if gn and fn else False
+    return {
+        "期間": f"{since} 以降",
+        "重賞レース数": gn,
+        "熱い当たり": gh,
+        "達成率": gh / gn if gn else np.nan,
+        "信頼区間": (lo, hi),
+        "v4プール": f"{v4_hits}/{v4_n} = {v4_hits / v4_n:.2%}",
+        "v4との差": vs_v4["差"],
+        "v4との差の区間": (vs_v4["差下限"], vs_v4["差上限"]),
+        "v4との差のp値": vs_v4["p値"],
+        "判定（達成率）": ("崩れた：v4より有意に低い" if collapsed
+                       else "維持：v4より有意に低くはない"),
+        "平場達成率": fh / fn if fn else np.nan,
+        "平場レース数": fn,
+        "H1（重賞>平場）のp値": h1_recent["p値"],
+        "判定（H1）": ("維持：重賞が平場を上回る（有意）" if h1_kept and h1_recent["有意"]
+                     else "維持（ただし有意差なし）" if h1_kept
+                     else "崩れた：重賞が平場を上回っていない"),
+    }
+
+
+def style_importance_table(results: list[dict]) -> pd.DataFrame:
+    """自前の脚質特徴量 vs 公式脚質判定の特徴量を、gain 重要度で比べる（依頼C-3）。
+
+    fold ごとの gain を合計し、全特徴量の中での順位も出す。
+    どちらを残すかは「データで決める」方針なので、ここでは並べるだけ。
+    """
+    from . import corner as corner_mod
+
+    frames = [r["importance"].assign(fold=r["fold"].name)
+              for r in results if r.get("importance") is not None]
+    if not frames:
+        return pd.DataFrame()
+    imp = pd.concat(frames, ignore_index=True)
+    total = imp.groupby("feature", as_index=False)["gain"].sum()
+    total["順位"] = total["gain"].rank(ascending=False, method="min").astype(int)
+    total["全体に占める割合"] = total["gain"] / total["gain"].sum()
+
+    official = set(corner_mod.official_style_feature_columns())
+    own = set(OWN_STYLE_FEATURES)
+    total["系統"] = np.where(total["feature"].isin(official), "公式脚質判定",
+                           np.where(total["feature"].isin(own), "自前の脚質", None))
+    out = total.loc[total["系統"].notna()].sort_values("gain", ascending=False)
+    return out[["系統", "feature", "gain", "順位", "全体に占める割合"]].reset_index(drop=True)
+
+
+def compare_with_v4(out: dict) -> pd.DataFrame:
+    """v4（Kaggle）と v5（JRA-VAN）の主要な数字を並べる（依頼D）。"""
+    h1, h2, h3, h4 = out["H1"], out["H2"], out["H3"], out["H4"]
+    rec = out["recommendation"]
+    lo, hi = rec["信頼区間"]
+    aucs = [r.get("auc") for r in out["results"] if r.get("auc") is not None]
+    rows = [
+        ("重賞・上位6頭BOX 達成率（プール）",
+         f"{V4_REFERENCE['pooled_rate']:.2%} [{V4_REFERENCE['pooled_ci'][0]:.2%}, {V4_REFERENCE['pooled_ci'][1]:.2%}]",
+         f"{rec['期待達成率（全fold プール）']:.2%} [{lo:.2%}, {hi:.2%}]"),
+        ("検証レース数（重賞）", f"{V4_REFERENCE['pooled_n']:,}", f"{rec['検証レース数']:,}"),
+        ("H1 重賞 vs 平場",
+         f"{V4_REFERENCE['H1_graded']:.2%} vs {V4_REFERENCE['H1_flat']:.2%}（p={V4_REFERENCE['H1_p']:.1e}）",
+         f"{h1['プール重賞達成率']:.2%} vs {h1['プール平場達成率']:.2%}（p={h1['p値']:.1e}）"
+         f"／再現 {h1['再現fold数']}"),
+        ("H2 G1 vs G2/G3",
+         f"{V4_REFERENCE['H2_G1']:.2%} vs {V4_REFERENCE['H2_G2G3']:.2%}（否定）",
+         f"{h2['プールG1達成率']:.2%} vs {h2['プールG2G3達成率']:.2%}（p={h2['p値']:.2f}）"),
+        ("H3 上位6頭BOXが最良（下限）", V4_REFERENCE["H3"], h3.get("下限で最良だったfold", "")),
+        ("H4 全foldで効いた選別条件", str(V4_REFERENCE["H4_consistent"]),
+         str(len(h4.get("全foldで下限が改善した条件", [])))),
+        ("valid AUC（fold平均）", "0.7821（v3・単一分割）",
+         f"{np.mean(aucs):.4f}" if aucs else "—"),
+    ]
+    return pd.DataFrame(rows, columns=["項目", "v4（Kaggle）", "v5（JRA-VAN）"])
+
+
+def run_v5(dataset, folds: list[Fold] | None = None, since: str = "2021-08-01",
+           ablation: bool = False, model_fn=None, verbose: bool = True) -> dict:
+    """JRA-VAN データで v4 と同じ検証を回し、v4 と比較する（依頼D）。
+
+    Parameters
+    ----------
+    dataset  : jvmap.build_dataset() の戻り値
+    ablation : True なら「公式脚質特徴量なし」でも CV を回して AUC を比べる
+               （学習が fold 数ぶん追加で走るので時間は約2倍）
+    """
+    from . import corner as corner_mod
+
+    folds = folds or V5_FOLDS
+    if verbose:
+        print(dataset.summary())
+        print("[v5] 前処理と特徴量作成（全期間で1回だけ）...")
+    df = preprocess.basic_clean(dataset.race_result)
+    df = features.add_all_features(df, lap_df=dataset.lap_df)
+    df = preprocess.downcast(df)
+    df = preprocess.to_category(df)
+
+    out = run_v4(df, payout_df=dataset.payout_df, folds=folds,
+                 model_fn=model_fn, verbose=False)
+    out["recent"] = recent_period_check(out["results"], since=since)
+    out["style_importance"] = style_importance_table(out["results"])
+    out["comparison"] = compare_with_v4(out)
+
+    if ablation:
+        official = set(corner_mod.official_style_feature_columns())
+        base_cols = [c for c in features.feature_columns(df) if c not in official]
+        base = run_time_series_cv(df, dataset.payout_df, folds=folds,
+                                  feature_cols=base_cols, model_fn=model_fn, verbose=False)
+        out["ablation"] = pd.DataFrame([
+            {"fold": a["fold"].name, "AUC（公式脚質あり）": a.get("auc"),
+             "AUC（公式脚質なし）": b.get("auc")}
+            for a, b in zip(out["results"], base)
+        ])
+        out["ablation"]["差"] = out["ablation"]["AUC（公式脚質あり）"] - out["ablation"]["AUC（公式脚質なし）"]
+
+    if verbose:
+        print_v5(out)
+    return out
+
+
+def print_v5(out: dict) -> None:
+    print_v4(out)
+
+    print("\n=== v5：v4 との比較 ===")
+    print(out["comparison"].to_string(index=False))
+
+    print("\n=== v5 成功判定：2021年8月以降 ===")
+    for k, v in out["recent"].items():
+        if isinstance(v, tuple):
+            print(f"  {k}: {v[0]:.2%} 〜 {v[1]:.2%}")
+        elif isinstance(v, float) and ("率" in k or "差" == k[-1:]):
+            print(f"  {k}: {v:.2%}")
+        else:
+            print(f"  {k}: {v}")
+
+    if not out["style_importance"].empty:
+        print("\n=== 依頼C-3：自前の脚質 vs 公式脚質判定（gain 重要度、全fold合計） ===")
+        print(out["style_importance"].to_string(index=False))
+    if "ablation" in out:
+        print("\n=== 公式脚質特徴量の有無による AUC ===")
+        print(out["ablation"].to_string(index=False))
