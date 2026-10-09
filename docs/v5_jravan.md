@@ -154,7 +154,7 @@ py -m pip install -r requirements.txt
 py -m pytest tests -q
 ```
 
-期待される出力：`146 passed, 5 skipped`（SDK を使う5件はまだ skip される）
+期待される出力：`155 passed, 6 skipped`（SDK を使う6件はまだ skip される）
 
 ### 1. SDK の場所を設定してテスト
 
@@ -163,7 +163,7 @@ $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
 py -m pytest tests -q
 ```
 
-期待される出力：`151 passed`（SDK の構造体で仕様書どおりのダミーレコードを読むテストが走る）
+期待される出力：`161 passed`（SDK の構造体で仕様書どおりのダミーレコードを読むテストが走る）
 
 `$env:` はそのウィンドウの間だけ有効。毎回設定したくなければ `setx JVSDK_DIR "…"` の後に
 PowerShell を開き直す。なお `config.py` の既定値もこのパスなので、SDK をこの場所に置いていれば未設定でも動く。
@@ -302,7 +302,7 @@ v4 の熱い当たり数 82 は 6.13%×1,337 からの逆算値。区間 4.97〜
 ## v5 で追加したテスト
 
 ```bash
-python -m pytest tests -q   # 146 passed, 5 skipped（SDK なし） / 151 passed（SDK あり）
+python -m pytest tests -q   # 155 passed, 6 skipped（SDK なし） / 161 passed（SDK あり）
 ```
 
 - **取得ループ**（偽の JV-Link）：`-3` で待って再試行、`-3` が続けば上限で止める、不要種別は JVSkip、
@@ -342,10 +342,46 @@ python -m pytest tests -q   # 146 passed, 5 skipped（SDK なし） / 151 passed
 JV-Link を2つ同時に開かないよう、本番の取得は止めてから実行すること。
 
 ```powershell
-py -m src.jvlink bench                          # 最初の SE ファイル1つ（既定のバッファ 110,000）
-py -m src.jvlink bench --buffer-size 2048       # バッファを小さくした場合
+py -m src.jvlink bench                          # 最初の SE ファイル1つ（既定のバッファ 2048）
+py -m src.jvlink bench --buffer-size 110000     # 公式サンプルと同じ大きさ
+py -m src.jvlink bench --method read            # JVGets の代わりに JVRead で読む（速さの比較用）
 py -m src.jvlink bench --profile                # 関数ごとの時間（cProfile）も出す
-py -m src.jvlink bench --option 1 --from 19860101000000-19860301000000   # 通常データで過去分が取れるか
 ```
+
+### bench の結果と、既定値を 2048 にした理由
+
+セットアップ用の SE ファイル（`SEVM19860199…`、3,226件）での実測：
+
+| バッファ | 合計 | JVGets 1件あたり | 解析・書き出し |
+|---|---|---|---|
+| 110,000（公式サンプル） | 296.5秒 | 91.65ms | 1秒未満 |
+| **2,048** | **110.4秒** | **34.09ms** | 1秒未満 |
+
+2点から分けると、JVGets 1回 ≒ **約33ms（大きさに関係しない）＋ 約0.53ms/1万バイト**。
+2048 にするとバッファ由来の部分はほぼ消える（約1ms）。残りの約33msは JV-Link の中の処理で、こちらでは減らせない。
+通常データ（option=1）は同じ 110,000 で1件約0.5msだったので、**セットアップ用ファイルのときだけ**
+JV-Link の1回あたりの処理が重い。`-3` は0回、ファイル内の位置による増加もなかった。
+通常データ（option=1）で1986年分を取る方法は「該当データなし」で使えなかった。
+
+2048 で足りるかは、`RACE` に含まれる全種別のレコード長（仕様書）で確認した：
+
+| 種別 | 長さ | 2048 で |
+|---|---|---|
+| RA / SE / HR（保存する） | 1,272 / 555 / 719 | 収まる |
+| JG / O1 / O2 | 80 / 962 / 2,042 | 収まる（読み飛ばす） |
+| O3〜O6・H1・H6・WF | 2,654〜102,890 | 切り捨て。先頭2バイトで種別が分かれば JVSkip するので問題ない |
+
+保存する種別が切り捨てられるバッファ（1,272 以下）は、起動時にエラーにする。
+
+### JVRead について
+
+JVRead は JV-Link の中で SJIS → Unicode に変換して文字列で返す。こちらでは cp932 でバイト列に戻してから
+構造体に通すので、変換できない文字があると位置がずれうる。テストでは JVGets と同じ値になることを確認したが、
+**本番には使わず速さの比較だけ**に使う。
+
+### Ctrl+C で止めたとき
+
+書けた分を CSV に書き出して JVClose してから、トレースバックを出さずに終わる。
+後始末の間は2回目の Ctrl+C を無視する（後始末が途中で打ち切られないように）。
 
 `-3` の待ちは 0.05 秒から倍々に伸ばし、1秒で頭打ちにした（以前は毎回1秒）。

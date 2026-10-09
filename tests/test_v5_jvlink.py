@@ -100,6 +100,12 @@ class FakeJVLink:
             return -1, None, name
         return item, None, self.fname
 
+    def JVRead(self, buff, size, name):
+        """JVRead の偽物。JV-Link と同じく SJIS を Unicode 文字列にして返す。"""
+        code, mv, fname = self.JVGets(None, size, None)
+        text = bytes(mv).decode("cp932", errors="replace") if mv is not None else ""
+        return code, text, code, fname
+
     def JVSkip(self):
         self.calls.append(("JVSkip",))
         while self.script and self.script[0] != -1:
@@ -109,7 +115,9 @@ class FakeJVLink:
         self.deleted.append(fname)
 
     def JVClose(self):
+        import signal
         self.closed += 1
+        self.sigint_at_close = signal.getsignal(signal.SIGINT)
         return 0
 
 
@@ -325,6 +333,60 @@ def test_bench_stop_keeps_progress_and_state(tmp_path):
     assert res.stopped_early and res.data_files == 1
     assert list(tmp_path.glob("progress_*.txt"))
     assert jvlink.load_state(tmp_path) == {}
+
+
+def test_default_buffer_is_2048(tmp_path):
+    """既定のバッファは 2048（bench で 110,000 の約2.7倍速かった）。"""
+    assert jvlink.BUFFER_SIZE == 2048
+    fake = FakeJVLink([b"O1" + b" " * 10, -1, 0])
+    _fetch_no_parse(fake, tmp_path)
+    assert set(fake.sizes) == {2048}
+
+
+def test_buffer_must_fit_saved_record_types():
+    """保存する種別（最長 RA 1,272 バイト）が切り捨てられるバッファは拒否する。"""
+    assert max(jvlink.RECORD_LENGTHS.values()) < jvlink.BUFFER_SIZE
+    with pytest.raises(ValueError, match="RA"):
+        jvlink.check_buffer_size(1272)
+    jvlink.check_buffer_size(1273)
+
+
+def test_jvread_method_reads_records(tmp_path):
+    """JVRead（文字列で返る）でも、種別の判定と読み飛ばしが同じように動くこと。"""
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([rec, rec, -1, b"O6" + b" " * 50, -1, 0])
+    res = jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=("SE",),
+                       client=_client(fake), parse=False, method="read",
+                       sleep=lambda s: None, log=lambda *a: None)
+    assert res.records == {"SE": 2}
+    assert res.skipped_files == {"O6": 1}
+    assert fake.sizes  # JVRead も同じ size で呼ばれている
+
+
+def test_ctrl_c_closes_and_ignores_second_ctrl_c(tmp_path):
+    """Ctrl+C で止めても JVClose し、後始末の間は2回目の Ctrl+C を無視していること。"""
+    import signal
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([rec, -1, rec, rec])
+
+    def interrupt_on_third_call(f):
+        f.gets_count += 1
+        if f.gets_count == 3:
+            raise KeyboardInterrupt
+
+    fake.delay_fn = interrupt_on_third_call
+    messages = []
+    before = signal.getsignal(signal.SIGINT)
+    with pytest.raises(KeyboardInterrupt):
+        jvlink.fetch(fromtime="19860101000000", option=4, out_dir=tmp_path,
+                     record_types=("SE",), client=_client(fake), parse=False,
+                     sleep=lambda s: None, log=messages.append)
+    assert fake.closed == 1
+    assert fake.sigint_at_close == signal.SIG_IGN      # 後始末中は Ctrl+C を無視
+    assert signal.getsignal(signal.SIGINT) == before   # 終わったら元に戻っている
+    assert any("JVClose しました" in m for m in messages)
+    # 1つ目のファイルは読み終えているので、再開記録に残っている
+    assert "F000.jvd" in jvlink.Progress(tmp_path, "RACE", 4, "19860101000000")
 
 
 def test_missing_sdk_gives_clear_error(tmp_path):
@@ -1001,6 +1063,21 @@ def test_sdk_fetch_writes_csv_and_maps(tmp_path):
     pay = jvmap.prepare_payout(raw["HR"], exclude_irregular=True)
     assert np.isnan(pay.loc[0, "3連単払戻"])  # 特払フラグで除外
     assert jvmap.prepare_payout(raw["HR"]).loc[0, "3連単払戻"] == 123450  # 既定は除外しない
+
+
+def test_sdk_jvread_gives_same_values_as_jvgets(tmp_path):
+    """JVRead（Unicode で返る）を cp932 に戻して構造体に通しても、JVGets と同じ値になること。"""
+    m = _sdk_module()
+    rows = {}
+    for method in ("gets", "read"):
+        out = tmp_path / method
+        fake = FakeJVLink([_se_bytes(), -1, 0])
+        jvlink.fetch(fromtime="20261001000000", out_dir=out, record_types=("SE",),
+                     client=_client(fake), struct_module=m, method=method,
+                     sleep=lambda s: None, log=lambda *a: None)
+        rows[method] = jvmap.load_raw(out, record_types=("SE",))["SE"].drop(columns="_seq")
+    pd.testing.assert_frame_equal(rows["gets"], rows["read"])
+    assert rows["read"].loc[0, "Bamei"] == "髙﨑テスト"
 
 
 def test_sdk_fetch_appends_and_keeps_order(tmp_path):

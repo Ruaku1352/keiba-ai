@@ -99,8 +99,34 @@ FIELDS: dict[str, list[str]] = {
     ],
 }
 
-# JVGets のバッファサイズ。公式サンプルと同じ値（最大レコードの O6 も収まる）
-BUFFER_SIZE = 110_000
+# JVGets / JVRead に渡すバッファの大きさ。
+#
+# 公式サンプルは 110,000（最大の H6 も入る大きさ）だが、2048 にした。
+# 開発者の Windows で、セットアップ用 SE ファイル（3,226件）を bench した結果:
+#     110,000 → JVGets 1回 91.65ms / 2,048 → 34.09ms
+# 1回あたりの時間がバッファの大きさにほぼ比例して増えるため（約0.53ms/1万バイト）。
+# 残り約33msは大きさに関係しない JV-Link 側の処理で、ここでは減らせない。
+#
+# 2048 で足りる理由（JV-Data仕様書のレコード長、CR/LF を含む）:
+#     保存する種別   RA 1,272 / SE 555 / HR 719 → 全部収まる
+#     読み飛ばす種別 JG 80 / O1 962 / O2 2,042 は収まる。
+#                   O3〜O6・H1・H6・WF（2,654〜102,890）は切り捨てられるが、
+#                   種別を見る先頭2バイトさえ読めれば JVSkip するので問題ない
+# 仕様書: size がレコード長より小さいと残りは切り捨て、最後の1バイトが NULL になる。
+# 保存する種別が切り捨てられないよう、レコード長より大きいことを起動時に確かめる。
+BUFFER_SIZE = 2048
+
+
+def check_buffer_size(size: int) -> None:
+    """保存する種別のレコードが切り捨てられない大きさか確かめる。
+
+    仕様書: size がレコード長より小さいと切り捨て、最後の1バイトが NULL になる。
+    「同じ長さ」でも最後の1バイトが NULL になりうるので、1バイト以上の余裕を求める。
+    """
+    need = max(RECORD_LENGTHS.values()) + 1
+    if size < need:
+        raise ValueError(f"バッファ {size} バイトでは RA（{RECORD_LENGTHS['RA']}バイト）が切り捨てられます。"
+                         f"{need} 以上を指定してください")
 
 
 class JVLinkError(RuntimeError):
@@ -252,12 +278,19 @@ class OpenResult:
 class JVLinkClient:
     """JV-Link（COM）を薄く包む。テストでは偽物の com を渡して差し替える。"""
 
-    def __init__(self, com=None, buffer_size: int = None):
-        # JVGets に渡すバッファの大きさ。既定は公式サンプルと同じ 110,000 バイト。
-        # 必要なのは RA(1272)/SE(555)/HR(719) だけなので、小さくしても読める
-        # （仕様書: size がレコード長より小さいと残りは切り捨てられる。不要種別は
-        #  先頭2バイトで種別が分かれば十分）。速度への影響は bench で測る。
+    def __init__(self, com=None, buffer_size: int = None, method: str = "gets"):
+        """
+        buffer_size : JVGets/JVRead に渡すバッファの大きさ（既定 BUFFER_SIZE の説明を参照）
+        method      : "gets"（JVGets・既定）か "read"（JVRead）。
+                      JVRead は JV-Link の中で SJIS → Unicode 変換をして文字列で返す。
+                      こちらでは cp932 でバイト列に戻してから構造体に通すので、
+                      読めない文字があると位置がずれうる。**速さの比較（bench）用**。
+        """
         self.buffer_size = buffer_size or BUFFER_SIZE
+        check_buffer_size(self.buffer_size)
+        if method not in ("gets", "read"):
+            raise ValueError(f"method は 'gets' か 'read': {method!r}")
+        self.method = method
         if com is None:
             try:
                 import win32com.client  # Windows + pywin32 でのみ動く
@@ -285,7 +318,9 @@ class JVLinkClient:
         return int(self.jv.JVStatus())
 
     def gets(self) -> tuple[int, bytes, str]:
-        """JVGets。戻り値は (コード, データ本体のバイト列, ファイル名)。"""
+        """1レコード読む。戻り値は (コード, データ本体のバイト列, ファイル名)。"""
+        if self.method == "read":
+            return self._read()
         buff = bytearray(self.buffer_size)
         ret, memview, fname = self.jv.JVGets(buff, self.buffer_size, bytearray())
         code = int(ret)
@@ -293,6 +328,16 @@ class JVLinkClient:
         if code > 0 and memview is not None:
             data = memview.tobytes() if hasattr(memview, "tobytes") else bytes(memview)
             raw = data[:code]  # 戻り値 = バッファにセットしたバイト数
+        return code, raw, str(fname or "")
+
+    def _read(self) -> tuple[int, bytes, str]:
+        """JVRead 版。公式サンプルのコメントと同じく (戻り値, 文字列, サイズ, ファイル名) を受け取る。"""
+        ret, text, _size, fname = self.jv.JVRead("", self.buffer_size, "")
+        code = int(ret)
+        raw = b""
+        if code > 0 and text:
+            # JV-Link が Unicode にしたものを、構造体が期待する SJIS のバイト列に戻す
+            raw = str(text).encode("cp932", errors="replace")[:code]
         return code, raw, str(fname or "")
 
     def skip(self) -> None:
@@ -379,6 +424,7 @@ class FetchResult:
     reopened: int = 0         # エラーで JVOpen し直した回数
     minus3: int = 0           # JVGets が -3 を返した回数
     stopped_early: bool = False  # max_data_files で途中終了した（bench）
+    interrupted: bool = False    # Ctrl+C で止めた
     timings: list = field(default_factory=list)
     seconds: float = 0.0
 
@@ -416,6 +462,28 @@ def _save_state(out_dir: Path, dataspec: str, result: FetchResult) -> None:
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     _state_path(out_dir).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class _ignore_ctrl_c:
+    """with の中だけ Ctrl+C（SIGINT）を無視する。後始末を最後まで通すため。
+
+    signal はメインスレッドでしか差し替えられないので、それ以外では何もしない。
+    """
+
+    def __enter__(self):
+        import signal
+        self.previous = None
+        try:
+            self.previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except ValueError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        import signal
+        if self.previous is not None:
+            signal.signal(signal.SIGINT, self.previous)
+        return False
 
 
 def wait_for_download(client: JVLinkClient, download_count: int, poll_sec: float = 0.5,
@@ -584,7 +652,7 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
           sleep=time.sleep, log=print, progress_every: int = 50_000,
           buffer_size: int | None = None, parse: bool = True,
           max_data_files: int | None = None, timing_path: str | os.PathLike | None = "auto",
-          clock=time.perf_counter) -> FetchResult:
+          method: str = "gets", clock=time.perf_counter) -> FetchResult:
     """JV-Link から取得して、レコード種別ごとの CSV に追記する。
 
     Parameters
@@ -598,7 +666,8 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
                0.05秒から始めて、続くたびに倍にしていき、この値で頭打ちにする。
     max_reopen : -402/-403/-502/-503 のとき、自動で JVClose → JVOpen し直す回数。
                  読み終えたファイルは飛ばすので、やり直しても最初から読み直しにはならない。
-    buffer_size : JVGets に渡すバッファの大きさ（既定 110,000）。
+    buffer_size : JVGets に渡すバッファの大きさ（既定 2048。BUFFER_SIZE の説明を参照）。
+    method   : "gets"（既定）/ "read"（JVRead。速さの比較用）。
     parse    : False ならパースも CSV 書き出しもしない（JVGets だけの速さを測る bench 用）。
     max_data_files : 保存対象のファイルをこの数だけ読んだら止める（bench 用）。
     timing_path : ファイルごとの所要時間の記録先。"auto" なら out_dir/fetch_timing.csv。
@@ -610,9 +679,11 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
     out_dir = Path(out_dir or config.JV_DATA_DIR)
     if parse:
         struct_module = struct_module or load_struct_module()
-    client = client or JVLinkClient(buffer_size=buffer_size)
+    client = client or JVLinkClient(buffer_size=buffer_size, method=method)
     if buffer_size:
+        check_buffer_size(buffer_size)
         client.buffer_size = buffer_size
+    client.method = method
 
     if fromtime is None:
         prev = load_state(out_dir).get(dataspec, {}).get("last_file_timestamp")
@@ -659,15 +730,29 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
             _save_state(out_dir, dataspec, result)
             progress.clear()  # 完走したので再開用の記録は不要
         return result
+    except KeyboardInterrupt:
+        result.interrupted = True
+        log("\n中断を受け付けました（Ctrl+C）。書けた分を保存して JVClose します。"
+            "もう一度 Ctrl+C を押さずにお待ちください…")
+        raise
     finally:
-        # 途中で例外が出ても（Ctrl+C を含む）、書けた分は残し、必ず JVClose する
-        for w in writers.values():
-            try:
-                w.flush()
-            except Exception:
-                pass
-        client.close()
-        result.seconds = time.time() - started
+        # 途中で例外が出ても（Ctrl+C を含む）、書けた分は残し、必ず JVClose する。
+        # 後始末の最中に2回目の Ctrl+C が来ると、ここが途中で打ち切られてしまうので、
+        # 後始末の間だけ Ctrl+C を無視する。
+        with _ignore_ctrl_c():
+            flushed = 0
+            for w in writers.values():
+                try:
+                    flushed += len(w.buffer)
+                    w.flush()
+                except Exception as e:  # 書き出しに失敗しても JVClose は必ず呼ぶ
+                    log(f"  CSV の書き出しに失敗: {e}")
+            client.close()
+            result.seconds = time.time() - started
+            if result.interrupted:
+                log(f"  CSV に {flushed:,} 件を書き出し、JVClose しました。"
+                    f"読み終えたファイル {len(progress.done):,} 個は {progress.path.name} に記録済み。\n"
+                    "  同じコマンドを再実行すれば続きから読みます。")
 
 
 def _read_all(client, dataspec, fromtime, option, writers, struct_module, progress,
@@ -840,8 +925,11 @@ def _cmd_check(args) -> int:
 
 
 def _cmd_fetch(args) -> int:
-    result = fetch(dataspec=args.dataspec, fromtime=args.fromtime, option=args.option,
-                   out_dir=args.out, buffer_size=args.buffer_size)
+    try:
+        result = fetch(dataspec=args.dataspec, fromtime=args.fromtime, option=args.option,
+                       out_dir=args.out, buffer_size=args.buffer_size)
+    except KeyboardInterrupt:
+        return 130  # 後始末とメッセージは fetch の中で済んでいる。トレースバックは出さない
     print(result.summary())
     return 0
 
@@ -857,10 +945,12 @@ def _cmd_bench(args) -> int:
     import io
     import pstats
 
-    label = f"buf{args.buffer_size or BUFFER_SIZE}" + ("" if not args.no_parse else "_noparse")
+    label = (f"{args.method}_buf{args.buffer_size or BUFFER_SIZE}"
+             + ("" if not args.no_parse else "_noparse"))
     out = Path(args.out or config.JV_DATA_DIR) / "bench" / f"{datetime.now():%Y%m%d_%H%M%S}_{label}"
     types = tuple(t.strip() for t in args.types.split(",") if t.strip())
-    print(f"bench: 種別={types} ファイル数={args.files} バッファ={args.buffer_size or BUFFER_SIZE} "
+    print(f"bench: 読み方={'JVRead' if args.method == 'read' else 'JVGets'} "
+          f"種別={types} ファイル数={args.files} バッファ={args.buffer_size or BUFFER_SIZE} "
           f"解析={'しない' if args.no_parse else 'する'}  出力先={out}")
 
     prof = cProfile.Profile() if args.profile else None
@@ -868,7 +958,7 @@ def _cmd_bench(args) -> int:
         prof.enable()
     result = fetch(dataspec=args.dataspec, fromtime=args.fromtime, option=args.option,
                    out_dir=out, record_types=types, buffer_size=args.buffer_size,
-                   parse=not args.no_parse, max_data_files=args.files)
+                   parse=not args.no_parse, max_data_files=args.files, method=args.method)
     if prof:
         prof.disable()
 
@@ -942,7 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="YYYYMMDDhhmmss（省略時は前回の続き。初回は30日前）")
     p.add_argument("--option", type=int, default=1, choices=[1, 2, 3, 4])
     p.add_argument("--buffer-size", type=int, default=None,
-                   help="JVGets に渡すバッファの大きさ（既定 110000）。bench の結果で決める")
+                   help="JVGets に渡すバッファの大きさ（既定 2048）")
     p.add_argument("--out", default=None)
     p.set_defaults(func=_cmd_fetch)
 
@@ -952,7 +1042,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--option", type=int, default=4, choices=[1, 2, 3, 4])
     p.add_argument("--types", default="SE", help="保存対象の種別（カンマ区切り）。既定 SE")
     p.add_argument("--files", type=int, default=1, help="保存対象のファイルを何個読んだら止めるか")
-    p.add_argument("--buffer-size", type=int, default=None, help="JVGets のバッファ（既定 110000）")
+    p.add_argument("--buffer-size", type=int, default=None, help="バッファの大きさ（既定 2048）")
+    p.add_argument("--method", default="gets", choices=["gets", "read"],
+                   help="gets=JVGets（既定）/ read=JVRead（速さの比較用）")
     p.add_argument("--no-parse", action="store_true", help="パースと CSV 書き出しをしない")
     p.add_argument("--profile", action="store_true", help="cProfile で関数ごとの時間も出す")
     p.add_argument("--out", default=None)
