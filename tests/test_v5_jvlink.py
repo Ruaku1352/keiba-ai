@@ -62,6 +62,9 @@ class FakeJVLink:
         self.opened = 0
         self.deleted = []
         self.file_index = 0
+        self.sizes = []          # JVGets に渡された size
+        self.delay_fn = None     # JVGets の中で遅延を起こしたいときに使う
+        self.gets_count = 0
 
     @property
     def fname(self):
@@ -83,6 +86,9 @@ class FakeJVLink:
         return self.status_seq.pop(0) if self.status_seq else 0
 
     def JVGets(self, buff, size, name):
+        self.sizes.append(size)
+        if self.delay_fn is not None:
+            self.delay_fn(self)
         if not self.script:
             return 0, None, ""
         item = self.script.pop(0)
@@ -251,6 +257,74 @@ def test_init_error_raises(tmp_path):
     fake = FakeJVLink([], init_ret=-303)
     with pytest.raises(jvlink.JVLinkError, match="-303"):
         _fetch_no_parse(fake, tmp_path)
+
+
+def test_minus3_wait_grows_from_short_interval(tmp_path):
+    """-3 の待ちは 0.05 秒から倍々に伸び、上限で頭打ちになること。
+
+    1秒固定だと、すぐ終わる待ちでも毎回1秒を捨てることになる。
+    """
+    slept = []
+    fake = FakeJVLink([-3] * 7 + [b"O1" + b" " * 10, -1, 0])
+    jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=(),
+                 client=_client(fake), struct_module=object(), retry_sleep_sec=1.0,
+                 sleep=slept.append, log=lambda *a: None)
+    assert slept == [0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0]
+
+
+def test_buffer_size_is_passed_to_jvgets(tmp_path):
+    fake = FakeJVLink([b"O1" + b" " * 10, -1, 0])
+    jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=(),
+                 client=_client(fake), struct_module=object(), buffer_size=2048,
+                 sleep=lambda s: None, log=lambda *a: None)
+    assert set(fake.sizes) == {2048}
+
+
+def test_timing_per_file_and_minus3_attribution(tmp_path):
+    """保存対象ファイルごとに件数・時間・-3 の回数が記録されること（parse なしで JVGets だけ）。"""
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([-3, -3, rec, rec, rec, -1, b"O6" + b" " * 9, -1, rec, -1, 0])
+    res = jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=("SE",),
+                       client=_client(fake), parse=False,
+                       sleep=lambda s: None, log=lambda *a: None)
+    rows = res.timings
+    assert [r["records"] for r in rows] == [3, 1]
+    assert rows[0]["minus3_count"] == 2      # ファイルを読み始める前の -3 もこのファイルの待ち
+    assert rows[1]["minus3_count"] == 0
+    assert res.skipped_files == {"O6": 1}
+    assert (tmp_path / "fetch_timing.csv").exists()
+    logged = pd.read_csv(tmp_path / "fetch_timing.csv", encoding="utf-8-sig")
+    assert list(logged["records"]) == [3, 1]
+
+
+def test_timing_detects_slowdown_within_file(tmp_path):
+    """読む位置に比例して JVGets が遅くなる場合、後半の1回あたりが前半より大きく出ること。"""
+    import time as _time
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([rec] * 300 + [-1, 0])
+
+    def slower_and_slower(f):
+        f.gets_count += 1
+        _time.sleep(0.00002 * f.gets_count)   # 呼ぶたびに少しずつ遅くなる
+
+    fake.delay_fn = slower_and_slower
+    res = jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=("SE",),
+                       client=_client(fake), parse=False, timing_path=None,
+                       sleep=lambda s: None, log=lambda *a: None)
+    row = res.timings[0]
+    assert row["gets_last100_ms"] > 2 * row["gets_first100_ms"]
+
+
+def test_bench_stop_keeps_progress_and_state(tmp_path):
+    """max_data_files で途中終了したときは、完走扱いにしない（進捗を消さず state も保存しない）。"""
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([rec, -1, rec, -1, rec, -1, 0])
+    res = jvlink.fetch(fromtime="19860101000000", option=4, out_dir=tmp_path,
+                       record_types=("SE",), client=_client(fake), parse=False,
+                       max_data_files=1, sleep=lambda s: None, log=lambda *a: None)
+    assert res.stopped_early and res.data_files == 1
+    assert list(tmp_path.glob("progress_*.txt"))
+    assert jvlink.load_state(tmp_path) == {}
 
 
 def test_missing_sdk_gives_clear_error(tmp_path):

@@ -252,7 +252,12 @@ class OpenResult:
 class JVLinkClient:
     """JV-Link（COM）を薄く包む。テストでは偽物の com を渡して差し替える。"""
 
-    def __init__(self, com=None):
+    def __init__(self, com=None, buffer_size: int = None):
+        # JVGets に渡すバッファの大きさ。既定は公式サンプルと同じ 110,000 バイト。
+        # 必要なのは RA(1272)/SE(555)/HR(719) だけなので、小さくしても読める
+        # （仕様書: size がレコード長より小さいと残りは切り捨てられる。不要種別は
+        #  先頭2バイトで種別が分かれば十分）。速度への影響は bench で測る。
+        self.buffer_size = buffer_size or BUFFER_SIZE
         if com is None:
             try:
                 import win32com.client  # Windows + pywin32 でのみ動く
@@ -281,8 +286,8 @@ class JVLinkClient:
 
     def gets(self) -> tuple[int, bytes, str]:
         """JVGets。戻り値は (コード, データ本体のバイト列, ファイル名)。"""
-        buff = bytearray(BUFFER_SIZE)
-        ret, memview, fname = self.jv.JVGets(buff, BUFFER_SIZE, bytearray())
+        buff = bytearray(self.buffer_size)
+        ret, memview, fname = self.jv.JVGets(buff, self.buffer_size, bytearray())
         code = int(ret)
         raw = b""
         if code > 0 and memview is not None:
@@ -369,8 +374,12 @@ class FetchResult:
     files_switched: int = 0
     short_records: int = 0
     files_done: int = 0       # 今回読み終えたファイル数
+    data_files: int = 0       # そのうち保存対象（RA/SE/HR）のファイル数
     resumed_files: int = 0    # 前回までに読み終えていたので飛ばしたファイル数
     reopened: int = 0         # エラーで JVOpen し直した回数
+    minus3: int = 0           # JVGets が -3 を返した回数
+    stopped_early: bool = False  # max_data_files で途中終了した（bench）
+    timings: list = field(default_factory=list)
     seconds: float = 0.0
 
     def summary(self) -> str:
@@ -379,7 +388,8 @@ class FetchResult:
             f"ダウンロード={self.download_count} 最新ファイル時刻={self.last_file_timestamp}",
             f"保存レコード: {self.records}",
             f"JVSkipしたファイル（種別ごと）: {self.skipped_files}",
-            f"再開で飛ばしたファイル: {self.resumed_files}  開き直し: {self.reopened}回",
+            f"再開で飛ばしたファイル: {self.resumed_files}  開き直し: {self.reopened}回  "
+            f"-3（ダウンロード中）: {self.minus3}回",
             f"短すぎるレコード: {self.short_records}  所要: {self.seconds:.0f}秒",
         ]
         return "\n".join(lines)
@@ -477,13 +487,104 @@ class Progress:
 REOPEN_CODES = {-402, -403, -502, -503}
 
 
+@dataclass
+class FileTiming:
+    """1ファイルを読むのにかかった時間の内訳（遅い原因を切り分けるため）。
+
+    wall      : そのファイルの最初のレコードから読み終わりまでの実時間
+    gets      : JVGets の呼び出しにかかった時間の合計（JV-Link の中の処理を含む）
+    wait_m3   : -3（ダウンロード中）で待った時間の合計
+    parse     : 構造体のパース（SDK の SetDataB）と列の取り出し
+    write     : CSV への追記（バッファに積む＋書き出し）
+    first_ms / last_ms : そのファイルの最初の100件・最後の100件の JVGets 1回あたりの平均（ミリ秒）
+        後半ほど遅いなら、読む位置に比例して遅くなっている（ファイル内で先頭から
+        たどり直しているような動き）ことが分かる。
+    """
+
+    fname: str
+    record_type: str = ""
+    records: int = 0
+    gets_calls: int = 0
+    minus3: int = 0
+    wall: float = 0.0
+    gets: float = 0.0
+    wait_m3: float = 0.0
+    parse: float = 0.0
+    write: float = 0.0
+    started: float = 0.0
+    _first: list = field(default_factory=list, repr=False)
+    _last: list = field(default_factory=list, repr=False)
+
+    def add_gets(self, sec: float) -> None:
+        self.gets += sec
+        self.gets_calls += 1
+        if len(self._first) < 100:
+            self._first.append(sec)
+        self._last.append(sec)
+        if len(self._last) > 100:
+            self._last.pop(0)
+
+    @property
+    def first_ms(self) -> float:
+        return 1000 * sum(self._first) / len(self._first) if self._first else 0.0
+
+    @property
+    def last_ms(self) -> float:
+        return 1000 * sum(self._last) / len(self._last) if self._last else 0.0
+
+    def line(self, index: int, total: int) -> str:
+        other = self.wall - self.gets - self.wait_m3 - self.parse - self.write
+        return (f"  [{index:>5}/{total}] {self.fname} {self.record_type} {self.records:,}件 "
+                f"{self.wall:.1f}秒 = JVGets {self.gets:.1f} / -3待ち {self.wait_m3:.1f}({self.minus3}回)"
+                f" / 解析 {self.parse:.1f} / 書出 {self.write:.1f} / その他 {other:.1f}"
+                f"  [JVGets 1回: 前半{self.first_ms:.1f}ms 後半{self.last_ms:.1f}ms]")
+
+    def row(self) -> dict:
+        return {"file": self.fname, "type": self.record_type, "records": self.records,
+                "gets_calls": self.gets_calls, "wall_sec": round(self.wall, 3),
+                "gets_sec": round(self.gets, 3), "minus3_count": self.minus3,
+                "minus3_wait_sec": round(self.wait_m3, 3), "parse_sec": round(self.parse, 3),
+                "write_sec": round(self.write, 3), "gets_first100_ms": round(self.first_ms, 3),
+                "gets_last100_ms": round(self.last_ms, 3)}
+
+
+class TimingLog:
+    """ファイルごとの計時を CSV に追記し、画面にも1行ずつ出す。"""
+
+    COLUMNS = ["logged_at", "file", "type", "records", "gets_calls", "wall_sec", "gets_sec",
+               "minus3_count", "minus3_wait_sec", "parse_sec", "write_sec",
+               "gets_first100_ms", "gets_last100_ms"]
+
+    def __init__(self, path: Path | None, log=print, show_min_sec: float = 0.0):
+        self.path, self.log, self.show_min_sec = path, log, show_min_sec
+        self.rows: list[dict] = []
+
+    def add(self, t: FileTiming, index: int, total: int) -> None:
+        row = {"logged_at": datetime.now().isoformat(timespec="seconds"), **t.row()}
+        self.rows.append(row)
+        if t.wall >= self.show_min_sec:
+            self.log(t.line(index, total))
+        if self.path is None:
+            return
+        new = not self.path.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=self.COLUMNS)
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+
 def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
           out_dir: str | os.PathLike | None = None,
           record_types: tuple[str, ...] = ("RA", "SE", "HR"),
           client: JVLinkClient | None = None, struct_module: ModuleType | None = None,
           sid: str = "UNKNOWN", retry_sleep_sec: float = 1.0,
           max_retry_sec: float = 600, max_reopen: int = 3, reopen_wait_sec: float = 10.0,
-          sleep=time.sleep, log=print, progress_every: int = 50_000) -> FetchResult:
+          sleep=time.sleep, log=print, progress_every: int = 50_000,
+          buffer_size: int | None = None, parse: bool = True,
+          max_data_files: int | None = None, timing_path: str | os.PathLike | None = "auto",
+          clock=time.perf_counter) -> FetchResult:
     """JV-Link から取得して、レコード種別ごとの CSV に追記する。
 
     Parameters
@@ -493,28 +594,40 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
                ※ これは**データの提供時刻**であってレース日ではない。
                  レース日で絞るのは読み込んだ後（jvmap 側）で行う。
     option   : 1=通常（差分更新） / 2=今週 / 4=ダイアログ無しセットアップ（初回のみダイアログ）
+    retry_sleep_sec : -3（ダウンロード中）のときに待つ時間の**上限**。
+               0.05秒から始めて、続くたびに倍にしていき、この値で頭打ちにする。
     max_reopen : -402/-403/-502/-503 のとき、自動で JVClose → JVOpen し直す回数。
                  読み終えたファイルは飛ばすので、やり直しても最初から読み直しにはならない。
+    buffer_size : JVGets に渡すバッファの大きさ（既定 110,000）。
+    parse    : False ならパースも CSV 書き出しもしない（JVGets だけの速さを測る bench 用）。
+    max_data_files : 保存対象のファイルをこの数だけ読んだら止める（bench 用）。
+    timing_path : ファイルごとの所要時間の記録先。"auto" なら out_dir/fetch_timing.csv。
 
     中断からの再開:
       同じ dataspec / fromtime / option でもう一度実行すると、読み終えたファイルを
       JVSkip で飛ばして続きから読む（Progress を参照）。
     """
     out_dir = Path(out_dir or config.JV_DATA_DIR)
-    struct_module = struct_module or load_struct_module()
-    client = client or JVLinkClient()
+    if parse:
+        struct_module = struct_module or load_struct_module()
+    client = client or JVLinkClient(buffer_size=buffer_size)
+    if buffer_size:
+        client.buffer_size = buffer_size
 
     if fromtime is None:
         prev = load_state(out_dir).get(dataspec, {}).get("last_file_timestamp")
         fromtime = prev or (datetime.now() - timedelta(days=30)).strftime("%Y%m%d000000")
 
-    writers = {rt: CsvAppender(out_dir / f"{rt}.csv", ["_seq"] + columns_for(rt, struct_module))
-               for rt in record_types}
+    writers = ({rt: CsvAppender(out_dir / f"{rt}.csv", ["_seq"] + columns_for(rt, struct_module))
+                for rt in record_types} if parse else {})
     # 追記する CSV の通し番号（同じ作成日のレコードの前後関係を決めるのに使う）
-    counter = {"seq": _next_seq(out_dir, record_types), "total": 0}
+    counter = {"seq": _next_seq(out_dir, record_types) if parse else 0, "total": 0}
     progress = Progress(out_dir, dataspec, option, fromtime)
     if progress.done:
         log(f"前回の続きから再開します（読み終えたファイル {len(progress.done)} 個を飛ばす）")
+    if timing_path == "auto":
+        timing_path = out_dir / "fetch_timing.csv"
+    timing = TimingLog(Path(timing_path) if timing_path else None, log=log)
 
     result = FetchResult(dataspec, fromtime, option, open_code=0)
     started = time.time()
@@ -525,7 +638,8 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
             try:
                 _read_all(client, dataspec, fromtime, option, writers, struct_module,
                           progress, counter, result, retry_sleep_sec, max_retry_sec,
-                          sleep, log, progress_every)
+                          sleep, log, progress_every, set(record_types), parse,
+                          max_data_files, timing, clock)
                 break
             except JVLinkError as e:
                 if e.code not in REOPEN_CODES or attempt >= max_reopen:
@@ -538,7 +652,8 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
                 client.close()
                 sleep(reopen_wait_sec)
 
-        if result.open_code != -1:
+        result.timings = timing.rows
+        if result.open_code != -1 and not result.stopped_early:
             for w in writers.values():
                 w.flush()
             _save_state(out_dir, dataspec, result)
@@ -556,7 +671,8 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
 
 
 def _read_all(client, dataspec, fromtime, option, writers, struct_module, progress,
-              counter, result, retry_sleep_sec, max_retry_sec, sleep, log, progress_every):
+              counter, result, retry_sleep_sec, max_retry_sec, sleep, log, progress_every,
+              wanted, parse, max_data_files, timing, clock):
     """JVOpen から EOF まで読む（1回分）。"""
     log(f"JVOpen({dataspec!r}, {fromtime!r}, option={option})")
     opened = client.open(dataspec, fromtime, option)
@@ -573,23 +689,38 @@ def _read_all(client, dataspec, fromtime, option, writers, struct_module, progre
     log(f"  読込対象ファイル {opened.read_count} / ダウンロード {opened.download_count}")
 
     wait_for_download(client, opened.download_count, sleep=sleep, log=log)
+    log("  読み込み開始（保存対象のファイルを読み終えるたびに1行ずつ所要時間を表示）")
+
+    cur: FileTiming | None = None   # いま読んでいる保存対象ファイルの計時
 
     def finish(fname: str) -> None:
         """1ファイル読み終わり：先に CSV へ書き出してから、読み終えたと記録する。"""
+        nonlocal cur
         if not fname:
             return
+        t0 = clock()
         for w in writers.values():
             w.flush()
         progress.mark(fname)
         result.files_done += 1
+        if cur is not None and cur.fname == fname:
+            cur.write += clock() - t0
+            cur.wall = clock() - cur.started
+            result.data_files += 1
+            timing.add(cur, result.files_done + result.resumed_files, opened.read_count)
+        cur = None
 
-    current = ""   # いま読んでいるファイル名
+    current = ""     # いま読んでいるファイル名
+    m3_streak = 0    # -3 が何回続いたか（待ち時間を伸ばすのに使う）
     waited = 0.0
+    pending_m3 = (0, 0.0)  # レコードを読む前の -3（どのファイルの待ちか、次のレコードで確定する）
     while True:
+        t0 = clock()
         code, raw, fname = client.gets()
+        dt = clock() - t0
 
         if code > 0:
-            waited = 0.0
+            waited, m3_streak = 0.0, 0
             if fname != current:          # 次のファイルに入った
                 finish(current)
                 current = fname
@@ -597,24 +728,37 @@ def _read_all(client, dataspec, fromtime, option, writers, struct_module, progre
                 result.resumed_files += 1
                 client.skip()
                 current = ""
+                pending_m3 = (0, 0.0)
                 continue
             record_type = raw[:2].decode("ascii", errors="replace")
-            if record_type not in writers:
+            if record_type not in wanted:
                 # 1ファイル=1レコード種別なので、残りは読まずに次のファイルへ
                 result.skipped_files[record_type] = result.skipped_files.get(record_type, 0) + 1
                 client.skip()
                 finish(current)
                 current = ""
+                pending_m3 = (0, 0.0)
                 continue
+            if cur is None:
+                cur = FileTiming(fname, record_type, started=t0)
+                cur.minus3, cur.wait_m3 = pending_m3
+                pending_m3 = (0, 0.0)
+            cur.add_gets(dt)
+            cur.records += 1
+
             if len(raw) < RECORD_LENGTHS[record_type] - 2:
                 result.short_records += 1
-            parsed = parse_record(raw, struct_module)
-            if parsed is None:
-                continue
-            _, row = parsed
-            row["_seq"] = counter["seq"]
-            counter["seq"] += 1
-            writers[record_type].append(row)
+            if parse:
+                t1 = clock()
+                parsed = parse_record(raw, struct_module)
+                t2 = clock()
+                cur.parse += t2 - t1
+                if parsed is not None:
+                    _, row = parsed
+                    row["_seq"] = counter["seq"]
+                    counter["seq"] += 1
+                    writers[record_type].append(row)
+                    cur.write += clock() - t2
             result.records[record_type] = result.records.get(record_type, 0) + 1
             counter["total"] += 1
             if counter["total"] % progress_every == 0:
@@ -625,6 +769,9 @@ def _read_all(client, dataspec, fromtime, option, writers, struct_module, progre
             result.files_switched += 1
             finish(current)
             current = ""
+            if max_data_files is not None and result.data_files >= max_data_files:
+                result.stopped_early = True
+                return
         elif code == 0:           # 全ファイル読み終わり
             finish(current)
             return
@@ -632,8 +779,18 @@ def _read_all(client, dataspec, fromtime, option, writers, struct_module, progre
             if waited >= max_retry_sec:
                 raise JVLinkError("JVGets", code,
                                   f"{max_retry_sec:.0f} 秒待ってもダウンロードが終わりません")
-            sleep(retry_sleep_sec)
-            waited += retry_sleep_sec
+            # 最初は 0.05 秒、続くたびに倍にして retry_sleep_sec で頭打ち。
+            # 1秒固定だと、すぐ終わる待ちでも毎回1秒捨てることになるため。
+            wait = min(0.05 * (2 ** m3_streak), retry_sleep_sec)
+            m3_streak += 1
+            sleep(wait)
+            waited += wait
+            result.minus3 += 1
+            if cur is not None:
+                cur.minus3 += 1
+                cur.wait_m3 += wait + dt
+            else:
+                pending_m3 = (pending_m3[0] + 1, pending_m3[1] + wait + dt)
         elif code in (-402, -403):
             client.delete_file(fname)
             raise JVLinkError("JVGets", code, ERROR_ADVICE[code] + f"（{fname}）")
@@ -684,8 +841,54 @@ def _cmd_check(args) -> int:
 
 def _cmd_fetch(args) -> int:
     result = fetch(dataspec=args.dataspec, fromtime=args.fromtime, option=args.option,
-                   out_dir=args.out)
+                   out_dir=args.out, buffer_size=args.buffer_size)
     print(result.summary())
+    return 0
+
+
+def _cmd_bench(args) -> int:
+    """遅い原因を切り分けるため、先頭の数ファイルだけを読んで内訳を出す。
+
+    本番の CSV・進捗とは別のフォルダ（data/jvlink/bench/日時_条件）に書くので、
+    本番のセットアップの再開記録には影響しない。JV-Link を同時に2つ開くのは
+    避けたいので、本番のセットアップは止めてから実行すること。
+    """
+    import cProfile
+    import io
+    import pstats
+
+    label = f"buf{args.buffer_size or BUFFER_SIZE}" + ("" if not args.no_parse else "_noparse")
+    out = Path(args.out or config.JV_DATA_DIR) / "bench" / f"{datetime.now():%Y%m%d_%H%M%S}_{label}"
+    types = tuple(t.strip() for t in args.types.split(",") if t.strip())
+    print(f"bench: 種別={types} ファイル数={args.files} バッファ={args.buffer_size or BUFFER_SIZE} "
+          f"解析={'しない' if args.no_parse else 'する'}  出力先={out}")
+
+    prof = cProfile.Profile() if args.profile else None
+    if prof:
+        prof.enable()
+    result = fetch(dataspec=args.dataspec, fromtime=args.fromtime, option=args.option,
+                   out_dir=out, record_types=types, buffer_size=args.buffer_size,
+                   parse=not args.no_parse, max_data_files=args.files)
+    if prof:
+        prof.disable()
+
+    print(result.summary())
+    rows = result.timings
+    if rows:
+        recs = sum(r["records"] for r in rows)
+        gets = sum(r["gets_sec"] for r in rows)
+        wall = sum(r["wall_sec"] for r in rows)
+        print(f"\n合計: {recs:,}件 {wall:.1f}秒  JVGets {gets:.1f}秒"
+              f"（1件あたり {1000 * gets / max(recs, 1):.2f}ms）"
+              f"  解析 {sum(r['parse_sec'] for r in rows):.1f}秒"
+              f"  書出 {sum(r['write_sec'] for r in rows):.1f}秒"
+              f"  -3待ち {sum(r['minus3_wait_sec'] for r in rows):.1f}秒"
+              f"（{sum(r['minus3_count'] for r in rows)}回）")
+    if prof:
+        buf = io.StringIO()
+        pstats.Stats(prof, stream=buf).sort_stats("tottime").print_stats(15)
+        print("\n--- cProfile（関数そのものにかかった時間の上位15）---")
+        print(buf.getvalue())
     return 0
 
 
@@ -738,8 +941,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--from", dest="fromtime", default=None,
                    help="YYYYMMDDhhmmss（省略時は前回の続き。初回は30日前）")
     p.add_argument("--option", type=int, default=1, choices=[1, 2, 3, 4])
+    p.add_argument("--buffer-size", type=int, default=None,
+                   help="JVGets に渡すバッファの大きさ（既定 110000）。bench の結果で決める")
     p.add_argument("--out", default=None)
     p.set_defaults(func=_cmd_fetch)
+
+    p = sub.add_parser("bench", help="先頭の数ファイルだけ読んで、遅い原因の内訳を測る")
+    p.add_argument("--dataspec", default="RACE")
+    p.add_argument("--from", dest="fromtime", default="19860101000000")
+    p.add_argument("--option", type=int, default=4, choices=[1, 2, 3, 4])
+    p.add_argument("--types", default="SE", help="保存対象の種別（カンマ区切り）。既定 SE")
+    p.add_argument("--files", type=int, default=1, help="保存対象のファイルを何個読んだら止めるか")
+    p.add_argument("--buffer-size", type=int, default=None, help="JVGets のバッファ（既定 110000）")
+    p.add_argument("--no-parse", action="store_true", help="パースと CSV 書き出しをしない")
+    p.add_argument("--profile", action="store_true", help="cProfile で関数ごとの時間も出す")
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=_cmd_bench)
 
     p = sub.add_parser("summary", help="保存済み CSV の中身を集計して表示")
     p.add_argument("--out", default=None)
