@@ -698,7 +698,9 @@ def fetch(dataspec: str = "RACE", fromtime: str | None = None, option: int = 1,
         log(f"前回の続きから再開します（読み終えたファイル {len(progress.done)} 個を飛ばす）")
     if timing_path == "auto":
         timing_path = out_dir / "fetch_timing.csv"
-    timing = TimingLog(Path(timing_path) if timing_path else None, log=log)
+    # 画面には1秒以上かかったファイルだけ出す（週次の差分更新は小さいファイルが多く、
+    # 全部出すと読みにくい）。CSV には全ファイルを記録する。
+    timing = TimingLog(Path(timing_path) if timing_path else None, log=log, show_min_sec=1.0)
 
     result = FetchResult(dataspec, fromtime, option, open_code=0)
     started = time.time()
@@ -774,7 +776,7 @@ def _read_all(client, dataspec, fromtime, option, writers, struct_module, progre
     log(f"  読込対象ファイル {opened.read_count} / ダウンロード {opened.download_count}")
 
     wait_for_download(client, opened.download_count, sleep=sleep, log=log)
-    log("  読み込み開始（保存対象のファイルを読み終えるたびに1行ずつ所要時間を表示）")
+    log("  読み込み開始（1秒以上かかった保存対象ファイルは、読み終えるたびに所要時間を表示）")
 
     cur: FileTiming | None = None   # いま読んでいる保存対象ファイルの計時
 

@@ -70,7 +70,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 161 passed（SDK が無い環境では 155 passed, 6 skipped）
+py -m pytest tests -q          # 167 passed（SDK が無い環境では 161 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -92,11 +92,15 @@ py -m src.jvlink summary                                       # 取得した中
 ```powershell
 py -m src.v5 build                 # 生データを変換し、各段階で何件残ったかを表示
 py -m src.v5 grades                # 年 × 格付けのレース数
+py -m src.v5 coverage              # 主要な列の年ごとの欠損率（何年から使えるか）
 py -m src.v5 validate              # v4 と同じ時系列CV（5fold）を回し、v4 と比較
 py -m src.v5 validate --ablation   # 公式脚質特徴量の有無で AUC も比較（約2倍の時間）
 ```
 
 結果は `data\jvlink\v5_results\` に CSV でも保存される。
+
+`build` は既定で **1986-01-01 以降のレース**だけを使う（v4 と同じ期間。生データには1954年からの記録も
+残してある）。`--start-date none` で全期間、`--start-date 2000-01-01` のように変えられる。
 
 ---
 

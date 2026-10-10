@@ -389,6 +389,19 @@ def test_ctrl_c_closes_and_ignores_second_ctrl_c(tmp_path):
     assert "F000.jvd" in jvlink.Progress(tmp_path, "RACE", 4, "19860101000000")
 
 
+def test_only_slow_files_are_printed(tmp_path):
+    """画面には1秒以上かかったファイルだけ出す（CSV には全部記録する）。"""
+    rec = b"SE" + b" " * 553
+    fake = FakeJVLink([rec, -1, rec, -1, 0])
+    messages = []
+    res = jvlink.fetch(fromtime="20260901000000", out_dir=tmp_path, record_types=("SE",),
+                       client=_client(fake), parse=False, sleep=lambda s: None,
+                       log=messages.append)
+    assert len(res.timings) == 2
+    assert not any(".jvd SE" in m for m in messages)   # 速いファイルは表示しない
+    assert len(pd.read_csv(tmp_path / "fetch_timing.csv", encoding="utf-8-sig")) == 2
+
+
 def test_missing_sdk_gives_clear_error(tmp_path):
     """SDK が見つからないとき、JVSDK_DIR の設定方法を含むエラーになること。"""
     with pytest.raises(FileNotFoundError, match="JVSDK_DIR"):
@@ -633,6 +646,99 @@ def test_build_reports_races_without_horses():
     assert steps["最終レース数"] == 10
     assert any("1987: 3" in what for what, n in ds.report.steps if n is None)
     assert steps["最終レースのうち 3連単払戻あり"] == 10
+
+
+def _with_old_races(raw, n_old=4, year=1960):
+    """1986年より前のレース（RA と SE）を足す。HR は無い（実データと同じ）。"""
+    ra_old = raw["RA"].iloc[:n_old].copy()
+    se_old = raw["SE"].loc[raw["SE"]["id.RaceNum"].isin(ra_old["id.RaceNum"])
+                           & raw["SE"]["id.Year"].isin(ra_old["id.Year"])
+                           & raw["SE"]["id.JyoCD"].isin(ra_old["id.JyoCD"])].copy()
+    for df in (ra_old, se_old):
+        df["id.Year"] = str(year)
+        df["head.MakeDate.Year"] = str(year)
+    ra_old["_seq"] = [str(10_000 + i) for i in range(len(ra_old))]
+    se_old["_seq"] = [str(20_000 + i) for i in range(len(se_old))]
+    raw = dict(raw)
+    raw["RA"] = pd.concat([raw["RA"], ra_old], ignore_index=True)
+    raw["SE"] = pd.concat([raw["SE"], se_old], ignore_index=True)
+    return raw, len(ra_old)
+
+
+def test_build_starts_from_1986_by_default():
+    """既定では1986年より前のレースとその馬を外し、件数と開催年の内訳を出すこと。"""
+    raw, n_old = _with_old_races(make_raw(n_races=20, years=1))
+    ds = jvmap.build_dataset(raw=raw)
+    assert ds.race_result["レース日付"].min() >= pd.Timestamp("1986-01-01")
+    steps = dict(ds.report.steps)
+    assert steps["RA 開始日 1986-01-01 の範囲外を除外（生データには残す）"] == n_old
+    assert any(what == f"開催年の内訳: {{1960: {n_old}}}" for what, n in ds.report.steps)
+    assert steps["最終レース数"] == 20
+    assert steps["RA のうち馬のデータが無く除外したレース"] == 0  # 古いレースはここでは数えない
+
+
+def test_build_can_include_pre_1986():
+    """start=None なら1986年より前も含めて作れる（生データは消していない）。"""
+    raw, n_old = _with_old_races(make_raw(n_races=20, years=1))
+    ds = jvmap.build_dataset(raw=raw, start=None)
+    assert ds.race_result["レースID"].nunique() == 20 + n_old
+    # 古いレースは HR が無いので「HR が未着」に数えられる
+    assert any(f"HR が未着 {n_old}" in what for what, n in ds.report.steps if n is None)
+
+
+def test_payout_reasons_split_not_sold_and_irregular():
+    """払戻なしを「発売なし」と「不成立・特払」に分けて数えること。"""
+    raw = make_raw(n_races=6, years=1)
+    hr = raw["HR"].copy()
+    hr.loc[0, "PaySanrentan[1].Kumi"] = "000000"                    # 発売なし
+    hr.loc[1, "PaySanrentan[1].Kumi"] = "000000"                    # 発売なし
+    hr.loc[2, "PaySanrentan[1].Kumi"] = "000000"                    # 不成立
+    hr.loc[2, "FuseirituFlag[9]"] = "1"
+    hr.loc[3, "HenkanFlag[9]"] = "1"                                # 返還（既定は除外しない）
+    raw["HR"] = hr
+    ds = jvmap.build_dataset(raw=raw)
+    notes = [what for what, n in ds.report.steps if n is None]
+    assert any("3連単の発売なし 2 / 不成立・特払 1 / 返還など（除外の設定） 0" in w for w in notes)
+    assert dict(ds.report.steps)["最終レースのうち 3連単払戻あり"] == 3
+    assert any(w.startswith("3連単の発売なしの開催年") for w in notes)
+
+    ds2 = jvmap.build_dataset(raw=raw, exclude_irregular_payout=True)
+    notes2 = [what for what, n in ds2.report.steps if n is None]
+    assert any("返還など（除外の設定） 1" in w for w in notes2)
+
+
+def test_three_furlongs_filled_from_laps():
+    """公式の前3F・後3Fが空なら、ラップタイムから計算して補うこと。"""
+    raw = make_raw(n_races=3, years=1)
+    ra = raw["RA"].copy()
+    laps = ["120", "110", "115", "120", "118", "116", "117", "119"]   # 1600m（8本）
+    for i in range(1, 26):
+        ra[f"LapTime[{i}]"] = laps[i - 1] if i <= len(laps) else "000"
+    ra.loc[0, ["HaronTimeS3", "HaronTimeL3"]] = "000"   # 公式値なし → ラップから
+    ra.loc[1, ["HaronTimeS3", "HaronTimeL3"]] = ["345", "352"]   # 公式値あり → そのまま
+    for i in range(1, 26):
+        ra.loc[2, f"LapTime[{i}]"] = "000"
+    ra.loc[2, ["HaronTimeS3", "HaronTimeL3"]] = "000"   # どちらも無い
+    races = jvmap.prepare_races(ra)
+    assert races.loc[0, "_前3F"] == pytest.approx(12.0 + 11.0 + 11.5)
+    assert races.loc[0, "_後3F"] == pytest.approx(11.6 + 11.7 + 11.9)
+    assert races.loc[0, "_3F出所"] == "ラップ"
+    assert races.loc[1, "_前3F"] == pytest.approx(34.5) and races.loc[1, "_3F出所"] == "公式"
+    assert np.isnan(races.loc[2, "_前3F"]) and races.loc[2, "_3F出所"] == "なし"
+
+
+def test_coverage_by_year_table():
+    """年ごとの欠損率の表が作れること（3F は平地だけで数える）。"""
+    raw = make_raw(n_races=40, years=2)
+    se = raw["SE"].copy()
+    se.loc[se["id.Year"] == "2011", "KyakusituKubun"] = "0"     # 1年目は脚質判定なし
+    raw["SE"] = se
+    table = jvmap.coverage_by_year(jvmap.build_dataset(raw=raw))
+    assert {"頭数", "_前3F", "_後3F", "3F_ラップ補完", "_4コーナー順位", "_脚質判定",
+            "馬体重", "後３Ｆタイム"} <= set(table.columns)
+    assert table.loc[2011, "_脚質判定"] == 100.0
+    assert table.loc[2012, "_脚質判定"] == 0.0
+    assert table.loc[2011, "_1コーナー順位"] == 100.0   # 合成データは1角を通らない
 
 
 def test_jump_grade_labels_match_kaggle():

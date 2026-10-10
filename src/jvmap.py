@@ -333,10 +333,8 @@ def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
         "公式出走頭数": to_int(ra["SyussoTosu"], invalid=("00",)).to_numpy(),
         "発走時刻": ra["HassoTime"].to_numpy(),
         "_RAデータ区分": ra["head.DataKubun"].to_numpy(),
-        # レース単位の公式3ハロン（平地のみ。障害は初期値 000 → NaN）
-        "_前3F": to_tenths(ra["HaronTimeS3"], invalid=("000", "999")).to_numpy(),
-        "_後3F": to_tenths(ra["HaronTimeL3"], invalid=("000", "999")).to_numpy(),
     })
+    _attach_three_furlongs(out, ra)
     # 馬場状態は芝なら芝の、ダート・障害なら該当する方を使う
     siba = ra["TenkoBaba.SibaBabaCD"].map(BABA_LABELS).to_numpy()
     dirt = ra["TenkoBaba.DirtBabaCD"].map(BABA_LABELS).to_numpy()
@@ -345,6 +343,39 @@ def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
     out["馬場状態1"] = pd.Series(out["馬場状態1"]).where(
         pd.Series(out["馬場状態1"]).notna(), pd.Series(dirt)).to_numpy()
     return out
+
+
+def _attach_three_furlongs(out: pd.DataFrame, ra: pd.DataFrame) -> None:
+    """レース単位の前3F・後3Fを付ける。公式値が空ならラップタイムから計算して補う。
+
+    公式値（HaronTimeS3/L3）は古い年に入っていないことがある。仕様書の定義では
+      前3ハロン = ラップの前半3本の合計（200mで割り切れない距離は、最初の1本が端数）
+      後3ハロン = ラップの後半3本の合計
+    なので、ラップがあれば同じ量を計算できる（Kaggle 版でやっていた計算と同じ）。
+    どちらから取ったかは `_3F出所`（公式 / ラップ / なし）に残す。
+    平地のみ（障害はラップも3Fも入らない）。
+    """
+    from . import pace as pace_mod
+
+    official_s3 = to_tenths(ra["HaronTimeS3"], invalid=("000", "999")).to_numpy()
+    official_l3 = to_tenths(ra["HaronTimeL3"], invalid=("000", "999")).to_numpy()
+
+    lap_cols = [f"LapTime[{i}]" for i in range(1, 26)]
+    if all(c in ra.columns for c in lap_cols):
+        laps = pd.DataFrame({"レースID": out["レースID"].to_numpy()})
+        for i, c in enumerate(lap_cols, start=1):
+            laps[f"ラップタイム{i}"] = to_tenths(ra[c], invalid=("000", "999")).to_numpy()
+        from_laps = pace_mod.compute_race_pace(laps)
+        lap_s3 = from_laps["前半3F"].to_numpy(dtype="float64")
+        lap_l3 = from_laps["上がり3F"].to_numpy(dtype="float64")
+    else:
+        lap_s3 = lap_l3 = np.full(len(out), np.nan)
+
+    has_official = ~np.isnan(official_s3) & ~np.isnan(official_l3)
+    has_laps = ~np.isnan(lap_s3) & ~np.isnan(lap_l3)
+    out["_前3F"] = np.where(has_official, official_s3, lap_s3)
+    out["_後3F"] = np.where(has_official, official_l3, lap_l3)
+    out["_3F出所"] = np.select([has_official, has_laps], ["公式", "ラップ"], default="なし")
 
 
 def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
@@ -412,8 +443,8 @@ def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
 def prepare_pace(races: pd.DataFrame) -> pd.DataFrame:
     """pace.attach_race_pace() が期待する形のレース単位ペース表を作る。
 
-    Kaggle 版はラップから前半3F・上がり3Fを計算し直していたが、
-    JRA-VAN は公式値（RA の前3ハロン・後3ハロン）がそのまま入っているので使う。
+    JRA-VAN の公式値（RA の前3ハロン・後3ハロン）を使い、空のレースだけ
+    ラップから計算した値で補う（_attach_three_furlongs）。
     """
     out = pd.DataFrame({
         "レースID": races["レースID"].to_numpy(),
@@ -440,17 +471,19 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
     hr = hr.loc[hr["id.JyoCD"].isin(CENTRAL_JYO) & hr["head.DataKubun"].isin(USABLE_HR_KUBUN)]
     report.add("HR 重複解消・中央・確定のみ", len(hr))
 
-    out = pd.DataFrame({"レースID": make_race_id(hr).to_numpy()})
+    out = pd.DataFrame({"レースID": make_race_id(hr).to_numpy(),
+                        "_HR日付": make_date(hr).to_numpy()})
     for kind, prefix in [("3連単", "PaySanrentan"), ("3連複", "PaySanrenpuku")]:
         kumi = hr[f"{prefix}[1].Kumi"].astype(str).str.strip()
-        pay = to_int(hr[f"{prefix}[1].Pay"])
-        pay = pay.where(~kumi.isin({"", "000000"}))  # 発売なし・特払・不成立
+        no_kumi = kumi.isin({"", "000000"})       # 当たり目が無い（発売なし・不成立・特払）
+        pay = to_int(hr[f"{prefix}[1].Pay"]).where(~no_kumi)
         n_hits = sum((hr[f"{prefix}[{i}].Kumi"].astype(str).str.strip()
                       .pipe(lambda s: ~s.isin({"", "000000"}))).astype(int)
                      for i in range(1, 4))
         i = FLAG_INDEX[kind]
-        irregular = ((hr[f"FuseirituFlag[{i}]"] == "1") | (hr[f"TokubaraiFlag[{i}]"] == "1")
-                     | (hr[f"HenkanFlag[{i}]"] == "1"))
+        fuseiritu_tokubarai = ((hr[f"FuseirituFlag[{i}]"] == "1")
+                               | (hr[f"TokubaraiFlag[{i}]"] == "1"))
+        irregular = fuseiritu_tokubarai | (hr[f"HenkanFlag[{i}]"] == "1")
         if exclude_irregular:
             report.add(f"HR {kind} 不成立・特払・返還で除外", int(irregular.sum()))
             pay = pay.where(~irregular)
@@ -458,6 +491,14 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
             report.add(f"HR {kind} 不成立・特払・返還あり（除外しない）", int(irregular.sum()))
         out[f"{kind}払戻"] = pay.astype("float64").to_numpy()
         out[f"{kind}的中組数"] = np.asarray(n_hits)
+        # 払戻が無い理由。発売開始日などは決め打ちせず、HR の中身で判定する:
+        #   組番が空で不成立・特払フラグも無い → その券種が発売されていない（3連単は発売開始前など）
+        #   組番が空で不成立・特払フラグがある → 不成立・特払
+        #   組番はあるが除外の設定で外した     → 返還など（--exclude-irregular のとき）
+        out[f"_{kind}払戻なし理由"] = np.select(
+            [no_kumi & ~fuseiritu_tokubarai, no_kumi & fuseiritu_tokubarai,
+             (~no_kumi) & irregular & exclude_irregular],
+            ["発売なし", "不成立・特払", "返還など（除外の設定）"], default="")
     return out
 
 
@@ -478,27 +519,50 @@ class JVDataset:
             "  格付け（レース数）: "
             + str(rr.drop_duplicates('レースID')['リステッド・重賞競走']
                   .value_counts(dropna=False).to_dict()),
-            f"  3連単払戻あり: {self.payout_df['3連単払戻'].notna().sum():,} レース",
+            f"  3連単払戻あり: {self.payout_df['3連単払戻'].notna().sum():,} レース（最終レースのうち）",
         ]
         return "\n".join(lines)
 
 
+# build の既定の開始日。v4（Kaggle、1986年1月〜）と条件を揃える。
+# JRA-VAN には1986年より前の重賞の記録などが少し入っているが、払戻（HR）は1986年からしかなく、
+# 混ぜると騎手・調教師の通算成績に昔の大レースだけが入ってしまう。生データには残す。
+DEFAULT_START = "1986-01-01"
+
+
 def build_dataset(data_dir: str | os.PathLike | None = None,
                   raw: dict[str, pd.DataFrame] | None = None,
-                  start: str | None = None, end: str | None = None,
+                  start: str | None = DEFAULT_START, end: str | None = None,
                   jump_as_flat: bool = False,
                   exclude_irregular_payout: bool = False) -> JVDataset:
     """生 CSV から、既存パイプラインに渡せる3つの表を作る。
 
-    start / end（"YYYY-MM-DD"）でレース日を絞れる。JVOpen は「提供時刻」でしか
-    範囲を指定できないので、レース日で切りたいときはここで行う。
-    ※ 過去成績の特徴量は絞った範囲の中だけで計算されるので、学習期間を
-      絞りたいだけなら、ここでは絞らず validate の fold で切ること。
+    start / end（"YYYY-MM-DD"）でレース日を絞る。既定は 1986-01-01 以降（DEFAULT_START）。
+    None にすると絞らない。絞るのはレース（RA）の段階なので、範囲外のレースの馬も
+    一緒に外れ、過去成績の特徴量にも入らない。**生データ（RA.csv / SE.csv）は変更しない。**
+    ※ 学習期間を絞りたいだけなら、ここでは絞らず validate の fold で切ること
+      （ここで絞ると、その前の成績が通算成績に入らなくなる）。
     """
     raw = raw or load_raw(data_dir)
     report = BuildReport()
 
     races = prepare_races(raw["RA"], report, jump_as_flat=jump_as_flat)
+
+    # レース日での絞り込み（ここで切れば、範囲外のレースの馬も prepare_horses で外れる）
+    for bound, label, keep in [
+        (start, "開始日", lambda d, b: d >= b),
+        (end, "終了日", lambda d, b: d <= b),
+    ]:
+        if bound is None:
+            continue
+        mask = keep(races["レース日付"], pd.Timestamp(bound))
+        out_of_range = races.loc[~mask]
+        report.add(f"RA {label} {bound} の範囲外を除外（生データには残す）", len(out_of_range))
+        if len(out_of_range):
+            report.note("開催年の内訳: " + _year_counts(out_of_range["レース日付"]))
+        races = races.loc[mask]
+    report.add("RA 期間内のレース", len(races))
+
     horses = prepare_horses(raw["SE"], races, report)
     payout = prepare_payout(raw["HR"], report, exclude_irregular=exclude_irregular_payout)
 
@@ -507,33 +571,83 @@ def build_dataset(data_dir: str | os.PathLike | None = None,
     dropped = races.loc[~races["レースID"].isin(with_horses)]
     report.add("RA のうち馬のデータが無く除外したレース", len(dropped))
     if len(dropped):
-        by_year = dropped["レース日付"].dt.year.value_counts().sort_index().to_dict()
-        report.note(f"開催年の内訳: {by_year}")
+        report.note("開催年の内訳: " + _year_counts(dropped["レース日付"]))
         report.note("SE が届いていない（過去レースの訂正で RA だけ届いた等）か、"
                     "全馬が取消・除外・中止だったレース")
-
-    if start is not None:
-        horses = horses.loc[horses["レース日付"] >= pd.Timestamp(start)]
-    if end is not None:
-        horses = horses.loc[horses["レース日付"] <= pd.Timestamp(end)]
-    races = races.loc[races["レースID"].isin(set(horses["レースID"]))]
+    races = races.loc[races["レースID"].isin(with_horses)]
     report.add("最終レース数", len(races))
 
-    # 払戻の有無の内訳（検証に使えるのは 3連単払戻があるレースだけ）
-    pay = payout.set_index("レースID")["3連単払戻"]
-    ids = races["レースID"]
-    no_hr = int((~ids.isin(pay.index)).sum())
-    no_pay = int(ids.isin(pay.index).sum() - pay.reindex(ids).notna().sum())
-    report.add("最終レースのうち 3連単払戻あり", len(ids) - no_hr - no_pay)
-    if no_hr or no_pay:
-        report.note(f"払戻なしの内訳: HR が未着 {no_hr} / 不成立・特払・返還など {no_pay}")
+    # 3F の出所（公式 / ラップから計算 / なし）
+    src = races["_3F出所"].value_counts().to_dict()
+    report.note(f"前3F・後3Fの出所: 公式 {src.get('公式', 0):,} / ラップから計算 {src.get('ラップ', 0):,}"
+                f" / なし {src.get('なし', 0):,}（障害はもともと無い）")
 
+    # 払戻の有無の内訳（検証に使えるのは 3連単払戻があるレースだけ）
+    pay = payout.set_index("レースID")
+    ids = races["レースID"]
+    in_hr = ids.isin(pay.index)
+    sub = pay.reindex(ids[in_hr])
+    has_pay = int(sub["3連単払戻"].notna().sum())
+    report.add("最終レースのうち 3連単払戻あり", has_pay)
+    reasons = sub.loc[sub["3連単払戻"].isna(), "_3連単払戻なし理由"]
+    no_hr = int((~in_hr).sum())
+    not_sold = reasons == "発売なし"
+    report.note(f"払戻なしの内訳: HR が未着 {no_hr:,} / 3連単の発売なし {int(not_sold.sum()):,}"
+                f" / 不成立・特払 {int((reasons == '不成立・特払').sum()):,}"
+                f" / 返還など（除外の設定） {int((reasons == '返還など（除外の設定）').sum()):,}")
+    if not_sold.any():
+        dates = pd.to_datetime(sub.loc[reasons.index[not_sold], "_HR日付"])
+        report.note("3連単の発売なしの開催年: " + _year_counts(dates))
+    sold = sub.loc[sub["3連単払戻"].notna(), "_HR日付"]
+    if len(sold):
+        report.note(f"3連単の払戻がある最初のレース: {pd.to_datetime(sold).min():%Y-%m-%d}")
+
+    horses = horses.loc[horses["レースID"].isin(set(races["レースID"]))]
     return JVDataset(
         race_result=horses.reset_index(drop=True),
         lap_df=prepare_pace(races),
-        payout_df=payout,
+        payout_df=payout.loc[payout["レースID"].isin(set(races["レースID"]))].reset_index(drop=True),
         report=report,
     )
+
+
+def _year_counts(dates: pd.Series, max_items: int = 50) -> str:
+    """{年: 件数} の文字列。年が多すぎるときは範囲だけにする。"""
+    counts = pd.to_datetime(dates).dt.year.value_counts().sort_index()
+    if len(counts) > max_items:
+        return f"{counts.index.min()}〜{counts.index.max()}（{len(counts)}年、計{int(counts.sum()):,}）"
+    return str({int(k): int(v) for k, v in counts.items()})
+
+
+# 年ごとの欠損率を見る列（race_result の列名）
+COVERAGE_HORSE_COLUMNS = ["_1コーナー順位", "_2コーナー順位", "_3コーナー順位", "_4コーナー順位",
+                          "_脚質判定", "馬体重", "後３Ｆタイム", "単勝オッズ"]
+
+
+def coverage_by_year(ds: "JVDataset") -> pd.DataFrame:
+    """主要な列の年ごとの欠損率（%）。何年から使えるデータかを確かめるため。
+
+    前3F・後3F はレース単位で、障害はもともと無いので**平地のレースだけ**で数える。
+    `3F_ラップ補完` は、公式値が空でラップから計算したレースの割合。
+    コーナー順位・脚質判定・馬体重などは馬単位。
+    1・2コーナーは短い距離だと通らないので、欠損が多くても異常ではない。
+    """
+    rr = ds.race_result
+    year = rr["レース日付"].dt.year
+    horse = rr[COVERAGE_HORSE_COLUMNS].isna().groupby(year).mean() * 100
+
+    races = rr.drop_duplicates("レースID")
+    flat = races.loc[races["芝・ダート区分"].isin(["芝", "ダート"])]
+    fy = flat["レース日付"].dt.year
+    race_part = pd.DataFrame({
+        "_前3F": flat["_前3F"].isna().groupby(fy).mean() * 100,
+        "_後3F": flat["_後3F"].isna().groupby(fy).mean() * 100,
+        "3F_ラップ補完": (flat["_3F出所"] == "ラップ").groupby(fy).mean() * 100,
+    })
+    out = race_part.join(horse, how="outer")
+    out.insert(0, "頭数", year.value_counts().sort_index())
+    out.index.name = "年"
+    return out.round(1)
 
 
 def grade_count_by_year(race_result: pd.DataFrame) -> pd.DataFrame:
