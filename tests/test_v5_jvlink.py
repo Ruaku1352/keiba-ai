@@ -1198,3 +1198,18 @@ def test_sdk_fetch_appends_and_keeps_order(tmp_path):
     assert list(ra["_seq"]) == ["0", "1"]
     # 同じレースが2回届いても、重複解消で1行になる
     assert len(jvmap.apply_data_kubun(ra, jvmap.RACE_KEY, jvmap.RACE_KUBUN_PRIORITY)) == 1
+
+
+def test_recent_check_no_races_is_undecidable():
+    """対象が0レースなら「判定不能」と出す（--folds 1 で 2021年8月以降が無いとき）。"""
+    results = _results_with_rate(0.06, n=400, since_year=2019)
+    out = validate.recent_period_check(results, since="2021-08-01")
+    assert out["判定（達成率）"] == "判定不能（対象レースなし）"
+    assert out["判定（H1）"] == "判定不能（対象レースなし）"
+
+
+def test_recent_check_h1_not_significant_wording():
+    """重賞と平場の差が有意でなければ「重賞が上とは言えない（有意差なし）」。"""
+    out = validate.recent_period_check(_results_with_rate(0.04, rate_flat=0.035, n=300))
+    assert out["H1（重賞>平場）のp値"] > 0.05
+    assert out["判定（H1）"] == "重賞が上とは言えない（有意差なし）"

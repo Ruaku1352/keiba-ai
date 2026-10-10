@@ -314,6 +314,14 @@ def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
     ra = ra.loc[ra["head.DataKubun"].isin(USABLE_RACE_KUBUN)]
     report.add(f"RA 全馬着順確定(5/6/7)のみ（中止{cancelled}件を除外）", len(ra))
 
+    return map_races(ra, jump_as_flat=jump_as_flat)
+
+
+def map_races(ra: pd.DataFrame, jump_as_flat: bool = False) -> pd.DataFrame:
+    """RA（1レース1行にしたもの）を、既存パイプラインの列名に対応付ける。
+
+    確定したレース（prepare_races）と出馬表段階のレース（prepare_entries）で共通。
+    """
     labels = GRADE_LABELS_JUMP_AS_FLAT if jump_as_flat else GRADE_LABELS
     out = pd.DataFrame({
         "レースID": make_race_id(ra).to_numpy(),
@@ -376,6 +384,13 @@ def _attach_three_furlongs(out: pd.DataFrame, ra: pd.DataFrame) -> None:
     out["_前3F"] = np.where(has_official, official_s3, lap_s3)
     out["_後3F"] = np.where(has_official, official_l3, lap_l3)
     out["_3F出所"] = np.select([has_official, has_laps], ["公式", "ラップ"], default="なし")
+    # 公式値とラップからの計算値を別々にも残す（両方あるレースで一致を確かめるため。check-3f）
+    out["_前3F公式"] = official_s3
+    out["_後3F公式"] = official_l3
+    out["_前3F計算"] = lap_s3
+    out["_後3F計算"] = lap_l3
+    out["_ラップ1本目"] = laps["ラップタイム1"].to_numpy(dtype="float64") if all(
+        c in ra.columns for c in lap_cols) else np.full(len(out), np.nan)
 
 
 def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
@@ -390,7 +405,27 @@ def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
     se = se.loc[se["head.DataKubun"].isin(USABLE_RACE_KUBUN)]
     report.add("SE 全馬着順確定(5/6/7)のみ", len(se))
 
-    horses = pd.DataFrame({
+    horses = map_horses(se)
+
+    # レース情報と結合（学習に使えるレースの馬だけが残る）
+    merged = horses.merge(races, on="レースID", how="inner")
+    report.add("SE レース情報と結合後", len(merged))
+
+    excluded = merged["異常区分"].isin(EXCLUDE_IJYO)
+    report.add(f"SE 取消・除外・中止・失格を除外（{int(excluded.sum()):,}頭）", int((~excluded).sum()))
+    merged = merged.loc[~excluded]
+
+    merged = merged.loc[merged["着順"].notna()]
+    report.add("SE 着順あり", len(merged))
+    return merged.reset_index(drop=True)
+
+
+def map_horses(se: pd.DataFrame) -> pd.DataFrame:
+    """SE（1レース1頭1行にしたもの）を、既存パイプラインの列名に対応付ける。
+
+    確定したレース（prepare_horses）と出馬表段階のレース（prepare_entries）で共通。
+    """
+    return pd.DataFrame({
         "レースID": make_race_id(se).to_numpy(),
         "枠番": to_int(se["Wakuban"], invalid=("0",)).to_numpy(),
         "馬番": to_int(se["Umaban"], invalid=("00",)).to_numpy(),
@@ -425,19 +460,58 @@ def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
         "DM_予想タイム": se["DMTime"].to_numpy(),
         "DM_予想順位": to_int(se["DMJyuni"], invalid=("00",)).to_numpy(),
         "_SEデータ区分": se["head.DataKubun"].to_numpy(),
+        "_SE作成日": _make_date_key(se).to_numpy(),
     })
 
-    # レース情報と結合（学習に使えるレースの馬だけが残る）
-    merged = horses.merge(races, on="レースID", how="inner")
-    report.add("SE レース情報と結合後", len(merged))
 
-    excluded = merged["異常区分"].isin(EXCLUDE_IJYO)
-    report.add(f"SE 取消・除外・中止・失格を除外（{int(excluded.sum()):,}頭）", int((~excluded).sum()))
-    merged = merged.loc[~excluded]
+# 出馬表段階のデータ区分（仕様書: 1=出走馬名表(木曜) 2=出馬表(金・土曜)）
+ENTRY_KUBUN = {"1", "2"}
+ENTRY_KUBUN_LABELS = {"1": "出走馬名表", "2": "出馬表"}
+# 出馬表の段階で除外すべき異常区分（出走取消・発走除外・競走除外）
+EXCLUDE_IJYO_ENTRY = {"1", "2", "3"}
 
-    merged = merged.loc[merged["着順"].notna()]
-    report.add("SE 着順あり", len(merged))
-    return merged.reset_index(drop=True)
+
+def prepare_entries(raw: dict[str, pd.DataFrame], from_date: str | None = None,
+                    to_date: str | None = None, graded_only: bool = True,
+                    jump_as_flat: bool = False) -> pd.DataFrame:
+    """出馬表段階（データ区分 1・2）のレースを、予測の入力の形にする。
+
+    確定したレース（5/6/7）とは別に、まだ結果の無いレースを取り出す。
+    データ区分の重複解消は確定レースと同じ（作成日順・確定度順）なので、
+    木曜の出走馬名表(1)の後に金土の出馬表(2)が届けば、出馬表の方が残る。
+    同じレースに速報（3以上）が届いていれば、そのレースは結果が出始めているので対象外。
+
+    出走取消・除外（異常区分 1〜3）が出馬表のデータに入っていれば、その馬は外す。
+    データを取り直して予測をやり直せば、新しい取消・乗り替わりが反映される。
+
+    返す列は prepare_horses と同じ（結果の列は空）に加えて:
+      データ区分（出走馬名表 / 出馬表）、データ作成日、枠順確定（馬番が全頭そろっているか）
+    """
+    ra = apply_data_kubun(raw["RA"], RACE_KEY, RACE_KUBUN_PRIORITY)
+    ra = central_only(ra)
+    ra = ra.loc[ra["head.DataKubun"].isin(ENTRY_KUBUN)]
+    races = map_races(ra, jump_as_flat=jump_as_flat)
+    if from_date is not None:
+        races = races.loc[races["レース日付"] >= pd.Timestamp(from_date)]
+    if to_date is not None:
+        races = races.loc[races["レース日付"] <= pd.Timestamp(to_date)]
+    if graded_only:
+        races = races.loc[races["リステッド・重賞競走"].isin(config.GRADED_VALUES)]
+    if races.empty:
+        return pd.DataFrame()
+
+    se = apply_data_kubun(raw["SE"], RACE_KEY + ["KettoNum"], RACE_KUBUN_PRIORITY)
+    se = central_only(se)
+    se = se.loc[se["head.DataKubun"].isin(ENTRY_KUBUN)]
+    horses = map_horses(se).merge(races, on="レースID", how="inner")
+    horses = horses.loc[~horses["異常区分"].isin(EXCLUDE_IJYO_ENTRY)]
+
+    g = horses.groupby("レースID", sort=False)
+    horses["データ区分"] = horses["_RAデータ区分"].map(ENTRY_KUBUN_LABELS)
+    horses["データ作成日"] = pd.to_datetime(
+        g["_SE作成日"].transform("max").astype(str), format="%Y%m%d", errors="coerce")
+    horses["枠順確定"] = g["馬番"].transform(lambda s: bool(s.notna().all()))
+    return horses.sort_values(["レース日付", "レースID", "馬番"]).reset_index(drop=True)
 
 
 def prepare_pace(races: pd.DataFrame) -> pd.DataFrame:

@@ -71,6 +71,29 @@ def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean_entries(df: pd.DataFrame) -> pd.DataFrame:
+    """予測対象（結果がまだ無い行）を、basic_clean と同じ型に整える。
+
+    basic_clean との違いは「着順・タイムが無い行を落とさない」ことだけ。
+    着順と目的変数は欠損のまま（NaN）にする。並び順も basic_clean と同じ。
+    """
+    cols = config.resolve_columns(df)
+    config.require(cols, "race_id", "date", "horse", "rank")
+    df = df.copy()
+    df[cols["rank"]] = pd.to_numeric(df[cols["rank"]], errors="coerce").astype("float64")
+    df[cols["date"]] = pd.to_datetime(df[cols["date"]], errors="coerce")
+    if "horse_weight_diff" in cols:
+        df[cols["horse_weight_diff"]] = pd.to_numeric(
+            df[cols["horse_weight_diff"]], errors="coerce").fillna(0)
+    for logical in ["post", "bracket", "age", "weight_carried", "horse_weight",
+                    "distance", "win_odds", "popularity", "last3f"]:
+        if logical in cols:
+            df[cols[logical]] = pd.to_numeric(df[cols[logical]], errors="coerce")
+    df[config.TARGET] = np.nan
+    sort_keys = [cols["date"], cols["race_id"]] + ([cols["post"]] if "post" in cols else [])
+    return df.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+
+
 def to_category(df: pd.DataFrame) -> pd.DataFrame:
     """カテゴリ列を category dtype に変換（LightGBM 用 & メモリ削減）。"""
     cols = config.resolve_columns(df)

@@ -161,6 +161,75 @@ def past_rate_excluding_race(df: pd.DataFrame, keys: list[str], value: pd.Series
     return rate.where(cnt >= min_count)
 
 
+def past_mean_ignore_nan_excluding(df: pd.DataFrame, keys: list[str], value: pd.Series,
+                                   group_col: str, min_count: int = 1) -> pd.Series:
+    """past_mean_ignore_nan の「同じ group_col の行を除く」版。
+
+    group_col に日付を渡せば「前日までの平均」になる（as_of="day" で使う）。
+    """
+    valid = value.notna().astype("float32")
+    total = past_sum_excluding_race(df, keys, value, group_col)
+    n = past_sum_excluding_race(df, keys, valid, group_col)
+    mean = total / n.replace(0, np.nan)
+    return mean.where(n >= min_count).astype("float32")
+
+
+def past_std_ignore_nan_excluding(df: pd.DataFrame, keys: list[str], value: pd.Series,
+                                  group_col: str, min_count: int = 2) -> pd.Series:
+    """past_std_ignore_nan の「同じ group_col の行を除く」版。"""
+    valid = value.notna().astype("float32")
+    n = past_sum_excluding_race(df, keys, valid, group_col)
+    s1 = past_sum_excluding_race(df, keys, value, group_col)
+    s2 = past_sum_excluding_race(df, keys, value.astype("float64") ** 2, group_col)
+    denom = n.replace(0, np.nan)
+    var = (s2 / denom - (s1 / denom) ** 2).clip(lower=0)
+    return np.sqrt(var).where(n >= min_count).astype("float32")
+
+
+def past_window_mean_excluding(df: pd.DataFrame, keys: list[str], value: pd.Series,
+                               window: int, group_col: str) -> pd.Series:
+    """「同じ group_col の行より前」の直近 window 行の平均。
+
+    例）騎手の直近100走勝率を「前日まで」で出す。同じ日に何鞍も乗るので、
+        自分より前の100行ではなく「その日の最初の騎乗より前の100行」を数える。
+
+    仕組み（キーごとに並べた配列の上で考える）:
+      P[j] = そのキーの先頭から j の手前までの合計（自分を含まない累積和）
+      f    = 自分と同じ日の最初の行の位置
+      窓   = [max(f - window, キーの先頭), f)
+      合計 = P[f] - P[窓の始まり]、件数 = f - 窓の始まり
+    行が「日付→レース」順に並んでいれば、同じ日の行はキーの中で連続するので f が決まる。
+    """
+    n = len(df)
+    if n == 0:
+        return pd.Series(dtype="float32", index=df.index)
+    key_id = df.groupby(keys, observed=True, sort=False).ngroup().to_numpy()
+    grp_id = df.groupby(keys + [group_col], observed=True, sort=False).ngroup().to_numpy()
+    v = value.fillna(0).to_numpy(dtype="float64")
+
+    order = np.argsort(key_id, kind="stable")          # キーごとに、元の（時系列の）順で並べる
+    k, g, vs = key_id[order], grp_id[order], v[order]
+    idx = np.arange(n)
+
+    new_key = np.r_[True, k[1:] != k[:-1]]
+    key_start = np.maximum.accumulate(np.where(new_key, idx, 0))
+    new_grp = new_key | np.r_[True, g[1:] != g[:-1]]
+    first_in_grp = np.maximum.accumulate(np.where(new_grp, idx, 0))
+
+    csum = np.cumsum(vs)
+    before_key = csum[key_start] - vs[key_start]       # そのキーの手前までの累積
+    prefix = csum - vs - before_key                     # P[j]（自分を含まない）
+
+    lo = np.maximum(first_in_grp - window, key_start)
+    total = prefix[first_in_grp] - prefix[lo]
+    count = (first_in_grp - lo).astype("float64")
+    mean_sorted = np.where(count > 0, total / np.where(count > 0, count, 1), np.nan)
+
+    out = np.empty(n)
+    out[order] = mean_sorted
+    return pd.Series(out, index=df.index, dtype="float32")
+
+
 def label_encode(s: pd.Series) -> pd.Series:
     """groupby キー用に文字列/カテゴリを整数コード化する（速度・メモリ対策）。"""
     if isinstance(s.dtype, pd.CategoricalDtype):

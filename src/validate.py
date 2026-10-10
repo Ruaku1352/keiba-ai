@@ -678,8 +678,22 @@ def recent_period_check(results: list[dict], since: str = "2021-08-01",
     h1_recent = trifecta.two_proportion_test(gh, gn, fh, fn)
     lo, hi = trifecta.wilson_interval(gh, gn)
 
-    collapsed = bool(vs_v4["有意"] and vs_v4["差"] < 0)
-    h1_kept = bool(h1_recent["差"] > 0) if gn and fn else False
+    collapsed = bool(gn and vs_v4["有意"] and vs_v4["差"] < 0)
+    no_races = "判定不能（対象レースなし）"
+    if not gn:
+        rate_verdict = no_races
+    elif collapsed:
+        rate_verdict = "崩れた：v4より有意に低い"
+    else:
+        rate_verdict = "維持：v4より有意に低くはない"
+    if not gn or not fn:
+        h1_verdict = no_races
+    elif h1_recent["有意"] and h1_recent["差"] > 0:
+        h1_verdict = "維持：重賞が平場を上回る（有意）"
+    elif h1_recent["有意"]:
+        h1_verdict = "崩れた：重賞が平場より有意に低い"
+    else:
+        h1_verdict = "重賞が上とは言えない（有意差なし）"
     return {
         "期間": f"{since} 以降",
         "重賞レース数": gn,
@@ -690,14 +704,11 @@ def recent_period_check(results: list[dict], since: str = "2021-08-01",
         "v4との差": vs_v4["差"],
         "v4との差の区間": (vs_v4["差下限"], vs_v4["差上限"]),
         "v4との差のp値": vs_v4["p値"],
-        "判定（達成率）": ("崩れた：v4より有意に低い" if collapsed
-                       else "維持：v4より有意に低くはない"),
+        "判定（達成率）": rate_verdict,
         "平場達成率": fh / fn if fn else np.nan,
         "平場レース数": fn,
         "H1（重賞>平場）のp値": h1_recent["p値"],
-        "判定（H1）": ("維持：重賞が平場を上回る（有意）" if h1_kept and h1_recent["有意"]
-                     else "維持（ただし有意差なし）" if h1_kept
-                     else "崩れた：重賞が平場を上回っていない"),
+        "判定（H1）": h1_verdict,
     }
 
 

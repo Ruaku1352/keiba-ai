@@ -19,11 +19,16 @@
    [レース日付, レースID, 馬番] の順にソート済みであること。
    この順序が保証されていれば cumsum は必ず「過去 → 未来」の向きに走る。
 
-■ 同日レースの扱い
-   騎手・調教師の集計は「同じ開催日の、より前のレース」を過去として含む。
-   実運用（当日朝に予測）で厳密にしたい場合は
-   add_all_features(..., strict_daily_lag=True) を使うと、
-   騎手・調教師系を「前日終了時点」の成績に切り替える。
+■ 同日レースの扱い（as_of）
+   as_of="race"（既定。v1〜v5 の validate と同じ）
+       騎手・調教師の集計は「同じ開催日の、より前のレース」を過去として含む。
+   as_of="day"（v6 の学習と予測で使う）
+       騎手・調教師の集計、レース単位のペースの統計を「前日までに確定したレース」だけで作る。
+       実戦では前日の夜に予測するので、当日の他のレースの結果はまだ無い。
+       学習のときも同じ条件にしておかないと、学習と予測で特徴量の意味がずれる。
+       馬の集計は1日1走なので、どちらでも同じ値になる。
+   集計の「日」は `_集計日` 列で決める（無ければレース日付）。予測のときは、未確定の
+   レースをすべて同じ日（最も早い予測対象日）にまとめて、互いに混ざらないようにする（predict.py）。
 """
 
 from __future__ import annotations
@@ -113,91 +118,79 @@ def add_horse_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # 騎手・調教師系
 # ---------------------------------------------------------------------------
-def _daily_lagged_rate(df: pd.DataFrame, key_cols: list[str], value: pd.Series,
-                       date_col: str) -> pd.Series:
-    """「前日終了時点」の勝率を返す（同日レースの結果を一切使わない厳密版）。
+AS_OF_CHOICES = ("race", "day")
+DAY_COL = "_集計日"
 
-    日単位で集計 → その日の分を除いた累積 → 元の行に結合、という手順。
+
+def _exclusion_col(df: pd.DataFrame, as_of: str) -> str:
+    """同じ行を「過去」に含めない単位の列名。race ならレースID、day なら _集計日。"""
+    if as_of not in AS_OF_CHOICES:
+        raise ValueError(f"as_of は {AS_OF_CHOICES} のどれか: {as_of!r}")
+    if as_of == "day":
+        return DAY_COL
+    return config.resolve_columns(df)["race_id"]
+
+
+def add_jockey_features(df: pd.DataFrame, as_of: str = "race") -> pd.DataFrame:
+    """騎手系の特徴量を追加する。
+
+    as_of="race": 同じレースの行だけを除く（騎手は1レース1頭なので、実質は自分だけ）。
+                  騎手×競馬場・騎手×芝ダ・直近100走は v1 からの実装のまま。
+    as_of="day" : 同じ日の行をすべて除く（前日までの成績）。
     """
-    tmp = pd.DataFrame({"_v": value.fillna(0).to_numpy(), "_d": df[date_col].to_numpy()})
-    for c in key_cols:
-        tmp[c] = df[c].to_numpy()
-
-    daily = tmp.groupby(key_cols + ["_d"], observed=True, sort=True).agg(
-        _sum=("_v", "sum"), _cnt=("_v", "size")
-    ).reset_index()
-
-    g = daily.groupby(key_cols, observed=True, sort=False)
-    # その日を含まない累積 = 累積 - 当日分
-    daily["_past_sum"] = g["_sum"].cumsum() - daily["_sum"]
-    daily["_past_cnt"] = g["_cnt"].cumsum() - daily["_cnt"]
-    daily["_rate"] = daily["_past_sum"] / daily["_past_cnt"].replace(0, np.nan)
-
-    merged = tmp.merge(
-        daily[key_cols + ["_d", "_rate", "_past_cnt"]], on=key_cols + ["_d"], how="left"
-    )
-    return pd.Series(merged["_rate"].to_numpy(), index=df.index, dtype="float32")
-
-
-def add_jockey_features(df: pd.DataFrame, strict_daily_lag: bool = False) -> pd.DataFrame:
-    """騎手系の特徴量を追加する。"""
     cols = config.resolve_columns(df)
     if "jockey" not in cols:
         return df
-    jockey, rank, date = cols["jockey"], cols["rank"], cols["date"]
+    jockey, rank = cols["jockey"], cols["rank"]
 
     win = (df[rank] == 1).astype("float32")
     df["_jockey_code"] = _label_encode(df[jockey])
+    excl = _exclusion_col(df, as_of)
+    window = config.JOCKEY_RECENT_WINDOW
 
-    # 騎手は1レース1頭なので本来は同一レースの重複は起きないが、
-    # データの誤りに備えて調教師と同じくレース単位で除外する版を使う
-    race_id = cols["race_id"]
-    if strict_daily_lag:
-        df["騎手通算勝率"] = _daily_lagged_rate(df, ["_jockey_code"], win, date)
-    else:
-        df["騎手通算勝率"] = leakfree.past_rate_excluding_race(
-            df, ["_jockey_code"], win, race_id).astype("float32")
-
+    df["騎手通算勝率"] = leakfree.past_rate_excluding_race(
+        df, ["_jockey_code"], win, excl).astype("float32")
     df["騎手通算騎乗数"] = leakfree.past_count_excluding_race(
-        df, ["_jockey_code"], race_id).astype("int32")
-    df[f"騎手直近{config.JOCKEY_RECENT_WINDOW}走勝率"] = _past_window_mean(
-        df, ["_jockey_code"], win, config.JOCKEY_RECENT_WINDOW
-    )
+        df, ["_jockey_code"], excl).astype("int32")
 
-    if "_course_code" in df.columns:
-        df["騎手×競馬場_勝率"] = _past_rate(
-            df, ["_jockey_code", "_course_code"], win, min_count=10
-        ).astype("float32")
+    if as_of == "day":
+        df[f"騎手直近{window}走勝率"] = leakfree.past_window_mean_excluding(
+            df, ["_jockey_code"], win, window, excl)
+    else:
+        df[f"騎手直近{window}走勝率"] = _past_window_mean(df, ["_jockey_code"], win, window)
 
-    if "_surface_code" in df.columns:
-        df["騎手×芝ダ_勝率"] = _past_rate(
-            df, ["_jockey_code", "_surface_code"], win, min_count=10
-        ).astype("float32")
+    for code_col, name in [("_course_code", "騎手×競馬場_勝率"), ("_surface_code", "騎手×芝ダ_勝率")]:
+        if code_col not in df.columns:
+            continue
+        keys = ["_jockey_code", code_col]
+        if as_of == "day":
+            df[name] = leakfree.past_rate_excluding_race(df, keys, win, excl, min_count=10)
+        else:
+            df[name] = _past_rate(df, keys, win, min_count=10)
+        df[name] = df[name].astype("float32")
 
     return df
 
 
-def add_trainer_features(df: pd.DataFrame, strict_daily_lag: bool = False) -> pd.DataFrame:
-    """調教師系の特徴量を追加する。"""
+def add_trainer_features(df: pd.DataFrame, as_of: str = "race") -> pd.DataFrame:
+    """調教師系の特徴量を追加する。
+
+    調教師は1レースに複数頭を出すので、少なくとも同じレースの同厩馬は「過去」に
+    含めない（v5で修正。v1〜v4では漏れていた）。as_of="day" なら同じ日の行をすべて除く。
+    """
     cols = config.resolve_columns(df)
     if "trainer" not in cols:
         return df
-    trainer, rank, date = cols["trainer"], cols["rank"], cols["date"]
+    trainer, rank = cols["trainer"], cols["rank"]
 
     win = (df[rank] == 1).astype("float32")
     df["_trainer_code"] = _label_encode(df[trainer])
+    excl = _exclusion_col(df, as_of)
 
-    # 調教師は1レースに複数頭を出すので、同じレースの同厩馬の結果を「過去」に
-    # 含めないよう、レース単位で除外する版を使う（v5で修正。v1〜v4では漏れていた）
-    race_id = cols["race_id"]
-    if strict_daily_lag:
-        df["調教師通算勝率"] = _daily_lagged_rate(df, ["_trainer_code"], win, date)
-    else:
-        df["調教師通算勝率"] = leakfree.past_rate_excluding_race(
-            df, ["_trainer_code"], win, race_id).astype("float32")
-
+    df["調教師通算勝率"] = leakfree.past_rate_excluding_race(
+        df, ["_trainer_code"], win, excl).astype("float32")
     df["調教師通算出走数"] = leakfree.past_count_excluding_race(
-        df, ["_trainer_code"], race_id).astype("int32")
+        df, ["_trainer_code"], excl).astype("int32")
     return df
 
 
@@ -262,13 +255,17 @@ def add_race_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
                      drop_helper_cols: bool = True,
                      corner_df: pd.DataFrame | None = None,
-                     lap_df: pd.DataFrame | None = None) -> pd.DataFrame:
+                     lap_df: pd.DataFrame | None = None,
+                     as_of: str = "race") -> pd.DataFrame:
     """すべての特徴量を追加する（この関数だけ呼べばよい）。
 
     Parameters
     ----------
+    as_of :
+        "race"（既定・validate と同じ）か "day"（前日までに確定したレースだけで集計）。
+        モジュール冒頭の説明を参照。
     strict_daily_lag :
-        True なら騎手・調教師の勝率を「前日終了時点」で計算する（より厳密）。
+        True なら as_of="day" と同じ（v1 からの互換のために残してある）。
     drop_helper_cols :
         True なら内部用の作業列（`_` で始まる列）を最後に削除する。
     corner_df :
@@ -280,11 +277,15 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     from . import corner as corner_mod  # 循環 import を避けるため関数内で読む
     from . import pace as pace_mod
 
+    if strict_daily_lag:
+        as_of = "day"
     df = df.copy()
+    if as_of == "day" and DAY_COL not in df.columns:
+        df[DAY_COL] = df[config.resolve_columns(df)["date"]]
 
     df = add_horse_features(df)
-    df = add_jockey_features(df, strict_daily_lag=strict_daily_lag)
-    df = add_trainer_features(df, strict_daily_lag=strict_daily_lag)
+    df = add_jockey_features(df, as_of=as_of)
+    df = add_trainer_features(df, as_of=as_of)
     df = add_horse_jockey_features(df)
     df = add_race_features(df)
 
@@ -305,7 +306,7 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     # 依頼B：ペース
     if lap_df is not None:
         df = pace_mod.attach_race_pace(df, lap_df)
-        df = pace_mod.add_pace_features(df)
+        df = pace_mod.add_pace_features(df, as_of=as_of)
 
     if drop_helper_cols:
         # `_` で始まる列は「そのレースの結果」や中間計算なので、

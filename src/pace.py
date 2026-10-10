@@ -149,7 +149,7 @@ def _race_frame(df: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
 
 
 def _standardize_by_condition(df: pd.DataFrame, value_col: str,
-                              sign: float = 1.0) -> pd.Series:
+                              sign: float = 1.0, day_col: str | None = None) -> pd.Series:
     """(芝ダート × 距離帯) ごとに、**過去のレースだけ**を使って z 化する。
 
     全期間の平均・標準偏差で割ると未来の情報が混ざるため、
@@ -157,10 +157,11 @@ def _standardize_by_condition(df: pd.DataFrame, value_col: str,
     計算はレース単位（_race_frame）で行い、最後に馬の行へ配り直す。
 
     sign=-1 を渡すと符号を反転してから z 化する（上がり3Fは小さいほど良いため）。
+    day_col を渡すと、同じ日のレースを「過去」に含めない（as_of="day"）。
     """
     cols = config.resolve_columns(df)
 
-    aux: list[str] = [value_col]
+    aux: list[str] = [value_col] + ([day_col] if day_col else [])
     df = df.copy()
     if "surface" in cols:
         df["_surf_code_pace"] = leakfree.label_encode(df[cols["surface"]]).astype("int16")
@@ -173,12 +174,18 @@ def _standardize_by_condition(df: pd.DataFrame, value_col: str,
 
     race = _race_frame(df, aux)
     race[value_col] = race[value_col].astype("float32") * sign
-    keys = [c for c in aux if c != value_col] or ["レースID"]
+    keys = [c for c in aux if c not in (value_col, day_col)] or ["レースID"]
 
-    mean = leakfree.past_mean_ignore_nan(race, keys, race[value_col],
-                                        min_count=PACE_Z_MIN_COUNT)
-    std = leakfree.past_std_ignore_nan(race, keys, race[value_col],
-                                      min_count=PACE_Z_MIN_COUNT)
+    if day_col:
+        mean = leakfree.past_mean_ignore_nan_excluding(race, keys, race[value_col], day_col,
+                                                       min_count=PACE_Z_MIN_COUNT)
+        std = leakfree.past_std_ignore_nan_excluding(race, keys, race[value_col], day_col,
+                                                     min_count=PACE_Z_MIN_COUNT)
+    else:
+        mean = leakfree.past_mean_ignore_nan(race, keys, race[value_col],
+                                            min_count=PACE_Z_MIN_COUNT)
+        std = leakfree.past_std_ignore_nan(race, keys, race[value_col],
+                                          min_count=PACE_Z_MIN_COUNT)
     race["_z"] = ((race[value_col] - mean) / std.replace(0, np.nan)).astype("float32")
 
     # 馬の行へ配り直す
@@ -188,12 +195,16 @@ def _standardize_by_condition(df: pd.DataFrame, value_col: str,
     return pd.Series(mapped["_z"].to_numpy(), index=df.index, dtype="float32")
 
 
-def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0) -> pd.DataFrame:
+def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0,
+                      as_of: str = "race") -> pd.DataFrame:
     """馬ごとのペース適性と、今日の想定ペースを追加する。
 
     attach_race_pace() を先に呼んでおくこと。
     脚質特徴量（corner.py）まで済んでいると想定ペースも作れる。
+    as_of="day" なら、レース単位の統計（z 化の平均・標準偏差、想定ペース）に
+    同じ日のレースを含めない。馬ごとの集計は1日1走なのでどちらでも同じ。
     """
+    day_col = "_集計日" if as_of == "day" else None
     if "_ペース指標" not in df.columns:
         raise KeyError("先に attach_race_pace() を呼んでください")
 
@@ -202,7 +213,7 @@ def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0) -> pd.
     df = df.copy()
 
     # そのレースのペースを条件別に z 化（この列も「結果」なので特徴量にはしない）
-    df["_ペース指標z"] = _standardize_by_condition(df, "_ペース指標")
+    df["_ペース指標z"] = _standardize_by_condition(df, "_ペース指標", day_col=day_col)
     z = df["_ペース指標z"]
 
     show = (df[rank] <= 3).astype("float32")          # 複勝圏
@@ -222,18 +233,18 @@ def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0) -> pd.
     # 上がり3Fの速さ（レース平均との差）。末脚の絶対的な速さを見る
     if "_上がり3F" in df.columns:
         # 上がり3Fは小さいほど速い＝良いので、符号を反転してから z 化する
-        last3f_z = _standardize_by_condition(df, "_上がり3F", sign=-1.0)
+        last3f_z = _standardize_by_condition(df, "_上がり3F", sign=-1.0, day_col=day_col)
         df["_上がり3Fz"] = last3f_z
         df["過去上がり3F偏差"] = leakfree.past_mean_ignore_nan(df, [horse], last3f_z)
         df["前走上がり3F偏差"] = df.groupby(horse, observed=True, sort=False)["_上がり3Fz"].shift(1)
 
     # --- 今日の想定ペース ----------------------------------------------------
-    df = add_expected_pace(df)
+    df = add_expected_pace(df, day_col=day_col)
 
     return df
 
 
-def add_expected_pace(df: pd.DataFrame) -> pd.DataFrame:
+def add_expected_pace(df: pd.DataFrame, day_col: str | None = None) -> pd.DataFrame:
     """出走馬の脚質構成から「今日の想定ペース」を推定する。
 
     仕組み:
@@ -254,10 +265,15 @@ def add_expected_pace(df: pd.DataFrame) -> pd.DataFrame:
     # 前傾度もペースもレース単位の値。馬の行のまま累積すると
     # 同じレースの他の馬の行が「過去」に混ざり、当日のペースを見てしまう。
     # 必ずレース単位に畳んでから過去平均を取る。
-    race = _race_frame(df, ["_前傾度bin", "_ペース指標z"])
-    race["想定ペース"] = leakfree.past_mean_ignore_nan(
-        race, ["_前傾度bin"], race["_ペース指標z"], min_count=EXPECTED_PACE_MIN_COUNT
-    )
+    race = _race_frame(df, ["_前傾度bin", "_ペース指標z"] + ([day_col] if day_col else []))
+    if day_col:
+        race["想定ペース"] = leakfree.past_mean_ignore_nan_excluding(
+            race, ["_前傾度bin"], race["_ペース指標z"], day_col,
+            min_count=EXPECTED_PACE_MIN_COUNT)
+    else:
+        race["想定ペース"] = leakfree.past_mean_ignore_nan(
+            race, ["_前傾度bin"], race["_ペース指標z"], min_count=EXPECTED_PACE_MIN_COUNT
+        )
     mapped = pd.DataFrame({"レースID": df[cols["race_id"]].to_numpy()}).merge(
         race[["レースID", "想定ペース"]], on="レースID", how="left"
     )

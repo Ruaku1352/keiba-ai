@@ -21,8 +21,9 @@ JRA の重賞で、**3連単の高配当が当たる確率**を上げるため�
 | 段階 | 内容 | 状態 |
 |---|---|---|
 | v1〜v4 | Kaggle データ（1986〜2021年7月）で戦略を探し、時系列CVで再現性を確認 | 完了 |
-| **v5** | **JRA-VAN Data Lab. から直近まで取得し、同じ戦略が成立するか再検証** | **全期間のデータ取得中** |
-| 次 | 当日予測、パドック評価の入力（スプレッドシート連携）と記録 | 未着手 |
+| v5 | JRA-VAN Data Lab. から直近まで取得し、同じ戦略が成立するか再検証 | 完了 |
+| **v6** | **出馬表から重賞ごとの買い目を出す（予測の本体）と、過去の日での練習モード** | **実装済み・実データで確認中** |
+| 次 | 馬体重発表後の再予測、スプレッドシートへの書き込み、結果の照合 | 未着手 |
 
 ### 確定している戦略（v4）
 
@@ -31,7 +32,7 @@ JRA の重賞で、**3連単の高配当が当たる確率**を上げるため�
 | 買う対象 | **重賞のみ**（G1 / G2 / G3 / 格付け前の G。障害重賞 J.G1〜3 とリステッドは含めない） |
 | 買い方 | **予測上位6頭の3連単BOX**（120点・12,000円） |
 | 選別条件 | **使わない** |
-| 達成率 | 6.13%（Wilson 95%区間 4.97〜7.55%、検証1,337レース、4fold をプール） |
+| 達成率 | v4：6.13%（Wilson 95%区間 4.97〜7.55%、1,337レース）／ **v5：5.19%（4.31〜6.26%、2,002レース、5fold）** |
 
 v4 で検証した仮説：
 
@@ -56,6 +57,14 @@ v4 で検証した仮説：
   修正済みだが、v4 の数字はこのリークを含んだまま出ている。v5 との差にはこの修正の効果も含まれる
 - JRA-VAN の公式値（4コーナー順位・前後3ハロン・脚質判定）を使うようにした
 - v5 の成功判定：**2021年8月以降の重賞の達成率が、v4 より有意に低くないこと**（差の検定で判定）
+  → 4.06%（665レース）、v4 との差 -2.07%・p=0.054 で基準はぎりぎり満たした。期待する達成率は 4〜5% とみる
+- 2021年8月以降は重賞と平場の差が有意でない（4.06% vs 3.47%、p=0.42）。買い方は変えずに進める
+
+### v6 で決めたこと
+
+- 特徴量は**前日までに確定したレースだけ**で作る（学習も予測も。validate の数字は変わらない）
+- 全データで学習するラウンド数は 454（fold 5 の best iteration）。乱数シード固定で再現できる
+- 出馬表の時点で無い馬体重は「前走の馬体重・増減0」、馬場状態は「良」と仮定して予測する
 
 ---
 
@@ -70,7 +79,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 167 passed（SDK が無い環境では 161 passed, 6 skipped）
+py -m pytest tests -q          # 199 passed（SDK が無い環境では 193 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -86,6 +95,28 @@ py -m src.jvlink summary                                       # 取得した中
 
 全期間のセットアップは、途中で止まっても**同じコマンドを再実行すれば続きから読む**。
 通信エラーなどは自動で3回まで開き直す。
+
+### 予測（`src/v6.py`）
+
+```powershell
+py -m src.jvlink fetch --option 1           # 今週の出馬表（データ区分1・2）と直近の結果を取得
+py -m src.v6 train                          # 2003年〜最新の確定レースで学習して data\models に保存
+py -m src.v6 predict --date 2026-10-11      # その日の重賞の買い目（省略すると今日以降の全重賞）
+py -m src.v6 predict --date 2026-10-11 --going 稍重   # 馬場状態が発表されたら指定し直す
+```
+
+取消・除外・乗り替わりがあったら、`fetch --option 1` と `predict` をやり直せば反映される。
+CSV は `data\predictions\` に保存され、先頭7列（レースID, 日付, レース名, 馬番, 馬名, 予測確率, 予測順位）は
+スプレッドシートの「評価入力」シートにそのまま貼れる。
+
+練習モード（過去の日を「結果が未確定の出馬表」として予測し、答え合わせする）:
+
+```powershell
+py -m src.v6 train --until 2026-09-30
+py -m src.v6 replay --date 2026-10-04
+```
+
+確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero`
 
 ### 変換と再検証（`src/v5.py`）
 
@@ -148,6 +179,9 @@ JV-Link ──▶ jvlink.py ──▶ data/jvlink/{RA,SE,HR}.csv（生データ�
 | `src/validate.py` | walk-forward の時系列CV、仮説 H1〜H4 の判定、v4 との比較 |
 | `src/paddock.py` / `records.py` | パドック評価による補正（logit 加算）と予測記録 |
 | `src/v5.py` | v5 の実行入口 |
+| `src/predict.py` | v6：学習・保存、出馬表からの予測の経路、出力 |
+| `src/diagnose.py` | v6：馬体重の代用の影響、払戻の推移、3F の一致、脚質判定の0の内訳 |
+| `src/v6.py` | v6 の実行入口（train / predict / replay / diagnose） |
 
 Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など）も残してあり、v1〜v4 と同じ流れで回せる。
 ただし調教師成績のリークを直したので、数字は v4 当時と完全には一致しない。
@@ -156,7 +190,7 @@ Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など�
 
 ## データと SDK の扱い
 
-- **JRA-VAN のデータは再配布禁止。** 取得したデータは `data/`（`.gitignore` 済み）に置き、コミットしない
+- **JRA-VAN のデータは再配布禁止。** 取得したデータ・学習したモデル・予測の CSV は `data/`（`.gitignore` 済み）に置き、コミットしない
 - **SDK（構造体 `JVData_Struct.py`・仕様書・サンプル）もコミットしない。** 環境変数 `JVSDK_DIR` の場所から実行時に読み込む
 - テスト `test_sdk_files_are_not_in_repository` が、SDK のファイルが紛れ込んでいないことを毎回確認する
 
@@ -173,3 +207,4 @@ Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など�
 | [docs/v3_race_selection.md](docs/v3_race_selection.md) | レース難易度による選別、グレード別、熱い基準の感度、3連複 |
 | [docs/v4_reproducibility.md](docs/v4_reproducibility.md) | 時系列CVで v3 の結論を再検証（H1〜H4） |
 | [docs/v5_jravan.md](docs/v5_jravan.md) | JRA-VAN からの取得・変換・再検証。SDK を読んで分かったこと、Windows での手順 |
+| [docs/v6_predict.md](docs/v6_predict.md) | 出馬表からの予測、学習と予測で特徴量を一致させる方法、練習モード、診断 |
