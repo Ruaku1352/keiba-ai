@@ -22,8 +22,9 @@ JRA の重賞で、**3連単の高配当が当たる確率**を上げるため�
 |---|---|---|
 | v1〜v4 | Kaggle データ（1986〜2021年7月）で戦略を探し、時系列CVで再現性を確認 | 完了 |
 | v5 | JRA-VAN Data Lab. から直近まで取得し、同じ戦略が成立するか再検証 | 完了 |
-| **v6** | **出馬表から重賞ごとの買い目を出す（予測の本体）と、過去の日での練習モード** | **実装済み・実データで確認中** |
-| 次 | 馬体重発表後の再予測、スプレッドシートへの書き込み、結果の照合 | 未着手 |
+| v6 | 出馬表から重賞ごとの買い目を出す（予測の本体）と、過去の日での練習モード | 完了（実データで動作確認） |
+| **v7** | **スプレッドシートへの書き込み、結果の照合と練習の成績表、毎週の手順、学習開始年の検証** | **実装済み・実データで確認中** |
+| 本番 | 2026-12-27 有馬記念（お金を賭けるのはこの1レースだけ。それまでの重賞は予測と記録のみ） | 12月中旬にモデルを固定 |
 
 ### 確定している戦略（v4）
 
@@ -65,6 +66,8 @@ v4 で検証した仮説：
 - 特徴量は**前日までに確定したレースだけ**で作る（学習も予測も。validate の数字は変わらない）
 - 全データで学習するラウンド数は 454（fold 5 の best iteration）。乱数シード固定で再現できる
 - 出馬表の時点で無い馬体重は「前走の馬体重・増減0」、馬場状態は「良」と仮定して予測する
+- 馬体重の代用で達成率はほぼ変わらない（4.85% → 4.70%、p=0.82）ので、**出馬表の時点の予測で確定**する。
+  本番条件での期待は 4.7%（3.85〜5.71%）
 
 ---
 
@@ -79,7 +82,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 204 passed（SDK が無い環境では 198 passed, 6 skipped）
+py -m pytest tests -q          # 227 passed（SDK が無い環境では 221 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -116,8 +119,19 @@ py -m src.v6 train --until 2026-09-30
 py -m src.v6 replay --date 2026-10-04
 ```
 
+予測をシートに書く・結果を照合する（毎週の手順は [docs/v7_weekly.md](docs/v7_weekly.md)）:
+
+```powershell
+py -m src.v6 predict --date 2026-10-18 --sheet   # 「評価入力」に書く（発汗・落着き・メモには触らない）
+py -m src.v6 results --sheet                     # 予測と結果を照合し、通算の成績表。「記録」に着順など
+```
+
+シートの鍵とIDはリポジトリ直下の `local_settings.json`（`.gitignore` 済み。`local_settings.example.json` を参照）か、
+環境変数 `KEIBA_GOOGLE_KEY`・`KEIBA_SHEET_ID` から読む。
+
 確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero` /
-`hot-payouts`（熱い当たりの払戻の分布）/ `arima`（2004年以降の有馬記念の3連単）
+`hot-payouts`（熱い当たりの払戻の分布）/ `arima`（2004年以降の有馬記念の3連単）/
+`weekend`（同じ週末の前日の結果が無い影響）/ `start-year`（学習開始 1995年 vs 2003年）
 
 ### 変換と再検証（`src/v5.py`）
 
@@ -182,7 +196,9 @@ JV-Link ──▶ jvlink.py ──▶ data/jvlink/{RA,SE,HR}.csv（生データ�
 | `src/v5.py` | v5 の実行入口 |
 | `src/predict.py` | v6：学習・保存、出馬表からの予測の経路、出力 |
 | `src/diagnose.py` | v6：馬体重の代用の影響、払戻の推移、3F の一致、脚質判定の0の内訳 |
-| `src/v6.py` | v6 の実行入口（train / predict / replay / diagnose） |
+| `src/v6.py` | v6・v7 の実行入口（train / predict / replay / results / diagnose） |
+| `src/sheets.py` | v7：スプレッドシートへの書き込み（見出しの名前で、行は上書き） |
+| `src/results.py` | v7：保存した予測と結果の照合、練習の成績表 |
 
 Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など）も残してあり、v1〜v4 と同じ流れで回せる。
 ただし調教師成績のリークを直したので、数字は v4 当時と完全には一致しない。
@@ -192,6 +208,7 @@ Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など�
 ## データと SDK の扱い
 
 - **JRA-VAN のデータは再配布禁止。** 取得したデータ・学習したモデル・予測の CSV は `data/`（`.gitignore` 済み）に置き、コミットしない
+- **Google の鍵ファイルとシートの ID もコミットしない。** `local_settings.json`・`secrets/`・`*service_account*.json` は `.gitignore` 済み
 - **SDK（構造体 `JVData_Struct.py`・仕様書・サンプル）もコミットしない。** 環境変数 `JVSDK_DIR` の場所から実行時に読み込む
 - テスト `test_sdk_files_are_not_in_repository` が、SDK のファイルが紛れ込んでいないことを毎回確認する
 
@@ -209,3 +226,4 @@ Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など�
 | [docs/v4_reproducibility.md](docs/v4_reproducibility.md) | 時系列CVで v3 の結論を再検証（H1〜H4） |
 | [docs/v5_jravan.md](docs/v5_jravan.md) | JRA-VAN からの取得・変換・再検証。SDK を読んで分かったこと、Windows での手順 |
 | [docs/v6_predict.md](docs/v6_predict.md) | 出馬表からの予測、学習と予測で特徴量を一致させる方法、練習モード、診断 |
+| [docs/v7_weekly.md](docs/v7_weekly.md) | 毎週の手順、結果が届くタイミング（仕様）、シート・照合のきまり、週末の結果欠落と学習開始年の検証 |

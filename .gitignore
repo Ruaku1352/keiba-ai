@@ -13,3 +13,8 @@ JRA-VAN Data Lab.*/
 JVDTLABSDK*.zip
 JV-Data仕様書*
 JV-Link*.pdf
+
+# --- Google スプレッドシートの設定・鍵（公開リポジトリなのでコミットしない）---
+local_settings.json
+*service_account*.json
+secrets/

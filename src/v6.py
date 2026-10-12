@@ -6,6 +6,8 @@
     py -m src.v6 predict --date 2026-10-11    その日の重賞だけ予測する
     py -m src.v6 replay --date 2026-10-04     過去の日の重賞を「結果未確定の出馬表」として予測し、答え合わせ
     py -m src.v6 models                       保存したモデルの一覧
+    py -m src.v6 predict --sheet              予測を「評価入力」シートにも書き込む
+    py -m src.v6 results [--sheet]            保存した予測と届いた結果を照合し、練習の成績表を出す
 
     py -m src.v6 diagnose weight              馬体重の代用で AUC・達成率がどれだけ落ちるか（5 fold）
     py -m src.v6 diagnose payout-trend        年ごとの3連単払戻の中央値・5万円以上の割合（重賞 vs 平場）
@@ -13,6 +15,8 @@
     py -m src.v6 diagnose style-zero          今回レース脚質判定の「0」の内訳（年ごと）
     py -m src.v6 diagnose hot-payouts         CV（as_of=day）で熱い当たりになったレースの払戻の分布と一覧
     py -m src.v6 diagnose arima               2004年以降の有馬記念の3連単（組番・払戻・人気）
+    py -m src.v6 diagnose weekend             同じ週末の前の日の結果が入らないことの影響（5 fold）
+    py -m src.v6 diagnose start-year          学習開始 1995年 vs 2003年（判定ルールは事前に固定）
 
 買い方は変えない：重賞のみ（G1/G2/G3/G）・予測上位6頭の3連単BOX（120点・12,000円）。
 データの取得は `py -m src.jvlink fetch --option 1`（出馬表もこれで届く）。
@@ -193,7 +197,20 @@ def _cmd_predict(args) -> int:
     path = predict.save_predictions(table, f"predict_{from_date.replace('-', '')}")
     print(f"CSV を保存しました: {path}")
     print("  先頭7列（レースID, 日付, レース名, 馬番, 馬名, 予測確率, 予測順位）はそのまま「評価入力」シートに貼れます")
+    if args.sheet:
+        _write_entry_sheet(table)
     return 0
+
+
+def _write_entry_sheet(table: pd.DataFrame, ws=None) -> None:
+    """予測を「評価入力」シートに書く（見出しの名前で。発汗・落着き・メモには触らない）。"""
+    from . import sheets
+
+    if ws is None:
+        settings = sheets.load_settings()
+        ws = sheets.open_worksheet(settings, settings.entry_sheet)
+    res = sheets.upsert_rows(ws, sheets.prediction_rows(table), sheets.ENTRY_COLUMNS)
+    print(f"「{ws.title}」シートに書き込みました: {res}")
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +287,74 @@ def _cmd_replay(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# results（結果の照合と練習の成績表）
+# ---------------------------------------------------------------------------
+def _cmd_results(args) -> int:
+    from . import results
+
+    clock = _Clock()
+    preds = results.load_predictions()
+    if preds.empty:
+        print(f"予測の CSV がありません: {predict.prediction_dir()}")
+        return 1
+    clock.step(f"予測 {preds['予測ファイル'].nunique()} ファイルを読みました。生データ（RA/SE/HR）を読み込み中 ...")
+    raw = jvmap.load_raw(args.data)
+    out = results.reconcile(preds, raw)
+    clock.step("完了\n")
+
+    races = out["races"]
+    if not races.empty:
+        print("=== レースごとの照合（6頭BOX・120点・12,000円。仮に買っていた場合） ===")
+        for _, r in races.iterrows():
+            verdict = ("的中・熱い当たり" if r["熱い"] else "的中（熱い基準 50,000円に届かず）" if r["的中"]
+                       else "不的中")
+            print(f"{r['日付']} {r['レース名']}（{r['格付け']}）［{r['区分']}］")
+            print(f"  BOX {r['BOX']}  →  1着 {r['1着']} / 2着 {r['2着']} / 3着 {r['3着']}"
+                  f"  3連単 {r['3連単']}")
+            refund = f"（返還: {r['返還された馬']}）" if r["返還された馬"] else ""
+            print(f"  {verdict}  投資 {r['投資']:,}円{refund}  払戻 {r['払戻']:,.0f}円  収支 {r['収支']:+,.0f}円")
+            print(f"  予測: {r['予測ファイル']}")
+    if not out["pending"].empty:
+        print("\n=== まだ照合できないレース ===")
+        _print_table(out["pending"])
+        print("  ※ 蓄積系の確定成績は月曜 14:00 ごろに届く（docs/v7_weekly.md）。届いたら fetch して再実行")
+    if not out["skipped"].empty:
+        print("\n=== 照合に使える予測がないレース ===")
+        _print_table(out["skipped"])
+
+    summ = results.summary(races)
+    print("\n=== 通算の成績表 ===")
+    _print_table(summ, pct_cols=("達成率", "下限", "上限"), money_cols=("投資", "払戻", "収支"))
+    print("  ※ 練習（replay）は本番予測と分けて数える。「参考外」はモデルがそのレースの結果を見ているもの")
+
+    save_dir = predict.data_root() / "results"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not races.empty:
+        races.to_csv(save_dir / f"races_{stamp}.csv", index=False, encoding="utf-8-sig")
+    summ.to_csv(save_dir / f"summary_{stamp}.csv", index=False, encoding="utf-8-sig")
+    print(f"\n保存しました: {save_dir}")
+
+    if args.sheet and not out["horses"].empty:
+        _write_record_sheet(results.record_rows(out["horses"]))
+    return 0
+
+
+def _write_record_sheet(rows: pd.DataFrame, ws=None) -> None:
+    """照合した結果を「記録」シートに書く（見出しの名前で。発汗・落着き・メモには触らない）。"""
+    from . import sheets
+
+    if rows.empty:
+        print("「記録」シートに書く行がありません")
+        return
+    if ws is None:
+        settings = sheets.load_settings()
+        ws = sheets.open_worksheet(settings, settings.record_sheet)
+    res = sheets.upsert_rows(ws, rows, sheets.RECORD_COLUMNS, mark_scratched=False)
+    print(f"「{ws.title}」シートに書き込みました: {res}")
+
+
+# ---------------------------------------------------------------------------
 # diagnose
 # ---------------------------------------------------------------------------
 def _results_dir(args) -> Path:
@@ -281,6 +366,10 @@ def _results_dir(args) -> Path:
 def _print_table(table: pd.DataFrame, pct_cols=(), money_cols=(), index=False) -> None:
     t = table.copy()
     for c in t.columns:
+        if isinstance(t[c].dtype, pd.api.extensions.ExtensionDtype) and t[c].dtype.kind in "iu":
+            t[c] = t[c].map(lambda v: "" if pd.isna(v) else f"{int(v):,}" if c in money_cols
+                            or any(k in str(c) for k in money_cols) else str(int(v)))
+            continue
         if c in pct_cols or any(k in str(c) for k in pct_cols):
             t[c] = t[c].map(lambda v: "" if pd.isna(v) else f"{v:.2%}")
         elif c in money_cols or any(k in str(c) for k in money_cols):
@@ -379,6 +468,59 @@ def _cmd_diag_arima(args) -> int:
     return 0
 
 
+def _cmd_diag_weekend(args) -> int:
+    from . import diagnose, validate
+
+    clock = _Clock()
+    _, ds = _load(args, clock)
+    folds = validate.V5_FOLDS[: args.folds] if args.folds else validate.V5_FOLDS
+    out = diagnose.weekend_gap_cv(ds, folds=folds)
+    clock.step("完了\n")
+    share = out["影響を受ける割合"]
+    print("=== 同じ週末の前の日の結果が入らないことの影響（5 fold・重賞・上位6頭BOX・馬体重は代用） ===")
+    print(f"  影響を受ける重賞（週末の2日目以降）: {share['週末の2日目以降']:,} / {share['重賞レース数']:,}"
+          f"（{share['割合']:.1%}）。初日のレースは A と B で特徴量が同じ")
+    _print_table(out["table"], pct_cols=("達成率", "下限", "上限", "差"))
+    print("\nAUC（fold ごと）:")
+    _print_table(out["auc"])
+    print("  平均: " + " / ".join(f"{c} {out['auc'][c].mean():.4f}" for c in out["auc"].columns if c.startswith("AUC")))
+    t = out["C_vs_B"]
+    print(f"\n  C − B（学習側を本番に合わせた効果）: {t['差']:+.2%} [{t['差下限']:+.2%}, {t['差上限']:+.2%}]"
+          f"  p={t['p値']:.3f}")
+    save = _results_dir(args) / "weekend_gap.csv"
+    out["table"].to_csv(save, index=False, encoding="utf-8-sig")
+    out["auc"].to_csv(_results_dir(args) / "weekend_gap_auc.csv", index=False, encoding="utf-8-sig")
+    print(f"\n保存しました: {save}")
+    return 0
+
+
+def _cmd_diag_start_year(args) -> int:
+    from . import diagnose, validate
+
+    print("=== 学習開始 1995年 vs 2003年（as_of=day・検証は同じ5 fold） ===")
+    print(diagnose.START_YEAR_RULE)
+    print()
+    clock = _Clock()
+    _, ds = _load(args, clock)
+    folds = validate.V5_FOLDS[: args.folds] if args.folds else validate.V5_FOLDS
+    out = diagnose.start_year_cv(ds, folds=folds)
+    clock.step("完了\n")
+    print("主指標（馬体重は代用＝本番の条件）:")
+    _print_table(out["table"], pct_cols=("達成率", "下限", "上限", "差"))
+    print("\n参考（実際の馬体重）:")
+    _print_table(out["table_real"], pct_cols=("達成率", "下限", "上限", "差"))
+    print("\n参考（AUC・best iteration）:")
+    _print_table(out["auc"])
+    print(f"\n判定: {out['verdict']}")
+    if args.folds:
+        print("  ※ --folds で fold を減らしているので、この判定は動作確認用（本番の判定は5 fold で）")
+    save = _results_dir(args) / "start_year.csv"
+    out["table"].to_csv(save, index=False, encoding="utf-8-sig")
+    out["auc"].to_csv(_results_dir(args) / "start_year_auc.csv", index=False, encoding="utf-8-sig")
+    print(f"\n保存しました: {save}")
+    return 0
+
+
 def _cmd_diag_payout(args) -> int:
     from . import diagnose
 
@@ -453,7 +595,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--going", default=None, choices=["良", "稍重", "重", "不良"],
                    help="馬場状態を指定する（既定: 未発表なら良と仮定）")
     p.add_argument("--model", default=None, help="使うモデル名（既定: 最後に学習したもの）")
+    p.add_argument("--sheet", action="store_true",
+                   help="予測を「評価入力」シートにも書き込む（local_settings.json の設定を使う）")
     p.set_defaults(func=_cmd_predict)
+
+    p = sub.add_parser("results", help="保存した予測と届いた結果を照合し、練習の成績表を出す")
+    p.add_argument("--sheet", action="store_true", help="照合した結果を「記録」シートにも書き込む")
+    p.set_defaults(func=_cmd_results)
 
     p = sub.add_parser("replay", help="過去の日の重賞を出馬表として予測し、答え合わせする")
     p.add_argument("--date", required=True)
@@ -482,6 +630,12 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか")
     q.add_argument("--as-of", default=predict.AS_OF, choices=["day", "race"])
     q.set_defaults(func=_cmd_diag_hot)
+    q = dsub.add_parser("weekend", help="同じ週末の前の日の結果が入らないことの影響")
+    q.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか（動作確認用）")
+    q.set_defaults(func=_cmd_diag_weekend)
+    q = dsub.add_parser("start-year", help="学習開始 1995年 vs 2003年（判定ルールは事前に固定）")
+    q.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか（動作確認用）")
+    q.set_defaults(func=_cmd_diag_start_year)
     q = dsub.add_parser("arima", help="有馬記念の3連単（組番・払戻・人気）の一覧")
     q.add_argument("--since-year", type=int, default=2004)
     q.set_defaults(func=_cmd_diag_arima)

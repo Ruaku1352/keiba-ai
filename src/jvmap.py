@@ -570,6 +570,21 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
         ninki = to_int(hr[ninki_col], invalid=("0000",)) if ninki_col in hr.columns \
             else pd.Series(np.nan, index=hr.index)
         out[f"{kind}人気"] = ninki.where(pay.notna()).astype("float64").to_numpy()
+        if kind == "3連単":
+            # 同着で的中組が複数あるとき用に、全部の組と払戻を ";" でつないで残す（結果の照合で使う）
+            combos, pays = [], []
+            for i in range(1, 7):
+                k_col, p_col = f"{prefix}[{i}].Kumi", f"{prefix}[{i}].Pay"
+                if k_col not in hr.columns:
+                    break
+                k = hr[k_col].astype(str).str.strip()
+                valid = ~k.isin({"", "000000"})
+                combos.append(k.where(valid, ""))
+                pays.append(to_int(hr[p_col]).where(valid).astype("Int64").astype(str).where(valid, ""))
+            join = (lambda parts: pd.concat(parts, axis=1).apply(
+                lambda r: ";".join(x for x in r if x), axis=1) if parts else pd.Series("", index=hr.index))
+            out["3連単組番一覧"] = join(combos).where(pay.notna(), "").to_numpy()
+            out["3連単払戻一覧"] = join(pays).where(pay.notna(), "").to_numpy()
         out[f"{kind}的中組数"] = np.asarray(n_hits)
         # 払戻が無い理由。発売開始日などは決め打ちせず、HR の中身で判定する:
         #   組番が空で不成立・特払フラグも無い → その券種が発売されていない（3連単は発売開始前など）

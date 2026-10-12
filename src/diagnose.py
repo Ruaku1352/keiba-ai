@@ -361,3 +361,232 @@ def arima_payouts(dataset, since_year: int = 2004) -> pd.DataFrame:
     if not out.empty:
         out["3連単人気"] = pd.to_numeric(out["3連単人気"], errors="coerce").round().astype("Int64")
     return out
+
+
+# ---------------------------------------------------------------------------
+# v7 共通：fold ごとの学習と、レースごとの「熱い当たり」
+# ---------------------------------------------------------------------------
+def build_feature_frame(dataset, weekend: bool = False) -> pd.DataFrame:
+    """as_of="day" の特徴量の表。weekend=True なら「その週末（連続した開催日）より前」だけで集計する。
+
+    weekend の仕組み：集計の除外単位（_集計日）を「その開催日が属する連続開催の初日」にする。
+    as_of="day" は同じ _集計日 の行を互いの過去に含めないので、土日（月曜祝日なら土日月）の
+    レースどうしが混ざらなくなる。本番で「日曜の予測に土曜の結果が無い」状態と同じになる。
+    （例外：馬の前走・通算成績は日付で切らないが、同じ週末に2回走る馬はほぼいない）
+    過去の各レースのペースの z 化だけは、本番の予測の経路と同じく「そのレースの前日まで」で行う
+    （本番では過去のレースは前日まで、で計算されるため。test_v7 で予測の経路との一致を確認）。
+    """
+    df = preprocess.basic_clean(dataset.race_result)
+    if weekend:
+        from . import pace
+        df[features.DAY_COL] = weekend_block_start(df["レース日付"])
+        df[pace.STANDARDIZE_DAY_COL] = df["レース日付"]   # 各レースのペースの z 化は本番と同じく前日まで
+    df = features.add_all_features(df, lap_df=dataset.lap_df, as_of="day")
+    df = preprocess.downcast(df)
+    return preprocess.to_category(df)
+
+
+def weekend_block_start(dates: pd.Series) -> pd.Series:
+    """各開催日について、1日も空かずに続く開催（土日、土日月など）の初日。"""
+    d = pd.to_datetime(dates)
+    days = np.sort(d.unique())
+    if len(days) == 0:
+        return d
+    gap = np.diff(days) > np.timedelta64(1, "D")
+    block = np.r_[0, np.cumsum(gap)]
+    first = days[np.r_[True, gap]]
+    return d.map(pd.Series(first[block], index=days))
+
+
+def race_hot_flags(test: pd.DataFrame, pred: np.ndarray, payout_df: pd.DataFrame) -> pd.Series:
+    """重賞・上位6頭BOX が熱い当たりになったか（レースID → bool）。払戻のある重賞だけ。
+
+    判定は trifecta.simulate と同じ（出走頭数が6未満なら買える頭数まで、基準は投資額の中央値から）。
+    """
+    race = trifecta.build_race_table(test, pred, payout_df)
+    g = race.loc[race["重賞"] & race["3連単払戻"].notna()]
+    res = trifecta.simulate(g, trifecta.box(predict.BOX_SIZE))
+    threshold = res.get("熱い基準", HOT_PAYOUT)
+    k = np.minimum(predict.BOX_SIZE, g["出走頭数"])
+    hit = (g["1着予測順位"] <= k) & (g["2着予測順位"] <= k) & (g["3着予測順位"] <= k)
+    return pd.Series((hit & (g["3連単払戻"] >= threshold)).to_numpy(), index=g["レースID"].to_numpy())
+
+
+def _with_substituted_weight(test: pd.DataFrame, prev_weight: pd.Series) -> pd.DataFrame:
+    out = test.copy()
+    out["馬体重"] = prev_weight.loc[test.index].astype("float32")
+    out["場体重増減"] = np.float32(0.0)
+    return out
+
+
+def _compare_arms(arms: dict[str, pd.Series], base: str) -> pd.DataFrame:
+    """同じ重賞レースでの熱い当たりを、腕ごとに集計し base との対応のある差を出す。"""
+    rows = []
+    ref = arms[base]
+    for name, flags in arms.items():
+        common = ref.index.intersection(flags.index)
+        hot, n = int(flags.loc[common].sum()), len(common)
+        lo, hi = trifecta.wilson_interval(hot, n)
+        row = {"条件": name, "重賞R数": n, "熱い当たり": hot, "達成率": hot / n if n else np.nan,
+               "下限": lo, "上限": hi}
+        if name != base:
+            t = trifecta.paired_proportion_test(flags.loc[common].to_numpy(), ref.loc[common].to_numpy())
+            row.update({f"差（−{base}）": t["差"], "差の下限": t["差下限"], "差の上限": t["差上限"],
+                        "p値": t["p値"], "こちらだけ当たり": t["xだけ"], f"{base}だけ当たり": t["yだけ"]})
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c.endswith("だけ当たり"):
+            out[c] = out[c].astype("Int64")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v7 3(2) 同じ週末の前の日の結果が入らないことの影響
+# ---------------------------------------------------------------------------
+WEEKEND_ARMS = {
+    "A": "学習=前日まで / 検証=前日まで（今の検証と同じ）",
+    "B": "学習=前日まで / 検証=週末より前（今の本番。速報を取らない場合）",
+    "C": "学習=週末より前 / 検証=週末より前（学習側を本番に合わせる案）",
+}
+
+
+def weekend_gap_cv(dataset, folds=None, model_fn=None, verbose: bool = True) -> dict:
+    """「前日までの結果」と「その週末より前の結果だけ」で作った特徴量を比べる（5 fold）。
+
+    3つの腕（WEEKEND_ARMS）。検証の馬体重はすべて代用（前走・増減0）＝本番の条件。
+    A と B は同じモデル（前日までの特徴量で学習）で、検証の特徴量だけを変える → 本番で失う分。
+    C は週末より前の特徴量で学習し直したモデル → 学習側を本番に合わせたときにどこまで戻るか。
+    学習は validate と同じ（検証期間で early stopping）。
+    """
+    from . import validate
+
+    folds = folds or validate.V5_FOLDS
+    model_fn = model_fn or _train_with_early_stopping
+    if verbose:
+        print("[diagnose] 特徴量を作成：前日まで ...")
+    day = build_feature_frame(dataset, weekend=False)
+    if verbose:
+        print("[diagnose] 特徴量を作成：週末より前 ...")
+    wk = _align_rows(build_feature_frame(dataset, weekend=True), day)
+    prev = predict.previous_weight(day)
+    cols = features.feature_columns(day)
+
+    flags = {k: [] for k in WEEKEND_ARMS}
+    aucs = []
+    for fold in folds:
+        tr_d, te_d = validate._slice_years(day, fold.train_years), validate._slice_years(day, fold.test_years)
+        tr_w, te_w = validate._slice_years(wk, fold.train_years), validate._slice_years(wk, fold.test_years)
+        if tr_d.empty or te_d.empty:
+            continue
+        if verbose:
+            print(f"  fold{fold.name} {fold.label}: train {len(tr_d):,} / test {len(te_d):,}")
+        te_d_sub, te_w_sub = _with_substituted_weight(te_d, prev), _with_substituted_weight(te_w, prev)
+        m_day = model_fn(tr_d, te_d, cols)
+        m_wk = model_fn(tr_w, te_w, cols)
+        preds = {
+            "A": m_day.predict(te_d_sub[cols], num_iteration=getattr(m_day, "best_iteration", None) or None),
+            "B": m_day.predict(te_w_sub[cols], num_iteration=getattr(m_day, "best_iteration", None) or None),
+            "C": m_wk.predict(te_w_sub[cols], num_iteration=getattr(m_wk, "best_iteration", None) or None),
+        }
+        row = {"fold": fold.name}
+        for k, p in preds.items():
+            flags[k].append(race_hot_flags(te_d, p, dataset.payout_df))
+            row[f"AUC_{k}"] = _auc(te_d[config.TARGET], p)
+        aucs.append(row)
+    arms = {k: pd.concat(v) for k, v in flags.items()}
+    table = _compare_arms(arms, base="A")
+    table.insert(1, "説明", table["条件"].map(WEEKEND_ARMS))
+    auc = pd.DataFrame(aucs)
+    # C と B の対応のある差（学習側を合わせると取り戻せるか）
+    common = arms["B"].index.intersection(arms["C"].index)
+    c_vs_b = trifecta.paired_proportion_test(arms["C"].loc[common].to_numpy(),
+                                             arms["B"].loc[common].to_numpy())
+    share = _same_weekend_share(dataset)
+    return {"table": table, "auc": auc, "C_vs_B": c_vs_b, "影響を受ける割合": share}
+
+
+def _align_rows(frame: pd.DataFrame, like: pd.DataFrame) -> pd.DataFrame:
+    """frame の行を like と同じ順番・同じ index にそろえる（キーは レースID・血統登録番号）。"""
+    key = ["レースID", "血統登録番号"]
+    a = pd.MultiIndex.from_frame(frame[key].astype(str))
+    b = pd.MultiIndex.from_frame(like[key].astype(str))
+    if a.has_duplicates or not b.isin(a).all():
+        raise ValueError("2つの特徴量の表の行が対応しません")
+    out = frame.iloc[a.get_indexer(b)].copy()
+    out.index = like.index
+    return out
+
+
+def _same_weekend_share(dataset) -> dict:
+    """重賞のうち、同じ週末の前の日に開催があるレース（＝本番で前日の結果が欠けるレース）の割合。"""
+    races = dataset.race_result.drop_duplicates("レースID")
+    races = races.loc[races["リステッド・重賞競走"].isin(config.GRADED_VALUES)]
+    all_days = pd.Series(pd.to_datetime(dataset.race_result["レース日付"]).unique())
+    first = pd.Series(weekend_block_start(all_days).to_numpy(), index=all_days.to_numpy())
+    d = pd.to_datetime(races["レース日付"])
+    affected = d.map(first) < d
+    return {"重賞レース数": int(len(races)), "週末の2日目以降": int(affected.sum()),
+            "割合": float(affected.mean()) if len(races) else np.nan}
+
+
+# ---------------------------------------------------------------------------
+# v7 4 学習開始 1995年 vs 2003年
+# ---------------------------------------------------------------------------
+START_YEAR_RULE = (
+    "判定ルール（結果を見る前に固定）:\n"
+    "  主指標 = 重賞・上位6頭BOX の熱い当たりの有無（5 fold の検証レースをプール。馬体重は代用＝本番の条件）\n"
+    "  同じ検証レースを両方のモデルで予測するので、対応のある比較（Newcombe 法10 の差の 95% 区間）を使う\n"
+    "  差（1995 − 2003）の 95% 区間の下限が 0 を超えたら 1995年を採用。そうでなければ 2003年のまま\n"
+    "  AUC・実際の馬体重での達成率は参考として表示するだけで、判定には使わない"
+)
+
+
+def start_year_cv(dataset, folds=None, years=(1995, 2003), model_fn=None, verbose: bool = True) -> dict:
+    """学習開始年だけを変えて、同じ検証 fold で比べる（as_of=day）。比べるのはこの1組だけ。"""
+    from . import validate
+
+    folds = folds or validate.V5_FOLDS
+    model_fn = model_fn or _train_with_early_stopping
+    if verbose:
+        print("[diagnose] 特徴量を作成（as_of=day、全期間で1回だけ）...")
+    df = build_feature_frame(dataset)
+    prev = predict.previous_weight(df)
+    cols = features.feature_columns(df)
+
+    sub_flags = {y: [] for y in years}
+    real_flags = {y: [] for y in years}
+    aucs = []
+    for fold in folds:
+        test = validate._slice_years(df, fold.test_years)
+        if test.empty:
+            continue
+        test_sub = _with_substituted_weight(test, prev)
+        row = {"fold": fold.name, "検証": f"{fold.test_years[0]}-{fold.test_years[1]}"}
+        for y in years:
+            train = validate._slice_years(df, (y, fold.train_years[1]))
+            if verbose:
+                print(f"  fold{fold.name} 学習 {y}-{fold.train_years[1]}: train {len(train):,} / test {len(test):,}")
+            m = model_fn(train, test, cols)
+            best = getattr(m, "best_iteration", None) or None
+            p_sub = m.predict(test_sub[cols], num_iteration=best)
+            p_real = m.predict(test[cols], num_iteration=best)
+            sub_flags[y].append(race_hot_flags(test, p_sub, dataset.payout_df))
+            real_flags[y].append(race_hot_flags(test, p_real, dataset.payout_df))
+            row[f"AUC_{y}（代用）"] = _auc(test[config.TARGET], p_sub)
+            row[f"best_iteration_{y}"] = best
+            row[f"学習行数_{y}"] = len(train)
+        aucs.append(row)
+
+    new, old = years
+    names = {new: f"学習開始{new}", old: f"学習開始{old}"}
+    sub = {names[y]: pd.concat(v) for y, v in sub_flags.items()}
+    real = {names[y]: pd.concat(v) for y, v in real_flags.items()}
+    table = _compare_arms({names[new]: sub[names[new]], names[old]: sub[names[old]]}, base=names[old])
+    table_real = _compare_arms({names[new]: real[names[new]], names[old]: real[names[old]]}, base=names[old])
+    lower = float(table.loc[table["条件"] == names[new], "差の下限"].iloc[0])
+    adopt = bool(lower > 0)
+    verdict = (f"採用：{new}年から学習する（差の下限 {lower:+.2%} > 0）" if adopt
+               else f"不採用：{old}年のまま（差の下限 {lower:+.2%} ≤ 0）")
+    return {"rule": START_YEAR_RULE, "table": table, "table_real": table_real,
+            "auc": pd.DataFrame(aucs), "adopt": adopt, "verdict": verdict}

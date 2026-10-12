@@ -1,0 +1,6 @@
+{
+  "google_service_account_file": "C:\\Users\\YOUR_NAME\\keiba\\secrets\\google_service_account.json",
+  "spreadsheet_id": "ここにシートのID（URL の /d/ と /edit の間）",
+  "entry_sheet": "評価入力",
+  "record_sheet": "記録"
+}

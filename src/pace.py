@@ -195,6 +195,9 @@ def _standardize_by_condition(df: pd.DataFrame, value_col: str,
     return pd.Series(mapped["_z"].to_numpy(), index=df.index, dtype="float32")
 
 
+STANDARDIZE_DAY_COL = "_標準化日"
+
+
 def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0,
                       as_of: str = "race") -> pd.DataFrame:
     """馬ごとのペース適性と、今日の想定ペースを追加する。
@@ -205,6 +208,10 @@ def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0,
     同じ日のレースを含めない。馬ごとの集計は1日1走なのでどちらでも同じ。
     """
     day_col = "_集計日" if as_of == "day" else None
+    # 各レースのペースの z 化（そのレース自身の値）に使う日付。ふだんは day_col と同じ。
+    # 「週末より前の結果だけ」の検証（diagnose weekend）では、_集計日 を週末の初日にしつつ、
+    # z 化は本番と同じく前日までで行うため、STANDARDIZE_DAY_COL に日付を入れておく。
+    std_col = STANDARDIZE_DAY_COL if day_col and STANDARDIZE_DAY_COL in df.columns else day_col
     if "_ペース指標" not in df.columns:
         raise KeyError("先に attach_race_pace() を呼んでください")
 
@@ -213,7 +220,7 @@ def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0,
     df = df.copy()
 
     # そのレースのペースを条件別に z 化（この列も「結果」なので特徴量にはしない）
-    df["_ペース指標z"] = _standardize_by_condition(df, "_ペース指標", day_col=day_col)
+    df["_ペース指標z"] = _standardize_by_condition(df, "_ペース指標", day_col=std_col)
     z = df["_ペース指標z"]
 
     show = (df[rank] <= 3).astype("float32")          # 複勝圏
@@ -233,7 +240,7 @@ def add_pace_features(df: pd.DataFrame, high_pace_threshold: float = 0.0,
     # 上がり3Fの速さ（レース平均との差）。末脚の絶対的な速さを見る
     if "_上がり3F" in df.columns:
         # 上がり3Fは小さいほど速い＝良いので、符号を反転してから z 化する
-        last3f_z = _standardize_by_condition(df, "_上がり3F", sign=-1.0, day_col=day_col)
+        last3f_z = _standardize_by_condition(df, "_上がり3F", sign=-1.0, day_col=std_col)
         df["_上がり3Fz"] = last3f_z
         df["過去上がり3F偏差"] = leakfree.past_mean_ignore_nan(df, [horse], last3f_z)
         df["前走上がり3F偏差"] = df.groupby(horse, observed=True, sort=False)["_上がり3Fz"].shift(1)

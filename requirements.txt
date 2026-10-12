@@ -8,3 +8,5 @@ pytest>=7.0
 pyarrow>=14.0
 # JV-Link（COM）は Windows 専用
 pywin32>=306; sys_platform == "win32"
+# v7: Google スプレッドシートへの書き込み（predict --sheet / results --sheet のときだけ使う）
+gspread>=6.0

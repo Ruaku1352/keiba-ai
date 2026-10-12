@@ -192,6 +192,50 @@ def two_proportion_test(hits_a: int, n_a: int, hits_b: int, n_b: int) -> dict:
             "差下限": lower, "差上限": upper, "有意": bool(p_value < 0.05)}
 
 
+def paired_proportion_test(x, y) -> dict:
+    """同じレースを2通りで判定したときの割合の差（x − y）の検定と信頼区間。
+
+    例）同じ検証レースで、学習開始 1995年のモデルと 2003年のモデルの「熱い当たり」を比べる。
+    同じレースなので2つの結果は強く相関する。two_proportion_test（別々の標本を仮定）は
+    この相関を無視するので区間が広すぎる。ここでは対応のある比較を使う:
+      差の区間: Newcombe (1998) の方法10（各割合の Wilson 区間と、2つの判定の相関 φ から組み立てる）
+      p値     : 正確な McNemar 検定（片方だけが当たったレース b, c の二項検定）
+    """
+    x = np.asarray(x, dtype=bool)
+    y = np.asarray(y, dtype=bool)
+    n = len(x)
+    if n == 0 or len(y) != n:
+        return {"差": float("nan"), "差下限": float("nan"), "差上限": float("nan"),
+                "p値": float("nan"), "n": n, "xだけ": 0, "yだけ": 0, "有意": False}
+    a = int((x & y).sum())
+    b = int((x & ~y).sum())
+    c = int((~x & y).sum())
+    d = n - a - b - c
+    p1, p2 = (a + b) / n, (a + c) / n
+    l1, u1 = wilson_interval(a + b, n)
+    l2, u2 = wilson_interval(a + c, n)
+    denom = math.sqrt((a + b) * (c + d) * (a + c) * (b + d))
+    if denom == 0:
+        phi = 0.0
+    else:
+        num = a * d - b * c
+        phi = (max(num - n / 2, 0.0) if num > 0 else num) / denom
+    delta = math.sqrt(max((p1 - l1) ** 2 - 2 * phi * (p1 - l1) * (u2 - p2) + (u2 - p2) ** 2, 0.0))
+    eps = math.sqrt(max((u1 - p1) ** 2 - 2 * phi * (u1 - p1) * (p2 - l2) + (p2 - l2) ** 2, 0.0))
+    diff = p1 - p2
+
+    # 正確な McNemar（両側）：b ~ Binomial(b + c, 1/2)
+    m = b + c
+    if m == 0:
+        p_value = 1.0
+    else:
+        k = min(b, c)
+        tail = sum(math.comb(m, i) for i in range(k + 1)) / 2 ** m
+        p_value = min(1.0, 2 * tail)
+    return {"差": diff, "差下限": diff - delta, "差上限": diff + eps, "p値": p_value,
+            "n": n, "xだけ": b, "yだけ": c, "両方": a, "有意": bool(p_value < 0.05)}
+
+
 def normal_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """依頼書に書かれていた素朴な二項近似（比較用に残してある）。"""
     if n == 0:
