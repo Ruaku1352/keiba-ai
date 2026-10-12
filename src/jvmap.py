@@ -564,6 +564,12 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
         else:
             report.add(f"HR {kind} 不成立・特払・返還あり（除外しない）", int(irregular.sum()))
         out[f"{kind}払戻"] = pay.astype("float64").to_numpy()
+        # 1番目の的中組の組番（馬番2桁×3）と人気順。払戻が無いレースは空
+        out[f"{kind}組番"] = kumi.where(pay.notna()).to_numpy()
+        ninki_col = f"{prefix}[1].Ninki"
+        ninki = to_int(hr[ninki_col], invalid=("0000",)) if ninki_col in hr.columns \
+            else pd.Series(np.nan, index=hr.index)
+        out[f"{kind}人気"] = ninki.where(pay.notna()).astype("float64").to_numpy()
         out[f"{kind}的中組数"] = np.asarray(n_hits)
         # 払戻が無い理由。発売開始日などは決め打ちせず、HR の中身で判定する:
         #   組番が空で不成立・特払フラグも無い → その券種が発売されていない（3連単は発売開始前など）

@@ -11,6 +11,8 @@
     py -m src.v6 diagnose payout-trend        年ごとの3連単払戻の中央値・5万円以上の割合（重賞 vs 平場）
     py -m src.v6 diagnose check-3f            ラップから計算した前3F・後3Fと公式値の一致（距離ごと）
     py -m src.v6 diagnose style-zero          今回レース脚質判定の「0」の内訳（年ごと）
+    py -m src.v6 diagnose hot-payouts         CV（as_of=day）で熱い当たりになったレースの払戻の分布と一覧
+    py -m src.v6 diagnose arima               2004年以降の有馬記念の3連単（組番・払戻・人気）
 
 買い方は変えない：重賞のみ（G1/G2/G3/G）・予測上位6頭の3連単BOX（120点・12,000円）。
 データの取得は `py -m src.jvlink fetch --option 1`（出馬表もこれで届く）。
@@ -313,6 +315,67 @@ def _cmd_diag_weight(args) -> int:
     save = _results_dir(args) / f"weight_impact_{args.as_of}.csv"
     table.to_csv(save, index=False, encoding="utf-8-sig")
     print(f"\n保存しました: {save}")
+    _print_hot_payouts(args, out["hot_hits"], show_list=False)
+    return 0
+
+
+_MONEY = ("最小", "25%", "中央値", "75%", "最大", "平均", "払戻")
+
+
+def _print_hot_payouts(args, hits: pd.DataFrame, show_list: bool) -> None:
+    from . import diagnose
+
+    print(f"\n=== 熱い当たり（重賞・上位6頭BOX・払戻50,000円以上）の3連単払戻の分布  as_of={args.as_of} ===")
+    print("    払戻は100円あたり。fold ごとと全 fold のプール")
+    if hits.empty:
+        print("\n  熱い当たりはありませんでした")
+    for label, g in hits.groupby("馬体重", sort=False):
+        print(f"\n  [{label}]")
+        _print_table(diagnose.hot_payout_distribution(g), money_cols=_MONEY)
+    real = hits.loc[hits["馬体重"] == "実際の馬体重"]
+    if show_list and not real.empty:
+        print("\n  熱い当たりになったレースの一覧（実際の馬体重）:")
+        cols = [c for c in ["fold", "日付", "競馬場", "レース名", "格付け", "出走頭数", "3連単組番",
+                            "3連単払戻", "3連単人気"] if c in real.columns]
+        t = real[cols].copy()
+        t["日付"] = pd.to_datetime(t["日付"]).dt.strftime("%Y-%m-%d")
+        _print_table(t.sort_values("日付"), money_cols=("払戻",))
+    save = _results_dir(args) / f"hot_hits_{args.as_of}.csv"
+    hits.to_csv(save, index=False, encoding="utf-8-sig")
+    print(f"\n保存しました: {save}")
+
+
+def _cmd_diag_hot(args) -> int:
+    from . import diagnose, validate
+
+    clock = _Clock()
+    _, ds = _load(args, clock)
+    folds = validate.V5_FOLDS[: args.folds] if args.folds else validate.V5_FOLDS
+    out = diagnose.weight_impact_cv(ds, folds=folds, as_of=args.as_of)
+    clock.step("完了")
+    _print_hot_payouts(args, out["hot_hits"], show_list=True)
+    return 0
+
+
+def _cmd_diag_arima(args) -> int:
+    from . import diagnose
+
+    clock = _Clock()
+    _, ds = _load(args, clock)
+    table = diagnose.arima_payouts(ds, since_year=args.since_year)
+    clock.step("完了\n")
+    if table.empty:
+        print(f"{args.since_year}年以降の有馬記念が確定レースにありません")
+        return 1
+    print(f"=== 有馬記念の3連単（{args.since_year}年以降。払戻は100円あたり、人気は3連単の人気順） ===")
+    _print_table(table.drop(columns=["レースID"]), money_cols=("払戻",))
+    pay = table["払戻"].dropna()
+    if len(pay):
+        print(f"\n  {len(pay)}回: 中央値 {pay.median():,.0f}円 / 最小 {pay.min():,.0f}円 / 最大 {pay.max():,.0f}円"
+              f" / 50,000円以上 {int((pay >= 50_000).sum())}回")
+    save = _results_dir(args) / "arima_payouts.csv"
+    table.to_csv(save, index=False, encoding="utf-8-sig")
+    print(f"\n保存しました: {save}")
     return 0
 
 
@@ -415,6 +478,13 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--since", default="2003-01-01")
     q.set_defaults(func=_cmd_diag_3f)
     dsub.add_parser("style-zero", help="今回レース脚質判定の0の内訳").set_defaults(func=_cmd_diag_style)
+    q = dsub.add_parser("hot-payouts", help="CV で熱い当たりになったレースの払戻の分布と一覧")
+    q.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか")
+    q.add_argument("--as-of", default=predict.AS_OF, choices=["day", "race"])
+    q.set_defaults(func=_cmd_diag_hot)
+    q = dsub.add_parser("arima", help="有馬記念の3連単（組番・払戻・人気）の一覧")
+    q.add_argument("--since-year", type=int, default=2004)
+    q.set_defaults(func=_cmd_diag_arima)
 
     args = parser.parse_args(argv)
     return args.func(args)

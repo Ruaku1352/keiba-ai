@@ -79,7 +79,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 199 passed（SDK が無い環境では 193 passed, 6 skipped）
+py -m pytest tests -q          # 204 passed（SDK が無い環境では 198 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -116,7 +116,8 @@ py -m src.v6 train --until 2026-09-30
 py -m src.v6 replay --date 2026-10-04
 ```
 
-確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero`
+確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero` /
+`hot-payouts`（熱い当たりの払戻の分布）/ `arima`（2004年以降の有馬記念の3連単）
 
 ### 変換と再検証（`src/v5.py`）
 

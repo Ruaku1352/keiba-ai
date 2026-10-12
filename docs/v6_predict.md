@@ -15,6 +15,8 @@
 | 3(2) 脚質判定の 0 | `py -m src.v6 diagnose style-zero` |
 | 3(3) 3F の一致 | `src/jvmap.py`（公式値・計算値を別列にも保存）、`py -m src.v6 diagnose check-3f` |
 | 3(4) 達成率低下の切り分け | `py -m src.v6 diagnose payout-trend`（レース側）、`diagnose weight`（モデル側の数字も出す） |
+| 追加：熱い当たりの払戻の分布 | `py -m src.v6 diagnose hot-payouts`（`diagnose weight` の最後にも分布だけ出る） |
+| 追加：有馬記念の3連単の一覧 | `py -m src.v6 diagnose arima`（2004年以降。`--since-year` で変更） |
 
 テストは `tests/test_v6_predict.py`。
 
@@ -160,3 +162,24 @@ validate と同じ5 fold で、fold ごとにモデルを1つ学習し、検証�
 | `data\models\latest.txt` | 最後に学習したモデルの名前（`--model` を省略するとこれを使う） |
 | `data\predictions\*.csv` | 予測の CSV |
 | `data\jvlink\v6_results\*.csv` | diagnose の結果 |
+
+---
+
+## 追加：熱い当たりの払戻の分布と、有馬記念の一覧
+
+### hot-payouts
+
+`diagnose weight` と同じ CV（as_of=day、validate と同じ5 fold、検証期間で early stopping）で、
+重賞・上位6頭BOX が**熱い当たり**（的中かつ3連単払戻 ≥ 50,000円/100円）になったレースを集め、
+fold ごと・全体の払戻の分布（件数・最小・25%・中央値・75%・最大・平均）を出す。
+実際の馬体重と代用した馬体重の両方。実際の馬体重の方はレースの一覧（日付・競馬場・レース名・格付け・
+頭数・組番・払戻・3連単人気）も出す。的中の判定は `trifecta.simulate` と同じ。
+結果は `data\jvlink\v6_results\hot_hits_day.csv`（`--as-of race` なら `_race`）。
+
+### arima
+
+確定レースのうち、競走名に「有馬記念」を含む G1（2004年以降）の3連単を一覧にする。
+組番（1着-2着-3着の馬番）・払戻（100円あたり）・3連単の人気順（HR の「3連単人気順」）・1〜3着の馬名と単勝人気。
+同着で的中組が複数あるときは HR の1番目の組。
+このため `jvmap.prepare_payout` に `3連単組番`・`3連単人気`（3連複も同様）の列を足した
+（払戻が無いレースは空）。

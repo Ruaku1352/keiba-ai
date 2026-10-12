@@ -6,6 +6,8 @@
     payout_trend         モデルを使わない数字：年ごとの3連単払戻の中央値と 50,000円以上の割合
     three_f_agreement    ラップから計算した前3F・後3Fと公式値の一致（距離ごと）
     style_zero_table     SE の今回レース脚質判定「0」（初期値）が、どこから来ているか
+    hot_payout_distribution  CV で熱い当たりになったレースの3連単払戻の分布
+    arima_payouts        有馬記念の3連単（組番・払戻・人気）の一覧
 
 どれも探索ではなく確認。買い方（重賞・上位6頭BOX）は変えない。
 """
@@ -48,11 +50,17 @@ def _auc(y, p) -> float:
     return float((ranks[y].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
-def _graded_box_stats(test: pd.DataFrame, pred: np.ndarray, payout_df: pd.DataFrame) -> dict:
-    """重賞・上位6頭BOX の成績と、モデルが選んだ6頭の人気。"""
+def _graded_box_stats(test: pd.DataFrame, pred: np.ndarray, payout_df: pd.DataFrame,
+                      hot_rows: list | None = None) -> dict:
+    """重賞・上位6頭BOX の成績と、モデルが選んだ6頭の人気。
+
+    hot_rows にリストを渡すと、熱い当たりになったレースの行（DataFrame）を追加する。
+    """
     race = trifecta.build_race_table(test, pred, payout_df)
     graded = race.loc[race["重賞"]]
     res = trifecta.simulate(graded, trifecta.box(predict.BOX_SIZE))
+    if hot_rows is not None:
+        hot_rows.append(hot_hit_races(graded, test, res.get("熱い基準", HOT_PAYOUT)))
 
     # 上位6頭に入った馬の単勝人気（確定レースの人気。特徴量には使っていない）
     t = test[["レースID", "人気", "リステッド・重賞競走"]].copy()
@@ -80,6 +88,50 @@ def _graded_box_stats(test: pd.DataFrame, pred: np.ndarray, payout_df: pd.DataFr
     }
 
 
+def format_kumi(kumi) -> str:
+    """"050312" -> "5-3-12"（3連単の組番。1着-2着-3着の馬番）。"""
+    if isinstance(kumi, str) and len(kumi) == 6 and kumi.isdigit():
+        return f"{int(kumi[:2])}-{int(kumi[2:4])}-{int(kumi[4:6])}"
+    return ""
+
+
+def hot_hit_races(graded: pd.DataFrame, test: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """重賞のレース表のうち、上位6頭BOX が熱い当たり（的中かつ払戻 ≥ 基準）になったレース。
+
+    的中の判定は trifecta.simulate と同じ（出走頭数が6頭未満なら買える頭数まで）。
+    """
+    g = graded.loc[graded["3連単払戻"].notna()]
+    k = np.minimum(predict.BOX_SIZE, g["出走頭数"])
+    hit = (g["1着予測順位"] <= k) & (g["2着予測順位"] <= k) & (g["3着予測順位"] <= k)
+    hot = g.loc[hit & (g["3連単払戻"] >= threshold)]
+    names = test.drop_duplicates("レースID").set_index("レースID")
+    cols = ["レースID", "日付", "格付け", "出走頭数", "3連単払戻"] + \
+        [c for c in ("3連単組番", "3連単人気") if c in hot.columns]
+    out = hot[cols].copy()
+    if "3連単組番" in out.columns:
+        out["3連単組番"] = out["3連単組番"].map(format_kumi)
+    if "3連単人気" in out.columns:
+        out["3連単人気"] = pd.to_numeric(out["3連単人気"], errors="coerce").round().astype("Int64")
+    for src, dst in [("競走名", "レース名"), ("競馬場名", "競馬場")]:
+        if src in names.columns:
+            out[dst] = out["レースID"].map(names[src]).astype(object)
+    return out
+
+
+def hot_payout_distribution(hits: pd.DataFrame, by: str = "fold") -> pd.DataFrame:
+    """熱い当たりの3連単払戻の分布（件数・最小・四分位・中央値・最大・平均）。by ごと＋全体。"""
+    def stats(p: pd.Series) -> dict:
+        p = p.dropna()
+        if p.empty:
+            return {"件数": 0}
+        return {"件数": len(p), "最小": p.min(), "25%": p.quantile(0.25), "中央値": p.median(),
+                "75%": p.quantile(0.75), "最大": p.max(), "平均": p.mean()}
+
+    rows = [{by: name, **stats(g["3連単払戻"])} for name, g in hits.groupby(by, sort=False)]
+    rows.append({by: "全体", **stats(hits["3連単払戻"])})
+    return pd.DataFrame(rows)
+
+
 def weight_impact_cv(dataset, folds=None, as_of: str = predict.AS_OF, model_fn=None,
                      verbose: bool = True) -> dict:
     """validate の fold で、実際の馬体重 vs 代用した馬体重を比べる。
@@ -104,7 +156,7 @@ def weight_impact_cv(dataset, folds=None, as_of: str = predict.AS_OF, model_fn=N
     cols = features.feature_columns(df)
     model_fn = model_fn or _train_with_early_stopping
 
-    rows, model_rows = [], []
+    rows, hot_parts = [], []
     for fold in folds:
         train = validate._slice_years(df, fold.train_years)
         test = validate._slice_years(df, fold.test_years)
@@ -118,13 +170,18 @@ def weight_impact_cv(dataset, folds=None, as_of: str = predict.AS_OF, model_fn=N
         p_real = booster.predict(test[cols], num_iteration=best)
         p_sub = booster.predict(test_sub[cols], num_iteration=best)
         for label, p in [("実際の馬体重", p_real), ("代用（前走・増減0）", p_sub)]:
-            st = _graded_box_stats(test, p, dataset.payout_df)
+            hot_rows: list = []
+            st = _graded_box_stats(test, p, dataset.payout_df, hot_rows)
+            for h in hot_rows:
+                hot_parts.append(h.assign(fold=fold.name, 馬体重=label))
             rows.append({"fold": fold.name, "検証": f"{fold.test_years[0]}-{fold.test_years[1]}",
                          "馬体重": label, "AUC": _auc(test[config.TARGET], p),
                          "best_iteration": best, **st})
     table = pd.DataFrame(rows)
     pooled = _pool_weight_table(table)
-    return {"table": table, "pooled": pooled}
+    hot = pd.concat(hot_parts, ignore_index=True) if hot_parts else pd.DataFrame(
+        columns=["fold", "馬体重", "レースID", "日付", "3連単払戻"])
+    return {"table": table, "pooled": pooled, "hot_hits": hot}
 
 
 def _train_with_early_stopping(train, test, cols):
@@ -262,4 +319,45 @@ def style_zero_table(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     # 最終データ（学習に使う中央・確定・取消なし）の中での 0 の割合
     final = t.loc[t["理由"] == "最終データ"]
     out["最終データでの0の割合"] = final.groupby("年")["0"].mean()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 有馬記念の3連単
+# ---------------------------------------------------------------------------
+ARIMA_NAME = "有馬記念"
+
+
+def arima_payouts(dataset, since_year: int = 2004) -> pd.DataFrame:
+    """有馬記念（競走名に「有馬記念」を含む G1）の3連単の一覧。
+
+    列: 年, 日付, レースID, 頭数, 組番（1着-2着-3着の馬番）, 払戻（100円あたり）, 3連単人気,
+        1〜3着の馬名と単勝人気
+    3連単の人気順は HR の「3連単払戻の人気順」。同着で的中組が複数あるときは1番目の組。
+    """
+    rr = dataset.race_result
+    races = rr.drop_duplicates("レースID")
+    races = races.loc[races["競走名"].astype(str).str.contains(ARIMA_NAME)
+                      & (races["リステッド・重賞競走"] == "G1")
+                      & (pd.to_datetime(races["レース日付"]).dt.year >= since_year)]
+    pay = dataset.payout_df.set_index("レースID")
+    rows = []
+    for _, r in races.sort_values("レース日付").iterrows():
+        rid = r["レースID"]
+        horses = rr.loc[rr["レースID"] == rid]
+        row = {"年": pd.Timestamp(r["レース日付"]).year, "日付": f"{pd.Timestamp(r['レース日付']):%Y-%m-%d}",
+               "レースID": rid, "頭数": len(horses)}
+        p = pay.loc[rid] if rid in pay.index else None
+        kumi = p.get("3連単組番") if p is not None else None
+        row["組番"] = format_kumi(kumi)
+        row["払戻"] = p.get("3連単払戻") if p is not None else np.nan
+        row["3連単人気"] = p.get("3連単人気") if p is not None else np.nan
+        for k in (1, 2, 3):
+            h = horses.loc[horses["着順"] == k]
+            row[f"{k}着"] = "/".join(f"{int(x.馬番)} {x.馬名表示}" for x in h.itertuples()) if len(h) else ""
+            row[f"{k}着人気"] = "/".join(str(int(x)) for x in h["人気"].dropna()) if len(h) else ""
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["3連単人気"] = pd.to_numeric(out["3連単人気"], errors="coerce").round().astype("Int64")
     return out

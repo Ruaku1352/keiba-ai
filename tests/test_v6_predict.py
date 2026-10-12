@@ -590,3 +590,75 @@ def test_auc_matches_definition():
     pairs = [(a, b) for a, ya in zip(p, y) if ya for b, yb in zip(p, y) if not yb]
     expect = sum(1.0 if a > b else 0.5 if a == b else 0.0 for a, b in pairs) / len(pairs)
     assert diagnose._auc(y, p) == pytest.approx(expect)
+
+
+# ===========================================================================
+# 熱い当たりの払戻の分布・有馬記念の一覧
+# ===========================================================================
+def test_hot_hits_match_hot_count(ds):
+    from src import diagnose, validate
+    folds = [validate.Fold("t", (2015, 2015), (2016, 2016))]
+    out = diagnose.weight_impact_cv(ds, folds=folds, verbose=False)
+    hits = out["hot_hits"]
+    for label, g in out["table"].groupby("馬体重"):
+        assert (hits["馬体重"] == label).sum() == int(g["熱い当たり"].sum())
+    assert (hits["3連単払戻"] >= 50_000).all()
+    dist = diagnose.hot_payout_distribution(hits.loc[hits["馬体重"] == "実際の馬体重"])
+    assert dist.iloc[-1]["fold"] == "全体"
+
+
+def test_hot_payout_distribution_values():
+    from src import diagnose
+    hits = pd.DataFrame({"fold": ["1", "1", "1", "2"],
+                         "3連単払戻": [50_000, 60_000, 100_000, 80_000]})
+    dist = diagnose.hot_payout_distribution(hits).set_index("fold")
+    assert dist.loc["1", "件数"] == 3 and dist.loc["1", "中央値"] == 60_000
+    assert dist.loc["1", "25%"] == 55_000 and dist.loc["1", "75%"] == 80_000
+    assert dist.loc["全体", "件数"] == 4 and dist.loc["全体", "最大"] == 100_000
+
+
+def _raw_with_arima():
+    raw = make_raw(n_days=60)
+    ra, hr = raw["RA"], raw["HR"]
+    # 12月の G1（GradeCD A）を有馬記念にする
+    arima = (ra["GradeCD"] == "A") & (ra["id.MonthDay"].str[:2] == "12")
+    ra.loc[arima, "RaceInfo.Hondai"] = "第60回有馬記念"
+    hr["PaySanrentan[1].Ninki"] = "0123"
+    return raw, int(arima.sum())
+
+
+def test_arima_payouts_list():
+    from src import diagnose
+    raw, n = _raw_with_arima()
+    assert n > 0
+    ds = jvmap.build_dataset(raw=raw)
+    table = diagnose.arima_payouts(ds, since_year=2004)
+    assert len(table) == n
+    row = table.iloc[0]
+    rid = row["レースID"]
+    rr = ds.race_result.loc[ds.race_result["レースID"] == rid]
+    first3 = [int(rr.loc[rr["着順"] == k, "馬番"].iloc[0]) for k in (1, 2, 3)]
+    assert row["組番"] == "-".join(map(str, first3))
+    assert row["3連単人気"] == 123
+    assert row["払戻"] == ds.payout_df.set_index("レースID").loc[rid, "3連単払戻"]
+    assert "ウマ" in row["1着"]
+    assert diagnose.arima_payouts(ds, since_year=2020).empty
+
+
+def test_cli_arima(tmp_path, monkeypatch, capsys):
+    from src import v6
+    raw, _ = _raw_with_arima()
+    d = tmp_path / "jvlink"
+    d.mkdir()
+    for rt, df in raw.items():
+        df.to_csv(d / f"{rt}.csv", index=False, encoding="utf-8-sig")
+    assert v6.main(["--data", str(d), "diagnose", "arima"]) == 0
+    out = capsys.readouterr().out
+    assert "有馬記念の3連単" in out and "第60回有馬記念" not in out  # 一覧は年・組番中心
+    assert (d / "v6_results" / "arima_payouts.csv").exists()
+
+
+def test_format_kumi():
+    from src import diagnose
+    assert diagnose.format_kumi("050312") == "5-3-12"
+    assert diagnose.format_kumi(None) == "" and diagnose.format_kumi(float("nan")) == ""
