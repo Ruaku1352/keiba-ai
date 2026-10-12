@@ -438,3 +438,13 @@ def test_start_year_cv_rule_and_runs():
     # 2014年からでも2015年からでも学習データは同じ → 差は0 → 採用しない
     row = out["table"].set_index("条件").loc["学習開始2014"]
     assert row["差（−学習開始2015）"] == 0 and not out["adopt"] and out["verdict"].startswith("不採用")
+
+
+def test_practice_prefers_model_that_did_not_see_the_race(tmp_path):
+    raw = make_raw(n_days=12)
+    ok, _ = _race_pred(raw, 9, until="2015-03-01")
+    seen, _ = _race_pred(raw, 9, until="2015-12-31")
+    _write_pred(tmp_path, ok, "replay", datetime(2026, 10, 1, 12, 0))
+    _write_pred(tmp_path, seen, "replay", datetime(2026, 10, 5, 12, 0))   # 後から全データのモデルで再実行
+    r = results.reconcile(results.load_predictions(tmp_path), raw)["races"].iloc[0]
+    assert r["区分"] == results.PRACTICE and r["予測ファイル"].endswith("20261001_120000.csv")

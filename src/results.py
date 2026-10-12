@@ -7,7 +7,8 @@
   同じレースが複数のファイルにあれば:
     本番予測 → **発走時刻より前に作った最後のファイル**を使う（作成時刻はファイル名の _YYYYmmdd_HHMMSS）。
                発走後に作ったものしか無いレースは照合しない（理由を表示する）
-    練習     → 最後のファイル。ただしモデルの学習終了日がレース日以降なら「参考外」（モデルが結果を見ている）
+    練習     → モデルの学習終了日がレース日より前のファイルのうち最後のもの。
+               そういうファイルが無ければ最後のファイルを「参考外」（モデルが結果を見ている）として出す
 
 ■ 照合（1レースごと）
   - 実際の1〜3着（馬番）、3連単の払戻（同着で的中組が複数あれば、そのすべて）
@@ -98,8 +99,9 @@ def choose_final_predictions(preds: pd.DataFrame, schedule: pd.DataFrame) -> tup
     if preds.empty:
         return preds, pd.DataFrame(columns=["区分", "レースID", "理由"])
     post = schedule.set_index("レースID")["発走日時"]
-    files = preds.drop_duplicates(["区分", "レースID", "予測ファイル"])[
-        ["区分", "レースID", "予測ファイル", "作成時刻"]].copy()
+    cols = ["区分", "レースID", "予測ファイル", "作成時刻", "日付"] + \
+        (["モデル学習終了日"] if "モデル学習終了日" in preds.columns else [])
+    files = preds.drop_duplicates(["区分", "レースID", "予測ファイル"])[cols].copy()
     files["発走日時"] = files["レースID"].map(post)
 
     pick, skipped = {}, []
@@ -112,6 +114,12 @@ def choose_final_predictions(preds: pd.DataFrame, schedule: pd.DataFrame) -> tup
                 skipped.append({"区分": kind, "レースID": rid,
                                 "理由": f"発走（{when:%Y-%m-%d %H:%M}）より前に作った予測がない"})
                 continue
+        elif "モデル学習終了日" in g.columns:
+            # 練習は、モデルがそのレースを見ていないファイルを優先する（無ければ最後のもの＝参考外）
+            unseen = g.loc[pd.to_datetime(g["モデル学習終了日"], errors="coerce")
+                           < pd.to_datetime(g["日付"], errors="coerce")]
+            if len(unseen):
+                g = unseen
         pick[(kind, rid)] = g.iloc[-1]["予測ファイル"]
 
     keep = [pick.get((k, r)) == f for k, r, f in zip(preds["区分"], preds["レースID"], preds["予測ファイル"])]
