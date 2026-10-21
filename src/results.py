@@ -82,8 +82,9 @@ def load_predictions(pred_dir: str | Path | None = None) -> pd.DataFrame:
 
 def race_schedule(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """全レース（出馬表の段階も含む）の発走日時。発走時刻が変わったら新しい版が残る。"""
-    ra = jvmap.central_only(jvmap.apply_data_kubun(raw["RA"], jvmap.RACE_KEY,
-                                                   jvmap.RACE_KUBUN_PRIORITY))
+    ra = jvmap.dedupe_records(raw["RA"])
+    n_dup = ra.attrs.get("レースIDの重複", 0)
+    ra = jvmap.central_only(ra)
     races = pd.DataFrame({"レースID": jvmap.make_race_id(ra).to_numpy(),
                           "レース日付": jvmap.make_date(ra).to_numpy(),
                           "発走時刻": ra["HassoTime"].astype(str).str.strip().to_numpy(),
@@ -91,6 +92,7 @@ def race_schedule(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     hhmm = races["発走時刻"].where(races["発走時刻"].str.fullmatch(r"\d{4}"), "2359")
     races["発走日時"] = races["レース日付"] + pd.to_timedelta(
         hhmm.str[:2].astype(int) * 60 + hhmm.str[2:].astype(int), unit="min")
+    races.attrs["レースIDの重複"] = n_dup
     return races
 
 
@@ -136,8 +138,7 @@ def race_results(raw: dict[str, pd.DataFrame], race_ids) -> pd.DataFrame:
     se = se.loc[jvmap.make_race_id(se).isin(ids)]
     if se.empty:
         return pd.DataFrame(columns=["レースID", "馬番", "馬名表示", "着順", "異常区分"])
-    se = jvmap.central_only(jvmap.apply_data_kubun(se, jvmap.RACE_KEY + ["KettoNum"],
-                                                   jvmap.RACE_KUBUN_PRIORITY))
+    se = jvmap.central_only(jvmap.dedupe_records(se, extra_keys=("KettoNum",)))
     se = se.loc[se["head.DataKubun"].isin(jvmap.USABLE_RACE_KUBUN)]
     return jvmap.map_horses(se)
 
@@ -210,9 +211,10 @@ def reconcile(preds: pd.DataFrame, raw: dict[str, pd.DataFrame]) -> dict:
     """予測と結果を照合する。戻り値: races（1レース1行）, horses（記録シート用）, pending, skipped。"""
     schedule = race_schedule(raw)
     final, skipped = choose_final_predictions(preds, schedule)
+    n_dup = schedule.attrs.get("レースIDの重複", 0)
     if final.empty:
         return {"races": pd.DataFrame(), "horses": pd.DataFrame(), "pending": pd.DataFrame(),
-                "skipped": skipped}
+                "skipped": skipped, "レースIDの重複": n_dup}
     results = race_results(raw, final["レースID"].unique())
     payout = jvmap.prepare_payout(raw["HR"]).set_index("レースID")
     status = schedule.set_index("レースID")["RAデータ区分"]
@@ -239,7 +241,7 @@ def reconcile(preds: pd.DataFrame, raw: dict[str, pd.DataFrame]) -> dict:
         races_df = races_df.sort_values(["日付", "レースID"]).reset_index(drop=True)
     return {"races": races_df,
             "horses": pd.concat(horses, ignore_index=True) if horses else pd.DataFrame(),
-            "pending": pd.DataFrame(pending), "skipped": skipped}
+            "pending": pd.DataFrame(pending), "skipped": skipped, "レースIDの重複": n_dup}
 
 
 def summary(races: pd.DataFrame) -> pd.DataFrame:

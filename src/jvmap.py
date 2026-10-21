@@ -263,6 +263,57 @@ def apply_data_kubun(df: pd.DataFrame, key_cols: list[str],
     return df.iloc[sorted(kept.values())].reset_index(drop=True)
 
 
+def dedupe_records(df: pd.DataFrame, priority: dict[str, int] | None = None,
+                   extra_keys: tuple[str, ...] = ()) -> pd.DataFrame:
+    """生データを「レースID（＋extra_keys）ごとに1行」にする。RA/SE/HR を使う所は必ずこれを通す。
+
+    1. apply_data_kubun：JV-Data のキー（開催年・**開催月日**・場・回・日目・R ＋ extra_keys）ごとに、
+       データ区分のルールで1行にする（出馬表(2)の後に確定(7)が来れば確定が残る）
+    2. それでも同じレースID（12桁。**開催月日を含まない**）が複数残ったら、
+       データ作成日が最新の版を残す（同じ日なら確定度の高い方、さらに同じなら後に取得した方）
+
+    2 が要るのは、キーの開催月日などが違うのにレースIDが同じ版がありうるため
+    （開催の延期で月日が変わった、など）。これを残すとレースIDで引く表が重複して壊れる
+    （v7 の results で発走日時の表が重複して落ちた）。何件まとめたかは
+    df.attrs["レースIDの重複"] に入れる（race_id_duplicates で中身を確認できる）。
+    """
+    priority = priority or RACE_KUBUN_PRIORITY
+    out = apply_data_kubun(df, RACE_KEY + list(extra_keys), priority)
+    if out.empty:
+        out.attrs["レースIDの重複"] = 0
+        return out
+    key = pd.DataFrame({"rid": make_race_id(out).to_numpy(),
+                        **{c: out[c].to_numpy() for c in extra_keys}})
+    n_dup = int(key.duplicated().sum())
+    if n_dup:
+        rank = pd.DataFrame({
+            "date": _make_date_key(out).to_numpy(),
+            "pri": out["head.DataKubun"].map(priority).fillna(-1).to_numpy(),
+            "seq": pd.to_numeric(out["_seq"], errors="coerce").fillna(-1).to_numpy(),
+        })
+        order = np.lexsort((rank["seq"].to_numpy(), rank["pri"].to_numpy(), rank["date"].to_numpy()))
+        keep = ~key.iloc[order].duplicated(keep="last").to_numpy()
+        out = out.iloc[np.sort(order[keep])].reset_index(drop=True)
+    out.attrs["レースIDの重複"] = n_dup
+    return out
+
+
+def race_id_duplicates(df: pd.DataFrame, extra_keys: tuple[str, ...] = (),
+                       priority: dict[str, int] | None = None) -> pd.DataFrame:
+    """データ区分のルールで1行にした後も、同じレースIDが複数残る行の一覧（原因の確認用）。"""
+    out = apply_data_kubun(df, RACE_KEY + list(extra_keys), priority or RACE_KUBUN_PRIORITY)
+    if out.empty:
+        return out
+    rid = make_race_id(out)
+    key = pd.DataFrame({"rid": rid.to_numpy(), **{c: out[c].to_numpy() for c in extra_keys}})
+    dup = key.duplicated(keep=False).to_numpy()
+    cols = ["head.DataKubun", "head.MakeDate.Year", "head.MakeDate.Month", "head.MakeDate.Day",
+            "_seq"] + RACE_KEY + list(extra_keys)
+    res = out.loc[dup, [c for c in cols if c in out.columns]].copy()
+    res.insert(0, "レースID", rid[dup].to_numpy())
+    return res.sort_values(["レースID", "_seq"]).reset_index(drop=True)
+
+
 def make_race_id(df: pd.DataFrame) -> pd.Series:
     """Kaggle 形式の12桁レースID（年4 + 場2 + 回2 + 日2 + R2）。月日は含めない。"""
     return (df["id.Year"].str.zfill(4) + df["id.JyoCD"].str.zfill(2)
@@ -306,8 +357,11 @@ def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
     """RA を1レース1行にし、学習に使えるレースだけ残してラベルを付ける。"""
     report = report or BuildReport()
     report.add("RA 生レコード", len(ra))
-    ra = apply_data_kubun(ra, RACE_KEY, RACE_KUBUN_PRIORITY)
+    ra = dedupe_records(ra)
     report.add("RA 重複解消後（1レース1行）", len(ra))
+    if ra.attrs.get("レースIDの重複"):
+        report.note(f"キー（開催月日など）は違うがレースIDが同じ版 {ra.attrs['レースIDの重複']} 件を、"
+                    "データ作成日が最新の版にまとめた")
     ra = central_only(ra)
     report.add("RA 中央競馬のみ", len(ra))
     cancelled = int((ra["head.DataKubun"] == "9").sum())
@@ -398,7 +452,7 @@ def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
     """SE を1頭1行にし、レース情報と結合して race_result 相当にする。"""
     report = report or BuildReport()
     report.add("SE 生レコード", len(se))
-    se = apply_data_kubun(se, RACE_KEY + ["KettoNum"], RACE_KUBUN_PRIORITY)
+    se = dedupe_records(se, extra_keys=("KettoNum",))
     report.add("SE 重複解消後（1レース1頭1行）", len(se))
     se = central_only(se)
     report.add("SE 中央競馬のみ", len(se))
@@ -487,7 +541,7 @@ def prepare_entries(raw: dict[str, pd.DataFrame], from_date: str | None = None,
     返す列は prepare_horses と同じ（結果の列は空）に加えて:
       データ区分（出走馬名表 / 出馬表）、データ作成日、枠順確定（馬番が全頭そろっているか）
     """
-    ra = apply_data_kubun(raw["RA"], RACE_KEY, RACE_KUBUN_PRIORITY)
+    ra = dedupe_records(raw["RA"])
     ra = central_only(ra)
     ra = ra.loc[ra["head.DataKubun"].isin(ENTRY_KUBUN)]
     races = map_races(ra, jump_as_flat=jump_as_flat)
@@ -500,7 +554,7 @@ def prepare_entries(raw: dict[str, pd.DataFrame], from_date: str | None = None,
     if races.empty:
         return pd.DataFrame()
 
-    se = apply_data_kubun(raw["SE"], RACE_KEY + ["KettoNum"], RACE_KUBUN_PRIORITY)
+    se = dedupe_records(raw["SE"], extra_keys=("KettoNum",))
     se = central_only(se)
     se = se.loc[se["head.DataKubun"].isin(ENTRY_KUBUN)]
     horses = map_horses(se).merge(races, on="レースID", how="inner")
@@ -541,7 +595,7 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
     """
     report = report or BuildReport()
     report.add("HR 生レコード", len(hr))
-    hr = apply_data_kubun(hr, RACE_KEY, HR_KUBUN_PRIORITY)
+    hr = dedupe_records(hr, priority=HR_KUBUN_PRIORITY)
     hr = hr.loc[hr["id.JyoCD"].isin(CENTRAL_JYO) & hr["head.DataKubun"].isin(USABLE_HR_KUBUN)]
     report.add("HR 重複解消・中央・確定のみ", len(hr))
 

@@ -17,6 +17,7 @@
     py -m src.v6 diagnose arima               2004年以降の有馬記念の3連単（組番・払戻・人気）
     py -m src.v6 diagnose weekend             同じ週末の前の日の結果が入らないことの影響（5 fold）
     py -m src.v6 diagnose start-year          学習開始 1995年 vs 2003年（判定ルールは事前に固定）
+    py -m src.v6 diagnose dup-races           キーは違うが同じレースIDの版（重複の原因の確認）
 
 買い方は変えない：重賞のみ（G1/G2/G3/G）・予測上位6頭の3連単BOX（120点・12,000円）。
 データの取得は `py -m src.jvlink fetch --option 1`（出馬表もこれで届く）。
@@ -143,8 +144,7 @@ def _cmd_models(args) -> int:
 def _pending_results_warnings(raw: dict, last_confirmed: pd.Timestamp,
                               target_dates: list[pd.Timestamp]) -> list[str]:
     """予測対象日より前で、まだ結果が届いていない開催日（その日の成績は特徴量に入らない）。"""
-    ra = jvmap.central_only(jvmap.apply_data_kubun(raw["RA"], jvmap.RACE_KEY,
-                                                   jvmap.RACE_KUBUN_PRIORITY))
+    ra = jvmap.central_only(jvmap.dedupe_records(raw["RA"]))
     ra = ra.loc[~ra["head.DataKubun"].isin(jvmap.USABLE_RACE_KUBUN | {"9", "0"})]
     dates = jvmap.make_date(ra)
     out = []
@@ -301,6 +301,9 @@ def _cmd_results(args) -> int:
     raw = jvmap.load_raw(args.data)
     out = results.reconcile(preds, raw)
     clock.step("完了\n")
+    if out.get("レースIDの重複"):
+        print(f"【注意】RA に、キー（開催月日など）が違うのに同じレースIDの版が {out['レースIDの重複']} 件ありました。"
+              "データ作成日が最新の版を使っています。中身は `py -m src.v6 diagnose dup-races` で確認できます\n")
 
     races = out["races"]
     if not races.empty:
@@ -521,6 +524,29 @@ def _cmd_diag_start_year(args) -> int:
     return 0
 
 
+def _cmd_diag_dup(args) -> int:
+    clock = _Clock()
+    clock.step("生データ（RA/SE/HR）を読み込み中 ...")
+    raw = jvmap.load_raw(args.data)
+    clock.step("完了\n")
+    print("=== データ区分のルールで1行にした後も、同じレースIDが複数残る版 ===")
+    print("    （キーの開催月日などが違う。使うのはデータ作成日が最新の版）")
+    found = False
+    for rt, extra, pri in [("RA", (), None), ("SE", ("KettoNum",), None),
+                           ("HR", (), jvmap.HR_KUBUN_PRIORITY)]:
+        dup = jvmap.race_id_duplicates(raw[rt], extra_keys=extra, priority=pri)
+        print(f"\n[{rt}] {len(dup)} 行（{dup['レースID'].nunique() if len(dup) else 0} レース）")
+        if len(dup):
+            found = True
+            _print_table(dup.head(args.limit))
+            if len(dup) > args.limit:
+                print(f"  … ほか {len(dup) - args.limit} 行。全部は CSV に保存")
+            dup.to_csv(_results_dir(args) / f"dup_races_{rt}.csv", index=False, encoding="utf-8-sig")
+    if not found:
+        print("\n重複はありません")
+    return 0
+
+
 def _cmd_diag_payout(args) -> int:
     from . import diagnose
 
@@ -636,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
     q = dsub.add_parser("start-year", help="学習開始 1995年 vs 2003年（判定ルールは事前に固定）")
     q.add_argument("--folds", type=int, default=None, help="先頭から何foldだけ回すか（動作確認用）")
     q.set_defaults(func=_cmd_diag_start_year)
+    q = dsub.add_parser("dup-races", help="キーは違うが同じレースIDの版（重複の原因の確認）")
+    q.add_argument("--limit", type=int, default=30, help="画面に出す行数")
+    q.set_defaults(func=_cmd_diag_dup)
     q = dsub.add_parser("arima", help="有馬記念の3連単（組番・払戻・人気）の一覧")
     q.add_argument("--since-year", type=int, default=2004)
     q.set_defaults(func=_cmd_diag_arima)

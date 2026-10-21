@@ -448,3 +448,103 @@ def test_practice_prefers_model_that_did_not_see_the_race(tmp_path):
     _write_pred(tmp_path, seen, "replay", datetime(2026, 10, 5, 12, 0))   # 後から全データのモデルで再実行
     r = results.reconcile(results.load_predictions(tmp_path), raw)["races"].iloc[0]
     assert r["区分"] == results.PRACTICE and r["予測ファイル"].endswith("20261001_120000.csv")
+
+
+# ===========================================================================
+# 同じレースが複数の版で入っている生データ（v7 の results が落ちた件）
+# ===========================================================================
+def _add_entry_version(raw: dict, day_index: int, jyo: str = "05", month_day: str | None = None,
+                       made: str = "20150313") -> str:
+    """確定済みのレースに、出馬表（区分2）の版を足す。month_day を渡すとキーの開催月日を変える。"""
+    ra, se = raw["RA"], raw["SE"]
+    md = _day(day_index).strftime("%m%d")
+    rmask = (ra["id.MonthDay"] == md) & (ra["id.JyoCD"] == jyo)
+    smask = (se["id.MonthDay"] == md) & (se["id.JyoCD"] == jyo)
+    seq0 = max(ra["_seq"].astype(int).max(), se["_seq"].astype(int).max()) + 1
+    extra = []
+    for df, mask in ((ra, rmask), (se, smask)):
+        e = df.loc[mask].copy()
+        e["head.DataKubun"] = "2"
+        e[["head.MakeDate.Year", "head.MakeDate.Month", "head.MakeDate.Day"]] = [made[:4], made[4:6], made[6:]]
+        if month_day:
+            e["id.MonthDay"] = month_day
+        e["_seq"] = [str(seq0 + i) for i in range(len(e))]        # 確定版より後に取得した
+        seq0 += len(e)
+        extra.append(e)
+    raw["RA"] = pd.concat([ra, extra[0]], ignore_index=True)
+    raw["SE"] = pd.concat([se, extra[1]], ignore_index=True)
+    return jvmap.make_race_id(ra.loc[rmask]).iloc[0]
+
+
+def test_entry_and_result_versions_with_same_key_are_one_race(tmp_path):
+    raw = make_raw(n_days=12)
+    rid = _add_entry_version(raw, 10)                         # 同じキーで区分2（古い）と区分7
+    sched = results.race_schedule(raw)
+    assert not sched["レースID"].duplicated().any()
+    assert sched.set_index("レースID").loc[rid, "RAデータ区分"] == "7"
+    pred, _ = _race_pred(raw, 10)
+    _write_pred(tmp_path, pred, "predict", datetime(2015, 3, 14, 20, 0))
+    out = results.reconcile(results.load_predictions(tmp_path), raw)
+    assert len(out["races"]) == 1 and out["races"].iloc[0]["照合"] == "済"
+
+
+def test_same_race_id_with_different_month_day_does_not_break_anything(tmp_path):
+    """キーの開催月日が違う出馬表の版（延期など）。旧コードでは発走日時の表が重複して落ちた。"""
+    raw = make_raw(n_days=12)
+    rid = _add_entry_version(raw, 10, month_day="0314")      # 前日の日付の出馬表（作成日は古い）
+    assert len(jvmap.race_id_duplicates(raw["RA"])) == 2
+    assert len(jvmap.race_id_duplicates(raw["SE"], extra_keys=("KettoNum",))) == 16
+
+    sched = results.race_schedule(raw)
+    assert not sched["レースID"].duplicated().any() and sched.attrs["レースIDの重複"] == 1
+    row = sched.set_index("レースID").loc[rid]
+    assert row["RAデータ区分"] == "7" and row["レース日付"] == _day(10)      # 作成日が最新＝確定版
+
+    ds = jvmap.build_dataset(raw=raw)
+    rr = ds.race_result
+    assert not rr.duplicated(["レースID", "血統登録番号"]).any()
+    assert (rr["レースID"] == rid).sum() == 8
+    assert not jvmap.prepare_payout(raw["HR"])["レースID"].duplicated().any()
+
+    pred, _ = _race_pred(raw, 10)
+    _write_pred(tmp_path, pred, "predict", datetime(2015, 3, 14, 20, 0))
+    out = results.reconcile(results.load_predictions(tmp_path), raw)
+    assert len(out["races"]) == 1 and out["races"].iloc[0]["照合"] == "済"
+    assert out["レースIDの重複"] == 1
+
+
+def test_latest_make_date_wins_across_keys():
+    """キーが違う2つの版は、データ作成日が新しい方（区分に関係なく）を使う。"""
+    raw = make_raw(n_days=12)
+    rid = _add_entry_version(raw, 10, month_day="0322", made="20150320")   # 確定版より新しい作成日
+    sched = results.race_schedule(raw).set_index("レースID")
+    assert sched.loc[rid, "RAデータ区分"] == "2"
+    assert sched.loc[rid, "レース日付"] == pd.Timestamp("2015-03-22")
+
+
+def test_no_raw_table_has_duplicate_race_ids():
+    """生データから作る表はどれもレースIDで一意（出馬表と確定成績が混ざっていても）。"""
+    raw = make_raw(n_days=12, entry_days=(11,))
+    _add_entry_version(raw, 10, month_day="0314")
+    _add_entry_version(raw, 9)
+    ra = jvmap.dedupe_records(raw["RA"])
+    assert not jvmap.make_race_id(ra).duplicated().any()
+    se = jvmap.dedupe_records(raw["SE"], extra_keys=("KettoNum",))
+    assert not pd.DataFrame({"r": jvmap.make_race_id(se), "h": se["KettoNum"]}).duplicated().any()
+    entries = jvmap.prepare_entries(raw, graded_only=False)
+    assert not entries.duplicated(["レースID", "血統登録番号"]).any()
+    res = results.race_results(raw, jvmap.make_race_id(raw["RA"]).unique())
+    assert not res.duplicated(["レースID", "血統登録番号"]).any()
+
+
+def test_cli_dup_races(tmp_path, capsys):
+    from src import v6
+    raw = make_raw(n_days=12)
+    _add_entry_version(raw, 10, month_day="0314")
+    d = tmp_path / "jvlink"
+    d.mkdir()
+    for rt, df in raw.items():
+        df.to_csv(d / f"{rt}.csv", index=False, encoding="utf-8-sig")
+    assert v6.main(["--data", str(d), "diagnose", "dup-races"]) == 0
+    out = capsys.readouterr().out
+    assert "[RA] 2 行（1 レース）" in out and "[HR] 0 行" in out

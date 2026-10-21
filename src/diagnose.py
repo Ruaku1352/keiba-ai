@@ -299,8 +299,7 @@ def style_zero_table(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
     se["_年"] = pd.to_numeric(se["id.Year"], errors="coerce")
     zero = se["KyakusituKubun"].astype(str).str.strip().isin({"0", ""})
 
-    kept = jvmap.apply_data_kubun(se.assign(_row=np.arange(len(se))),
-                                  jvmap.RACE_KEY + ["KettoNum"], jvmap.RACE_KUBUN_PRIORITY)
+    kept = jvmap.dedupe_records(se.assign(_row=np.arange(len(se))), extra_keys=("KettoNum",))
     is_kept = pd.Series(False, index=se.index)
     is_kept.iloc[kept["_row"].to_numpy()] = True
     central = se["id.JyoCD"].isin(jvmap.CENTRAL_JYO)

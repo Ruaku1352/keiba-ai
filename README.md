@@ -82,7 +82,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 228 passed（SDK が無い環境では 222 passed, 6 skipped）
+py -m pytest tests -q          # 233 passed（SDK が無い環境では 227 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
