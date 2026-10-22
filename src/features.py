@@ -256,7 +256,8 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
                      drop_helper_cols: bool = True,
                      corner_df: pd.DataFrame | None = None,
                      lap_df: pd.DataFrame | None = None,
-                     as_of: str = "race") -> pd.DataFrame:
+                     as_of: str = "race",
+                     extra: dict | None = None) -> pd.DataFrame:
     """すべての特徴量を追加する（この関数だけ呼べばよい）。
 
     Parameters
@@ -273,6 +274,10 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     lap_df :
         pace.load_laptime() の戻り値。渡すとペース特徴量（依頼B）が付く。
         脚質特徴量が先に付いていると「想定ペース」も作れる。
+    extra :
+        v8 の検証用の追加特徴量。{"levels": {}}（格・着差・推移・タイム指数）、
+        {"trackbias": {"cutoff_min": 20, "delay_min": 20}}（当日の馬場の傾向）。
+        既定（None）では何も足さない＝本番の predict・train・validate の特徴量は変わらない。
     """
     from . import corner as corner_mod  # 循環 import を避けるため関数内で読む
     from . import pace as pace_mod
@@ -307,6 +312,15 @@ def add_all_features(df: pd.DataFrame, strict_daily_lag: bool = False,
     if lap_df is not None:
         df = pace_mod.attach_race_pace(df, lap_df)
         df = pace_mod.add_pace_features(df, as_of=as_of)
+
+    extra = extra or {}
+    if "levels" in extra:
+        from . import levels as levels_mod
+        df = levels_mod.add_level_features(df, day_col=DAY_COL if as_of == "day" else None,
+                                           **extra["levels"])
+    if "trackbias" in extra:
+        from . import trackbias as trackbias_mod
+        df = trackbias_mod.add_track_bias_features(df, **extra["trackbias"])
 
     if drop_helper_cols:
         # `_` で始まる列は「そのレースの結果」や中間計算なので、
@@ -352,6 +366,12 @@ def feature_columns(df: pd.DataFrame, include_odds: bool = False) -> list[str]:
     engineered += corner_mod.running_style_feature_columns()
     engineered += corner_mod.official_style_feature_columns()
     engineered += pace_mod.pace_feature_columns()
+    # v8 の検証用の追加特徴量（extra を渡して作った表にだけ列がある）
+    from . import levels as levels_mod
+    from . import trackbias as trackbias_mod
+    engineered += levels_mod.level_feature_columns()
+    engineered += trackbias_mod.track_bias_feature_columns()
+    engineered += ["市場確率_log"]
 
     result = [cols[k] for k in base_logical if k in cols]
     result += [c for c in engineered if c in df.columns]

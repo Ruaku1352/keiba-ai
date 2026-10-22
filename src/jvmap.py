@@ -408,6 +408,9 @@ def map_races(ra: pd.DataFrame, jump_as_flat: bool = False) -> pd.DataFrame:
         "_RAデータ区分": ra["head.DataKubun"].to_numpy(),
     })
     _attach_three_furlongs(out, ra)
+    # レースの格（0=新馬 … 9=G1）。レース前に分かる情報（v8 の検証用。本番の特徴量には使っていない）
+    from .levels import race_class_level
+    out["_格レベル"] = race_class_level(ra)
     # 馬場状態は芝なら芝の、ダート・障害なら該当する方を使う
     siba = ra["TenkoBaba.SibaBabaCD"].map(BABA_LABELS).to_numpy()
     dirt = ra["TenkoBaba.DirtBabaCD"].map(BABA_LABELS).to_numpy()
@@ -485,6 +488,11 @@ def prepare_horses(se: pd.DataFrame, races: pd.DataFrame,
     return merged.reset_index(drop=True)
 
 
+def _time_diff_seconds(s: pd.Series) -> pd.Series:
+    from .levels import parse_time_diff
+    return parse_time_diff(s)
+
+
 def map_horses(se: pd.DataFrame) -> pd.DataFrame:
     """SE（1レース1頭1行にしたもの）を、既存パイプラインの列名に対応付ける。
 
@@ -515,6 +523,7 @@ def map_horses(se: pd.DataFrame) -> pd.DataFrame:
         # （仕様書）。後4Fで代用はしない（別の量なので）。欠損のまま扱う。
         "後３Ｆタイム": to_tenths(se["HaronTimeL3"], invalid=("000", "999")).to_numpy(),
         "タイム差": se["TimeDiff"].to_numpy(),
+        "_タイム差秒": _time_diff_seconds(se["TimeDiff"]).to_numpy(),   # 結果（v8 の検証用）
         # ↓ そのレース自身の結果。特徴量にはせず、過去集計の材料にだけ使う
         "_1コーナー順位": to_int(se["Jyuni1c"], invalid=("00",)).to_numpy(),
         "_2コーナー順位": to_int(se["Jyuni2c"], invalid=("00",)).to_numpy(),
@@ -635,21 +644,6 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
         ninki = to_int(hr[ninki_col], invalid=("0000",)) if ninki_col in hr.columns \
             else pd.Series(np.nan, index=hr.index)
         out[f"{kind}人気"] = ninki.where(pay.notna()).astype("float64").to_numpy()
-        if kind == "3連単":
-            # 同着で的中組が複数あるとき用に、全部の組と払戻を ";" でつないで残す（結果の照合で使う）
-            combos, pays = [], []
-            for i in range(1, 7):
-                k_col, p_col = f"{prefix}[{i}].Kumi", f"{prefix}[{i}].Pay"
-                if k_col not in hr.columns:
-                    break
-                k = hr[k_col].astype(str).str.strip()
-                valid = ~k.isin({"", "000000"})
-                combos.append(k.where(valid, ""))
-                pays.append(to_int(hr[p_col]).where(valid).astype("Int64").astype(str).where(valid, ""))
-            join = (lambda parts: pd.concat(parts, axis=1).apply(
-                lambda r: ";".join(x for x in r if x), axis=1) if parts else pd.Series("", index=hr.index))
-            out["3連単組番一覧"] = join(combos).where(pay.notna(), "").to_numpy()
-            out["3連単払戻一覧"] = join(pays).where(pay.notna(), "").to_numpy()
         out[f"{kind}的中組数"] = np.asarray(n_hits)
         # 払戻が無い理由。発売開始日などは決め打ちせず、HR の中身で判定する:
         #   組番が空で不成立・特払フラグも無い → その券種が発売されていない（3連単は発売開始前など）
@@ -659,6 +653,28 @@ def prepare_payout(hr: pd.DataFrame, report: BuildReport | None = None,
             [no_kumi & ~fuseiritu_tokubarai, no_kumi & fuseiritu_tokubarai,
              (~no_kumi) & irregular & exclude_irregular],
             ["発売なし", "不成立・特払", "返還など（除外の設定）"], default="")
+    # 的中組と払戻の一覧（同着で複数あるとき用。";" でつなぐ）。結果の照合と v8 の買い目の検証で使う
+    for kind, prefix, n in [("3連単", "PaySanrentan", 6), ("3連複", "PaySanrenpuku", 3),
+                            ("馬単", "PayUmatan", 6), ("馬連", "PayUmaren", 3)]:
+        combos, pays = [], []
+        for i in range(1, n + 1):
+            k_col, p_col = f"{prefix}[{i}].Kumi", f"{prefix}[{i}].Pay"
+            if k_col not in hr.columns or p_col not in hr.columns:
+                break
+            k = hr[k_col].astype(str).str.strip()
+            valid = ~k.isin({"", "0000", "000000"}) & k.str.fullmatch(r"\d+")
+            pv = to_int(hr[p_col])
+            valid &= pv.notna() & (pv > 0)
+            combos.append(k.where(valid, ""))
+            pays.append(pv.where(valid).astype("Int64").astype(str).where(valid, ""))
+        if combos:
+            ck = pd.concat(combos, axis=1).to_numpy()
+            pk = pd.concat(pays, axis=1).to_numpy()
+            out[f"{kind}組番一覧"] = [";".join(x for x in row if x) for row in ck]
+            out[f"{kind}払戻一覧"] = [";".join(x for x in row if x) for row in pk]
+        else:
+            out[f"{kind}組番一覧"] = ""
+            out[f"{kind}払戻一覧"] = ""
     return out
 
 

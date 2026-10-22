@@ -23,7 +23,8 @@ JRA の重賞で、**3連単の高配当が当たる確率**を上げるため�
 | v1〜v4 | Kaggle データ（1986〜2021年7月）で戦略を探し、時系列CVで再現性を確認 | 完了 |
 | v5 | JRA-VAN Data Lab. から直近まで取得し、同じ戦略が成立するか再検証 | 完了 |
 | v6 | 出馬表から重賞ごとの買い目を出す（予測の本体）と、過去の日での練習モード | 完了（実データで動作確認） |
-| **v7** | **スプレッドシートへの書き込み、結果の照合と練習の成績表、毎週の手順、学習開始年の検証** | **実装済み・実データで確認中** |
+| v7 | スプレッドシートへの書き込み、結果の照合と練習の成績表、毎週の手順、学習開始年の検証 | 完了（実データで動作確認） |
+| **v8** | **最後の改良の検証（平場で試す：格・着差、オッズとの混合、3連単の確率、買い目、当日の傾向）と当日運用の設計** | **実装済み・実データで検証中** |
 | 本番 | 2026-12-27 有馬記念（お金を賭けるのはこの1レースだけ。それまでの重賞は予測と記録のみ） | 12月中旬にモデルを固定 |
 
 ### 確定している戦略（v4）
@@ -82,7 +83,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 252 passed（SDK が無い環境では 246 passed, 6 skipped）
+py -m pytest tests -q          # 270 passed（SDK が無い環境では 264 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -128,6 +129,18 @@ py -m src.v6 results --sheet                     # 予測と結果を照合し�
 
 シートの鍵とIDはリポジトリ直下の `local_settings.json`（`.gitignore` 済み。`local_settings.example.json` を参照）か、
 環境変数 `KEIBA_GOOGLE_KEY`・`KEIBA_SHEET_ID` から読む。
+
+v8 の検証（毎週のコマンドとは別。新しい案は平場だけで比べ、重賞の成績は出さない。手順は [docs/v8_validation.md](docs/v8_validation.md)）:
+
+```powershell
+py -m src.v8 baseline        # 今のモデル・単勝人気・ランダムの上位6頭BOX（重賞・平場）
+py -m src.v8 odds-coverage   # オッズ・払戻のそろい具合
+py -m src.v8 levels          # 格・着差・推移・タイム指数
+py -m src.v8 market          # モデルと市場の確率を混ぜる（Benter）
+py -m src.v8 trifecta        # 3連単の確率（Harville・Henery）と配当の推定
+py -m src.v8 bets            # 買い目の選び方
+py -m src.v8 trackbias       # 当日の馬場の傾向
+```
 
 確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero` /
 `hot-payouts`（熱い当たりの払戻の分布）/ `arima`（2004年以降の有馬記念の3連単）/
@@ -199,6 +212,10 @@ JV-Link ──▶ jvlink.py ──▶ data/jvlink/{RA,SE,HR}.csv（生データ�
 | `src/v6.py` | v6・v7 の実行入口（train / predict / replay / results / diagnose） |
 | `src/sheets.py` | v7：スプレッドシートへの書き込み（見出しの名前で、行は上書き） |
 | `src/results.py` | v7：保存した予測と結果の照合、練習の成績表 |
+| `src/experiment.py` | v8：5 fold の検証期間の予測（as_of=day・馬体重代用・454ラウンド）と、重賞を見ないガード |
+| `src/levels.py` / `trackbias.py` | v8：格・着差・推移・タイム指数 / 当日の馬場の傾向（検証用。本番の特徴量には入れていない） |
+| `src/market.py` / `bets.py` | v8：市場の確率との混合・3連単の確率・配当の推定 / 買い目の選び方 |
+| `src/v8.py` | v8 の検証の実行入口 |
 
 Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など）も残してあり、v1〜v4 と同じ流れで回せる。
 ただし調教師成績のリークを直したので、数字は v4 当時と完全には一致しない。
@@ -227,3 +244,5 @@ Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など�
 | [docs/v5_jravan.md](docs/v5_jravan.md) | JRA-VAN からの取得・変換・再検証。SDK を読んで分かったこと、Windows での手順 |
 | [docs/v6_predict.md](docs/v6_predict.md) | 出馬表からの予測、学習と予測で特徴量を一致させる方法、練習モード、診断 |
 | [docs/v7_weekly.md](docs/v7_weekly.md) | 毎週の手順、結果が届くタイミング（仕様）、シート・照合のきまり、週末の結果欠落と学習開始年の検証 |
+| [docs/v8_validation.md](docs/v8_validation.md) | v8 の検証の枠組み（平場で試し重賞は後で1回）、データで分かったこと、各案の中身、実行の順番 |
+| [docs/v8_raceday_design.md](docs/v8_raceday_design.md) | 有馬記念当日の自動運用の設計と見積もり |
