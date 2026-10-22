@@ -264,20 +264,27 @@ def apply_data_kubun(df: pd.DataFrame, key_cols: list[str],
 
 
 def dedupe_records(df: pd.DataFrame, priority: dict[str, int] | None = None,
-                   extra_keys: tuple[str, ...] = ()) -> pd.DataFrame:
+                   extra_keys: tuple[str, ...] = (),
+                   confirmed: set[str] | None = None) -> pd.DataFrame:
     """生データを「レースID（＋extra_keys）ごとに1行」にする。RA/SE/HR を使う所は必ずこれを通す。
 
     1. apply_data_kubun：JV-Data のキー（開催年・**開催月日**・場・回・日目・R ＋ extra_keys）ごとに、
        データ区分のルールで1行にする（出馬表(2)の後に確定(7)が来れば確定が残る）
-    2. それでも同じレースID（12桁。**開催月日を含まない**）が複数残ったら、
-       データ作成日が最新の版を残す（同じ日なら確定度の高い方、さらに同じなら後に取得した方）
+    2. それでも同じレースID（12桁。**開催月日を含まない**）が複数残ったら、次の順で1つ選ぶ:
+         (a) 確定の版（RA/SE は区分 5/6/7、HR は 1/2）があれば必ずそれ
+         (b) その中で（または確定の版が無ければ全体で）データ作成日が最新の版
+         (c) 同じ日なら確定度の高い方、さらに同じなら後に取得した方
 
-    2 が要るのは、キーの開催月日などが違うのにレースIDが同じ版がありうるため
-    （開催の延期で月日が変わった、など）。これを残すとレースIDで引く表が重複して壊れる
-    （v7 の results で発走日時の表が重複して落ちた）。何件まとめたかは
-    df.attrs["レースIDの重複"] に入れる（race_id_duplicates で中身を確認できる）。
+    2 が要るのは、キーの開催月日が違うのにレースIDが同じ版があるため。
+    典型は**雪・台風などで中止（区分9）になり、後日に同じ回・日目・Rで代替開催（区分7）された**レース。
+    古いデータは作成日がすべて同じ日（2002-12-20）なので、作成日だけで選ぶと中止の版が残り、
+    実際に走った版が消えてしまう（v7 の最初の修正でこれが起き、確定レースが 316 減った）。
+    (a) で確定の版を必ず残すので、変換後のレースは「区分 5/6/7 に絞ってから1つにする」修正前の変換と同じになる。
+    何件まとめたかは df.attrs["レースIDの重複"] に入れる（race_id_duplicates で中身を確認できる）。
     """
     priority = priority or RACE_KUBUN_PRIORITY
+    if confirmed is None:
+        confirmed = USABLE_HR_KUBUN if priority is HR_KUBUN_PRIORITY else USABLE_RACE_KUBUN
     out = apply_data_kubun(df, RACE_KEY + list(extra_keys), priority)
     if out.empty:
         out.attrs["レースIDの重複"] = 0
@@ -286,12 +293,16 @@ def dedupe_records(df: pd.DataFrame, priority: dict[str, int] | None = None,
                         **{c: out[c].to_numpy() for c in extra_keys}})
     n_dup = int(key.duplicated().sum())
     if n_dup:
+        kubun = out["head.DataKubun"]
         rank = pd.DataFrame({
+            "conf": kubun.isin(confirmed).astype(int).to_numpy(),
             "date": _make_date_key(out).to_numpy(),
-            "pri": out["head.DataKubun"].map(priority).fillna(-1).to_numpy(),
+            "pri": kubun.map(priority).fillna(-1).to_numpy(),
             "seq": pd.to_numeric(out["_seq"], errors="coerce").fillna(-1).to_numpy(),
         })
-        order = np.lexsort((rank["seq"].to_numpy(), rank["pri"].to_numpy(), rank["date"].to_numpy()))
+        # 並べて最後の行を残す。優先順は 確定の版か → 作成日 → 確定度 → 取得順
+        order = np.lexsort((rank["seq"].to_numpy(), rank["pri"].to_numpy(),
+                            rank["date"].to_numpy(), rank["conf"].to_numpy()))
         keep = ~key.iloc[order].duplicated(keep="last").to_numpy()
         out = out.iloc[np.sort(order[keep])].reset_index(drop=True)
     out.attrs["レースIDの重複"] = n_dup
@@ -361,7 +372,7 @@ def prepare_races(ra: pd.DataFrame, report: BuildReport | None = None,
     report.add("RA 重複解消後（1レース1行）", len(ra))
     if ra.attrs.get("レースIDの重複"):
         report.note(f"キー（開催月日など）は違うがレースIDが同じ版 {ra.attrs['レースIDの重複']} 件を、"
-                    "データ作成日が最新の版にまとめた")
+                    "1つにまとめた（確定の版があればそれ、無ければデータ作成日が最新の版）")
     ra = central_only(ra)
     report.add("RA 中央競馬のみ", len(ra))
     cancelled = int((ra["head.DataKubun"] == "9").sum())

@@ -513,13 +513,102 @@ def test_same_race_id_with_different_month_day_does_not_break_anything(tmp_path)
     assert out["レースIDの重複"] == 1
 
 
-def test_latest_make_date_wins_across_keys():
-    """キーが違う2つの版は、データ作成日が新しい方（区分に関係なく）を使う。"""
+def test_confirmed_version_wins_over_newer_unconfirmed():
+    """キーが違う2つの版は、確定の版（5/6/7）があれば作成日に関係なくそれを使う。"""
     raw = make_raw(n_days=12)
-    rid = _add_entry_version(raw, 10, month_day="0322", made="20150320")   # 確定版より新しい作成日
+    rid = _add_entry_version(raw, 10, month_day="0322", made="20150320")   # 確定版より新しい作成日の区分2
     sched = results.race_schedule(raw).set_index("レースID")
-    assert sched.loc[rid, "RAデータ区分"] == "2"
-    assert sched.loc[rid, "レース日付"] == pd.Timestamp("2015-03-22")
+    assert sched.loc[rid, "RAデータ区分"] == "7"
+    assert sched.loc[rid, "レース日付"] == _day(10)
+
+
+def test_latest_make_date_wins_among_unconfirmed():
+    """確定の版が無ければ、作成日が最新の版（中止の後に組み直された出馬表など）を使う。"""
+    raw = make_raw(n_days=12, entry_days=(11,))
+    md = _day(11).strftime("%m%d")
+    ra = raw["RA"]
+    old = ra.loc[(ra["id.MonthDay"] == md) & (ra["id.JyoCD"] == "05")].copy()
+    old["head.DataKubun"] = "9"                                  # 元の日に中止（作成日は古い）
+    old["id.MonthDay"] = (_day(11) - pd.Timedelta(days=7)).strftime("%m%d")
+    old[["head.MakeDate.Year", "head.MakeDate.Month", "head.MakeDate.Day"]] = ["2015", "03", "01"]
+    old["_seq"] = "999999"
+    raw["RA"] = pd.concat([ra, old], ignore_index=True)
+    rid = jvmap.make_race_id(old).iloc[0]
+    sched = results.race_schedule(raw).set_index("レースID")
+    assert sched.loc[rid, "RAデータ区分"] == "2" and sched.loc[rid, "レース日付"] == _day(11)
+
+
+# ---------------------------------------------------------------------------
+# 中止（区分9）のあと、後日に同じ回・日目・Rで代替開催（区分7）されたレース
+# ---------------------------------------------------------------------------
+OLD_MAKE_DATE = "20021220"       # 古いデータは作成日がすべてこの日
+
+
+def _add_cancelled_version(raw: dict, day_index: int, jyo: str = "05", days_before: int = 1,
+                           same_make_date: bool = True, cancelled_seq_last: bool = True) -> str:
+    """確定済みのレース（代替開催の版）に、元の開催日の「中止」の版（RA/SE/HR、区分9）を足す。"""
+    md = _day(day_index).strftime("%m%d")
+    orig_md = (_day(day_index) - pd.Timedelta(days=days_before)).strftime("%m%d")
+    seq0 = max(int(raw[rt]["_seq"].astype(int).max()) for rt in ("RA", "SE", "HR")) + 1
+    rid = None
+    for rt in ("RA", "SE", "HR"):
+        df = raw[rt]
+        mask = (df["id.MonthDay"] == md) & (df["id.JyoCD"] == jyo)
+        if rid is None:
+            rid = jvmap.make_race_id(df.loc[mask]).iloc[0]
+        c = df.loc[mask].copy()
+        c["head.DataKubun"] = "9"
+        c["id.MonthDay"] = orig_md
+        if same_make_date:
+            for d in (c, df):
+                idx = d.index if d is c else d.index[mask]
+                d.loc[idx, "head.MakeDate.Year"] = OLD_MAKE_DATE[:4]
+                d.loc[idx, "head.MakeDate.Month"] = OLD_MAKE_DATE[4:6]
+                d.loc[idx, "head.MakeDate.Day"] = OLD_MAKE_DATE[6:]
+        if rt == "SE":
+            c["KakuteiJyuni"] = "00"
+            c["Time"] = "0000"
+        if cancelled_seq_last:                      # 中止の版を後に取得した（最も選ばれやすい条件）
+            c["_seq"] = [str(seq0 + i) for i in range(len(c))]
+            seq0 += len(c)
+        raw[rt] = pd.concat([df, c], ignore_index=True)
+    return rid
+
+
+@pytest.mark.parametrize("same_make_date", [True, False])
+@pytest.mark.parametrize("cancelled_seq_last", [True, False])
+def test_cancelled_then_rerun_keeps_the_race_that_was_run(same_make_date, cancelled_seq_last):
+    base = make_raw(n_days=12)
+    expected = jvmap.build_dataset(raw={k: v.copy() for k, v in base.items()})
+    raw = {k: v.copy() for k, v in base.items()}
+    rids = [_add_cancelled_version(raw, 10, "05", same_make_date=same_make_date,
+                                   cancelled_seq_last=cancelled_seq_last),
+            _add_cancelled_version(raw, 9, "08", days_before=7, same_make_date=same_make_date,
+                                   cancelled_seq_last=cancelled_seq_last)]
+    assert len(jvmap.race_id_duplicates(raw["RA"])) == 4
+
+    ds = jvmap.build_dataset(raw=raw)
+    rr, er = ds.race_result, expected.race_result
+    # 変換後のレース数・頭数は、中止の版が無いときと同じ（＝走った版が残る）
+    assert rr["レースID"].nunique() == er["レースID"].nunique()
+    assert len(rr) == len(er)
+    for rid in rids:
+        got = rr.loc[rr["レースID"] == rid]
+        assert len(got) == 8 and got["着順"].notna().all()
+        assert got["レース日付"].iloc[0] == er.loc[er["レースID"] == rid, "レース日付"].iloc[0]
+    pay = ds.payout_df.set_index("レースID")
+    assert pay.loc[rids, "3連単払戻"].notna().all()
+    sched = results.race_schedule(raw).set_index("レースID")
+    assert (sched.loc[rids, "RAデータ区分"] == "7").all()
+    res = results.race_results(raw, rids)
+    assert len(res) == 16 and res["着順"].notna().all()
+
+
+def test_dup_summary_counts_kubun_combinations():
+    raw = make_raw(n_days=12)
+    _add_cancelled_version(raw, 10)
+    dup = jvmap.race_id_duplicates(raw["RA"])
+    assert sorted(dup["head.DataKubun"]) == ["7", "9"]
 
 
 def test_no_raw_table_has_duplicate_race_ids():

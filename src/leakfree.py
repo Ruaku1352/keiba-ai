@@ -5,11 +5,15 @@
 
 ■ 中核となる考え方
 
-    groupby.cumcount()            → 自分より前の行数
-    groupby.cumsum() - 自分の値    → 自分より前の合計
+    groupby.cumcount()                  → 自分より前の行数
+    groupby.shift(1) してから cumsum()   → 自分より前の合計
 
-  cumsum() は「自分を含む累積和」なので、自分の値を引けば
-  「自分より前だけの累積和」になる。これだけで漏れは防げる。
+  「自分より前の値だけ」を足し上げる。v7 までは「自分を含む累積和 − 自分の値」で
+  求めていたが、浮動小数では (前の合計 + 自分) − 自分 が前の合計とぴったり同じにならず、
+  丸めの向きが**自分の値（＝そのレースの結果）**で変わっていた。値そのものの差は 1e-8 程度だが、
+  脚質カテゴリのように境界（0.10 など）で切る特徴量では、ちょうど境界にいる馬のカテゴリが
+  自分の結果で変わってしまう（学習の経路と予測の経路で特徴量がずれた原因。v7 で修正）。
+  今は引き算をせず、前の行だけを足すので、結果の列を消しても同じ値になる。
 
 ■ 前提
   DataFrame が [レース日付, レースID, 馬番] 順にソート済みであること
@@ -39,11 +43,17 @@ def past_count(df: pd.DataFrame, keys: list[str]) -> pd.Series:
     return df.groupby(keys, observed=True, sort=False).cumcount()
 
 
+def _exclusive_cumsum(value: pd.Series, grouper) -> pd.Series:
+    """グループごとの「自分より前の行だけ」の累積和。NaN は 0。引き算をしないので、
+    自分の値が何であっても結果はビット単位で同じ（自分の値に依存しない）。"""
+    tmp = value.fillna(0)
+    prev = tmp.groupby(grouper, observed=True, sort=False).shift(1, fill_value=0)
+    return prev.groupby(grouper, observed=True, sort=False).cumsum()
+
+
 def past_sum(df: pd.DataFrame, keys: list[str], value: pd.Series) -> pd.Series:
     """自分より前の合計（自分自身は含まない）。NaN は 0 として扱う。"""
-    tmp = value.fillna(0)
-    cum = tmp.groupby(_grouper(df, keys), observed=True, sort=False).cumsum()
-    return cum - tmp
+    return _exclusive_cumsum(value, _grouper(df, keys))
 
 
 def past_rate(df: pd.DataFrame, keys: list[str], value: pd.Series,
@@ -64,12 +74,12 @@ def past_window_mean(df: pd.DataFrame, keys: list[str], value: pd.Series,
     """直近 window 行の平均（自分自身は含まない）。
 
     累積和の差分で計算するので O(n)。
-        直近N走の合計 = (自分より前の累積和) - (N行前時点の累積和)
+        直近N走の合計 = (自分より前の累積和) - (N行前時点の「その行より前の」累積和)
+    どちらの累積和も自分より前の行だけで決まるので、自分の値には依存しない。
     groupby.rolling は162万行だと現実的な時間で終わらないため使わない。
     """
-    tmp = value.fillna(0)
     g = _grouper(df, keys)
-    past_cum = tmp.groupby(g, observed=True, sort=False).cumsum() - tmp
+    past_cum = _exclusive_cumsum(value, g)
     lagged = past_cum.groupby(g, observed=True, sort=False).shift(window).fillna(0)
 
     cnt = past_count(df, keys)
@@ -145,11 +155,15 @@ def past_count_excluding_race(df: pd.DataFrame, keys: list[str], race_col: str) 
 
 def past_sum_excluding_race(df: pd.DataFrame, keys: list[str], value: pd.Series,
                             race_col: str) -> pd.Series:
-    """自分より前の合計。同じレースの行は含めない（past_count_excluding_race と同じ考え方）。"""
-    tmp = value.fillna(0)
-    whole = tmp.groupby(_grouper(df, keys), observed=True, sort=False).cumsum()
-    same_race = tmp.groupby(_grouper(df, keys + [race_col]), observed=True, sort=False).cumsum()
-    return whole - same_race
+    """自分より前の合計。同じレースの行は含めない（past_count_excluding_race と同じ考え方）。
+
+    「そのキーで、同じレース（race_col）の最初の行より前の合計」を、同じレースの全行に配る。
+    行が「日付→レース」順に並んでいれば同じレースの行はキーの中で連続するので、
+    最初の行の「自分より前の合計」= 前のレースまでの合計。引き算をしないので、
+    同じレースの行（自分を含む）の値には依存しない。
+    """
+    excl = _exclusive_cumsum(value, _grouper(df, keys))
+    return excl.groupby(_grouper(df, keys + [race_col]), observed=True, sort=False).transform("first")
 
 
 def past_rate_excluding_race(df: pd.DataFrame, keys: list[str], value: pd.Series,
@@ -216,9 +230,10 @@ def past_window_mean_excluding(df: pd.DataFrame, keys: list[str], value: pd.Seri
     new_grp = new_key | np.r_[True, g[1:] != g[:-1]]
     first_in_grp = np.maximum.accumulate(np.where(new_grp, idx, 0))
 
-    csum = np.cumsum(vs)
-    before_key = csum[key_start] - vs[key_start]       # そのキーの手前までの累積
-    prefix = csum - vs - before_key                     # P[j]（自分を含まない）
+    # P[j] = そのキーの先頭から j の手前までの合計。キーごとに前の行だけを足す（引き算をしない）
+    vs_s, k_s = pd.Series(vs), pd.Series(k)
+    prefix = vs_s.groupby(k_s, sort=False).shift(1, fill_value=0.0) \
+        .groupby(k_s, sort=False).cumsum().to_numpy()
 
     lo = np.maximum(first_in_grp - window, key_start)
     total = prefix[first_in_grp] - prefix[lo]

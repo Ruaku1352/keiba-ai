@@ -82,7 +82,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 233 passed（SDK が無い環境では 227 passed, 6 skipped）
+py -m pytest tests -q          # 252 passed（SDK が無い環境では 246 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -175,7 +175,7 @@ JV-Link ──▶ jvlink.py ──▶ data/jvlink/{RA,SE,HR}.csv（生データ�
 ### 設計で守っていること
 
 - **リークを起こさない。** 過去成績はすべて `leakfree.py` の道具だけで作る。
-  `cumsum() - 自分の値` で「自分より前だけ」の合計を取り、レース単位の値（ペースなど）や
+  「自分より前の行だけ」を足して過去の合計を取り（引き算をしないので、丸めの桁でも自分の結果に依存しない）、レース単位の値（ペースなど）や
   1レースに複数行ありうるキー（調教師）は、同じレースの行も除いて集計する。
   テストで「未来の結果を書き換えても過去行が変わらない」「自分のレースを書き換えても自分の行が変わらない」を確認している
 - **オッズ・人気・JRA-VAN のマイニング予想は特徴量に入れない。** 市場や他人の予測をなぞるだけになるため

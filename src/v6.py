@@ -303,7 +303,7 @@ def _cmd_results(args) -> int:
     clock.step("完了\n")
     if out.get("レースIDの重複"):
         print(f"【注意】RA に、キー（開催月日など）が違うのに同じレースIDの版が {out['レースIDの重複']} 件ありました。"
-              "データ作成日が最新の版を使っています。中身は `py -m src.v6 diagnose dup-races` で確認できます\n")
+              "確定の版（無ければデータ作成日が最新の版）を使っています。中身は `py -m src.v6 diagnose dup-races` で確認できます\n")
 
     races = out["races"]
     if not races.empty:
@@ -530,7 +530,7 @@ def _cmd_diag_dup(args) -> int:
     raw = jvmap.load_raw(args.data)
     clock.step("完了\n")
     print("=== データ区分のルールで1行にした後も、同じレースIDが複数残る版 ===")
-    print("    （キーの開催月日などが違う。使うのはデータ作成日が最新の版）")
+    print("    （キーの開催月日などが違う。使うのは確定の版。無ければデータ作成日が最新の版）")
     found = False
     for rt, extra, pri in [("RA", (), None), ("SE", ("KettoNum",), None),
                            ("HR", (), jvmap.HR_KUBUN_PRIORITY)]:
@@ -538,6 +538,16 @@ def _cmd_diag_dup(args) -> int:
         print(f"\n[{rt}] {len(dup)} 行（{dup['レースID'].nunique() if len(dup) else 0} レース）")
         if len(dup):
             found = True
+            keys = ["レースID"] + list(extra)
+            combo = (dup.groupby(keys)["head.DataKubun"]
+                     .agg(lambda k: "+".join(sorted(k))).value_counts())
+            central = dup.loc[dup["id.JyoCD"].isin(jvmap.CENTRAL_JYO)]
+            print("  データ区分の組み合わせ（件数）: " + ", ".join(f"{c}: {n:,}" for c, n in combo.items()))
+            print(f"  うち中央（場コード01〜10）: {len(central):,} 行")
+            conf = jvmap.USABLE_HR_KUBUN if rt == "HR" else jvmap.USABLE_RACE_KUBUN
+            n_conf = dup.assign(c=dup["head.DataKubun"].isin(conf)).groupby(keys)["c"].sum()
+            print(f"  確定の版が2つ以上あるもの: {int((n_conf >= 2).sum()):,}"
+                  "（0 なら、v7 より前の変換でも重複せず正しく1つになっていた）")
             _print_table(dup.head(args.limit))
             if len(dup) > args.limit:
                 print(f"  … ほか {len(dup) - args.limit} 行。全部は CSV に保存")
