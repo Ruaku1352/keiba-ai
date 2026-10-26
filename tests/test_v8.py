@@ -387,14 +387,17 @@ def test_exploration_guard_rejects_graded():
 # ===========================================================================
 @pytest.fixture()
 def v8_env(tmp_path, monkeypatch):
-    raw = make_raw_v8(n_days=110, races=8)
+    # 3 fold にする：2段目（混ぜた確率）が fold 2・3 の2つになり、fold をまたいで表をつなぐ処理まで通る
+    # （v8 の最初の版は、ここで pd.concat が attrs の DataFrame を比べて落ちた）
+    raw = make_raw_v8(n_days=170, races=8)
     d = tmp_path / "jvlink"
     d.mkdir()
     for rt, df in raw.items():
         df.to_csv(d / f"{rt}.csv", index=False, encoding="utf-8-sig")
     monkeypatch.setattr(predict, "data_root", lambda: tmp_path)
     monkeypatch.setattr(validate, "V5_FOLDS", [validate.Fold("1", (2012, 2012), (2013, 2013)),
-                                               validate.Fold("2", (2012, 2013), (2014, 2014))])
+                                               validate.Fold("2", (2012, 2013), (2014, 2014)),
+                                               validate.Fold("3", (2012, 2014), (2015, 2015))])
     return d
 
 
@@ -402,13 +405,18 @@ def test_oof_runs_and_marks_graded(v8_env):
     ds = jvmap.build_dataset(v8_env)
     oof = experiment.run_oof(ds, "levels", rounds=10, verbose=False)
     t = oof.table
-    assert set(t["fold"]) == {"1", "2"}
+    assert set(t["fold"]) == {"1", "2", "3"}
     assert t["重賞"].any() and (~t["重賞"]).any()
     assert np.allclose(t.groupby("レースID")["prob"].sum(), 1.0)
     assert set(levels.level_feature_columns()) <= set(oof.feature_cols)
 
 
+def _no_frame_in_attrs(df: pd.DataFrame) -> bool:
+    return not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in df.attrs.values())
+
+
 def test_cli_v8_commands_run(v8_env, capsys):
+    """全コマンドを、表の組み立て・表示・保存まで通す（重い計算のあとで落ちないように）。"""
     from src import v8
     common = ["--data", str(v8_env), "--rounds", "10"]
     assert v8.main(common + ["baseline", "--reps", "3"]) == 0
@@ -422,14 +430,132 @@ def test_cli_v8_commands_run(v8_env, capsys):
     assert v8.main(common + ["market"]) == 0
     out = capsys.readouterr().out
     assert "α（モデル）" in out and "混ぜたもの（2段階）" in out
+
     assert v8.main(common + ["trifecta"]) == 0
     out = capsys.readouterr().out
-    assert "Harville" in out and "推定配当" in out
-    assert v8.main(common + ["bets", "--sample", "40"]) == 0
+    assert "Harville" in out and "推定配当" in out and "3連単：年ごと" in out
+    assert "−log P（Henery）" in out
+    # 2回目は γ・δ と 2c・2d の結果を保存から読む（推定をやり直さない）
+    assert v8.main(common + ["trifecta"]) == 0
     out = capsys.readouterr().out
-    assert "S4 券種と金額を混ぜる" in out and "熱さの一覧" in out
+    assert "保存済みの γ・δ と 2c・2d の結果を使います" in out and "γ・δ を推定中" not in out
+
+    assert v8.main(common + ["bets", "--sample", "30"]) == 0
+    out = capsys.readouterr().out
+    assert "保存済みの γ・δ と 2c・2d の結果を使います" in out
+    for name, _ in v8.PROB_SOURCES:
+        assert name in out
+    assert "達成率の一覧" in out and "熱さの一覧" in out and "S4 券種と金額を混ぜる" in out
+    n_trials = len(v8.PROB_SOURCES) * len(v8.STRATEGIES)
+    assert f"平場で比べた案: {n_trials} 個" in out
+
     assert v8.main(common + ["trackbias"]) == 0
     out = capsys.readouterr().out
     assert "7R 以降" in out and "当日_使えたレース数" in out
     saved = {p.name for p in (v8_env.parent / "v8").glob("*.csv")}
-    assert {"baseline.csv", "levels_compare.csv", "market_compare.csv", "bets_summary.csv"} <= saved
+    assert {"baseline.csv", "levels_compare.csv", "market_compare.csv", "trifecta_nll.csv",
+            "payout_estimate.csv", "bets_summary.csv", "bets_heat.csv", "trackbias_compare.csv"} <= saved
+    summary = pd.read_csv(v8_env.parent / "v8" / "bets_summary.csv", encoding="utf-8-sig")
+    assert len(summary) == n_trials and set(summary["確率"]) == {n for n, _ in v8.PROB_SOURCES}
+
+
+def test_market_tables_keep_no_frames_in_attrs(v8_env):
+    """DataFrame を attrs に入れない（pd.concat が attrs を == で比べて落ちる）。"""
+    import argparse
+    from src import v8
+    ds = jvmap.build_dataset(v8_env)
+    args = argparse.Namespace(folds=None, refresh=False, rounds=10, stage1="levels", data=str(v8_env))
+    mt = v8.market_tables(args, ds)
+    for df in (mt.blended, mt.coefs, mt.stage1, mt.odds_oof.table):
+        assert _no_frame_in_attrs(df)
+    assert mt.blended["fold"].nunique() == 2
+    pd.concat([mt.blended.loc[mt.blended["fold"] == f] for f in mt.blended["fold"].unique()])
+    res = v8.trifecta_results(args, ds, mt, verbose=False)
+    assert set(res["disc_b"]) == set(res["disc_q"]) == set(mt.blended["fold"])
+
+
+def test_mix_columns():
+    from src import v8
+    t = pd.DataFrame({"レースID": ["a"] * 3 + ["b"] * 2, "prob": [0.6, 0.3, 0.1, 0.5, 0.5],
+                      "市場確率": [0.2, 0.3, 0.5, 0.9, 0.1]})
+    m = v8.add_mix_columns(t, weights=(0.0, 0.5, 1.0))
+    assert np.allclose(m["mix0"], t["市場確率"]) and np.allclose(m["mix100"], t["prob"])
+    assert np.allclose(m.groupby("レースID")["mix50"].sum(), 1.0)
+    g = np.sqrt(np.array([0.6, 0.3, 0.1]) * np.array([0.2, 0.3, 0.5]))
+    assert np.allclose(m["mix50"].iloc[:3], g / g.sum())
+
+
+def test_place_loglik_matches_per_race():
+    """γ・δ の推定（まとめて計算する版）が、1レースずつの計算と同じになる。"""
+    rng = np.random.default_rng(0)
+    rows = []
+    for r in range(300):
+        n = int(rng.integers(5, 16))
+        p = rng.dirichlet(np.ones(n))
+        order = rng.permutation(n)
+        rank = np.full(n, 9.0)
+        rank[order[:3]] = [1, 2, 3]
+        rows += [{"レースID": f"r{r:04d}", "馬番": h + 1, "着順": rank[h], "prob": p[h]} for h in range(n)]
+    t = pd.DataFrame(rows)
+    _, L2, L3 = market.place_loglik(t, "prob")
+    ts, st = market.race_slices(t)
+    s2 = np.zeros(len(market.GRID))
+    s3 = np.zeros(len(market.GRID))
+    for (a, b), pos in zip(zip(st[:-1], st[1:]), market._finish_index(ts, st)):
+        l2, l3 = market._place_loglik(ts["prob"].to_numpy()[a:b], *pos)
+        s2 += l2
+        s3 += l3
+    assert np.allclose(L2.sum(0), s2) and np.allclose(L3.sum(0), s3)
+    cal, nll, n = market.trifecta_calibration(t, "prob", 0.9, 0.8)
+    ref = np.mean([-np.log(market.trifecta_tensor(ts["prob"].to_numpy()[a:b], 0.9, 0.8)[tuple(pos)])
+                   for (a, b), pos in zip(zip(st[:-1], st[1:]), market._finish_index(ts, st))])
+    assert n == 300 and np.isclose(nll, ref) and cal["実際の的中"].sum() == 300
+
+
+def _mixed_reference(P, Q, p, posts, budget=bets.BUDGET, target=bets.TARGET, kinds=bets.KINDS, h=bets.TOP_H):
+    """毎回すべての候補の増え方を計算し直す、素直な版（速くした版と同じ選び方になるかの確認用）。"""
+    order = np.argsort(-p, kind="mergesort")[:min(h, len(p))]
+    hh = len(order)
+    outcomes, cands, M = bets.coverage_structure(hh)
+    po = bets._subtensor(P, order, outcomes)
+    out = []
+    for kind, c in cands:
+        ix = tuple(order[list(c)])
+        q = Q[kind][ix] if kind in ("3連単", "3連複") else Q[kind][ix[0], ix[1]]
+        out.append(market.estimated_payout(q, kind) if q > 0 else np.nan)
+    est = np.array(out)
+    stake = np.ceil(target / est) * 100
+    usable = np.isfinite(stake) & (stake <= budget) & np.isin([k for k, _ in cands], list(kinds))
+    unc = np.ones(len(outcomes))
+    chosen, spent = [], 0
+    while True:
+        gains = M @ (po * unc)
+        ok = usable & (stake <= budget - spent) & (gains > 1e-15)
+        if not ok.any():
+            break
+        best = int(np.argmax(np.where(ok, gains / stake, -1)))
+        chosen.append(best)
+        spent += int(stake[best])
+        unc = unc * (1 - M[best])
+        usable[best] = False
+    return [(cands[c][0], tuple(int(posts[order[x]]) for x in cands[c][1]), int(stake[c])) for c in chosen]
+
+
+def test_fast_mixed_matches_reference():
+    rng = np.random.default_rng(7)
+    for _ in range(25):
+        n = int(rng.integers(6, 18))
+        p, q = rng.dirichlet(np.ones(n) * 0.8), rng.dirichlet(np.ones(n) * 0.8)
+        posts = np.arange(1, n + 1)
+        P = market.trifecta_tensor(p, 0.86, 0.75)
+        Q = market.combo_probabilities(market.trifecta_tensor(q, 0.86, 0.75))
+        for kinds in (bets.KINDS, ("3連単",)):
+            fast = bets.mixed(P, Q, p, posts, kinds=kinds)
+            ref = _mixed_reference(P, Q, p, posts, kinds=kinds)
+            ref_plan = bets.Plan("ref", [bets.Bet(k, tuple(sorted(c)) if k in ("3連複", "馬連") else c, st)
+                                         for k, c, st in ref])
+            # 増え方がまったく同じ候補（例: 片方の並びを押さえ済みの馬連と、残りの並びの馬単）が並んだときは、
+            # 丸めの差でどちらを選ぶかが変わることがある。どちらでも予測の達成確率・金額は同じ
+            assert fast.invest == ref_plan.invest and len(fast.bets) == len(ref_plan.bets)
+            assert bets.predicted_success(fast, P, Q, posts, bets.TARGET) == pytest.approx(
+                bets.predicted_success(ref_plan, P, Q, posts, bets.TARGET), abs=1e-12)

@@ -103,6 +103,7 @@ def run_oof(dataset, variant: str, folds=None, rounds: int = predict.DEFAULT_ROU
     if verbose:
         print(f"[v8] 特徴量を作成：{variant}（{VARIANTS[variant]['説明']}）...", flush=True)
     frame = build_frame(dataset, variant)
+    frame.attrs = {}          # 途中の表の attrs を持ち越さない（pd.concat が attrs を比べるため）
     prev = predict.previous_weight(frame)
     cols = features.feature_columns(frame)
     parts, imps = [], []

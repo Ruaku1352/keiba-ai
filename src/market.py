@@ -234,63 +234,120 @@ def _finish_index(t: pd.DataFrame, starts: np.ndarray):
     return out
 
 
-def fit_discount(table: pd.DataFrame, prob_col: str) -> tuple[float, float, float]:
-    """γ・δ を最尤で（格子）。戻り値 (γ, δ, レース数)。"""
+def race_blocks(table: pd.DataFrame, prob_col: str):
+    """頭数ごとに、レースをまとめた配列を返す（1〜3着がそろい、確率が正のレースだけ）。
+
+    戻り値: {頭数 n: {"rid": (R,), "p": (R, n) 正規化済み, "pos": (R, 3) 1〜3着の位置}}
+    1レースずつ Python で回すと数万レースで数十分かかるので、同じ頭数のレースを行列にして一度に計算する。
+    """
     t, starts = race_slices(table)
     fin = _finish_index(t, starts)
     p_all = t[prob_col].to_numpy(dtype="float64")
-    s2 = np.zeros(len(GRID))
-    s3 = np.zeros(len(GRID))
-    n = 0
+    rids = t["レースID"].to_numpy()
+    by_n: dict[int, dict[str, list]] = {}
     for (a, b), pos in zip(zip(starts[:-1], starts[1:]), fin):
-        if pos is None or b - a < 3:
+        n = b - a
+        if pos is None or n < 3:
             continue
         p = p_all[a:b]
         if not np.isfinite(p).all() or (p <= 0).any():
             continue
-        l2, l3 = _place_loglik(p, *pos)
-        s2 += l2
-        s3 += l3
-        n += 1
-    return float(GRID[np.argmax(s2)]), float(GRID[np.argmax(s3)]), n
+        d = by_n.setdefault(n, {"rid": [], "p": [], "pos": []})
+        d["rid"].append(rids[a])
+        d["p"].append(p / p.sum())
+        d["pos"].append(pos)
+    return {n: {"rid": np.array(d["rid"]), "p": np.vstack(d["p"]), "pos": np.array(d["pos"])}
+            for n, d in by_n.items()}
+
+
+def place_loglik(table: pd.DataFrame, prob_col: str, grid=GRID, chunk: int = 4000):
+    """レースごとの log P(2着|1着)・log P(3着|1,2着) を、格子の全ての値について一度に計算する。
+
+    戻り値: (レースID の配列, L2 (R, G), L3 (R, G))。γ・δ の推定は、使ってよいレースの行を足して argmax を取るだけになる
+    （fold ごとに推定し直しても、ここは1回で済む）。
+    """
+    rid_parts, l2_parts, l3_parts = [], [], []
+    for n, blk in race_blocks(table, prob_col).items():
+        P, pos = blk["p"], blk["pos"]
+        for s in range(0, len(P), chunk):
+            p = P[s:s + chunk]                                   # (R, n)
+            ps = pos[s:s + chunk]
+            r = np.arange(len(p))
+            pw = p[None, :, :] ** grid[:, None, None]            # (G, R, n)
+            tot = pw.sum(axis=2)
+            f1, f2, f3 = pw[:, r, ps[:, 0]], pw[:, r, ps[:, 1]], pw[:, r, ps[:, 2]]
+            l2_parts.append((np.log(f2) - np.log(tot - f1)).T)   # (R, G)
+            l3_parts.append((np.log(f3) - np.log(tot - f1 - f2)).T)
+            rid_parts.append(blk["rid"][s:s + chunk])
+    if not rid_parts:
+        return np.array([]), np.zeros((0, len(grid))), np.zeros((0, len(grid)))
+    return np.concatenate(rid_parts), np.vstack(l2_parts), np.vstack(l3_parts)
+
+
+def discount_from_loglik(L2: np.ndarray, L3: np.ndarray, rows=None, grid=GRID) -> tuple[float, float, int]:
+    """place_loglik の結果（の一部の行）から γ・δ を選ぶ。"""
+    if rows is not None:
+        L2, L3 = L2[rows], L3[rows]
+    if len(L2) == 0:
+        return float("nan"), float("nan"), 0
+    return float(grid[np.argmax(L2.sum(axis=0))]), float(grid[np.argmax(L3.sum(axis=0))]), int(len(L2))
+
+
+def fit_discount(table: pd.DataFrame, prob_col: str) -> tuple[float, float, int]:
+    """γ・δ を最尤で（格子）。戻り値 (γ, δ, レース数)。"""
+    _, L2, L3 = place_loglik(table, prob_col)
+    return discount_from_loglik(L2, L3)
+
+
+def trifecta_tensor_batch(p: np.ndarray, gamma: float = 1.0, delta: float = 1.0) -> np.ndarray:
+    """trifecta_tensor の複数レース版。p は (R, n)、戻り値は (R, n, n, n)。"""
+    p = p / p.sum(axis=1, keepdims=True)
+    n = p.shape[1]
+    pg, pd_ = p ** gamma, p ** delta
+    sg, sd = pg.sum(axis=1), pd_.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        second = pg[:, None, :] / (sg[:, None, None] - pg[:, :, None])
+        third = pd_[:, None, None, :] / (sd[:, None, None, None] - pd_[:, :, None, None] - pd_[:, None, :, None])
+        P = p[:, :, None, None] * second[:, :, :, None] * third
+    idx = np.arange(n)
+    P[:, idx, idx, :] = 0
+    P[:, idx, :, idx] = 0
+    P[:, :, idx, idx] = 0
+    return np.nan_to_num(P, nan=0.0, posinf=0.0)
 
 
 TRI_BINS = [0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0001]
 
 
 def trifecta_calibration(table: pd.DataFrame, prob_col: str, gamma: float, delta: float,
-                         bins=TRI_BINS) -> tuple[pd.DataFrame, float, int]:
+                         bins=TRI_BINS, chunk: int = 1500) -> tuple[pd.DataFrame, float, int]:
     """全組の予測確率を区間に分け、予測の合計と実際の的中数を比べる。と、実際の組の平均 −log P。"""
-    t, starts = race_slices(table)
-    fin = _finish_index(t, starts)
-    p_all = t[prob_col].to_numpy(dtype="float64")
     edges = np.asarray(bins)
     nb = len(edges) - 1
     pred_sum = np.zeros(nb)
     combos = np.zeros(nb)
     hits = np.zeros(nb)
-    nll, n = 0.0, 0
-    for (a, b), pos in zip(zip(starts[:-1], starts[1:]), fin):
-        if pos is None or b - a < 3:
-            continue
-        p = p_all[a:b]
-        if not np.isfinite(p).all() or (p <= 0).any():
-            continue
-        P = trifecta_tensor(p, gamma, delta)
-        flat = P.ravel()
-        valid = flat > 0
-        idx = np.clip(np.searchsorted(edges, flat[valid], side="right") - 1, 0, nb - 1)
-        np.add.at(pred_sum, idx, flat[valid])
-        np.add.at(combos, idx, 1)
-        actual = P[pos[0], pos[1], pos[2]]
-        hits[np.clip(np.searchsorted(edges, actual, side="right") - 1, 0, nb - 1)] += 1
-        nll += -math.log(max(actual, 1e-12))
-        n += 1
+    nll, count = 0.0, 0
+    for n, blk in race_blocks(table, prob_col).items():
+        for s in range(0, len(blk["p"]), chunk):
+            P = trifecta_tensor_batch(blk["p"][s:s + chunk], gamma, delta)      # (R, n, n, n)
+            pos = blk["pos"][s:s + chunk]
+            flat = P.reshape(len(P), -1)
+            valid = flat > 0
+            v = flat[valid]
+            idx = np.clip(np.searchsorted(edges, v, side="right") - 1, 0, nb - 1)
+            pred_sum += np.bincount(idx, weights=v, minlength=nb)
+            combos += np.bincount(idx, minlength=nb)
+            actual = P[np.arange(len(P)), pos[:, 0], pos[:, 1], pos[:, 2]]
+            hits += np.bincount(np.clip(np.searchsorted(edges, actual, side="right") - 1, 0, nb - 1),
+                                minlength=nb)
+            nll += float(-np.log(np.maximum(actual, 1e-12)).sum())
+            count += len(P)
     out = pd.DataFrame({"区間": [f"[{edges[i]:g}, {edges[i + 1]:g})" for i in range(nb)],
                         "組の数": combos.astype(int), "予測の合計": pred_sum, "実際の的中": hits.astype(int)})
     out["予測の平均"] = out["予測の合計"] / out["組の数"].replace(0, np.nan)
     out["実際の的中率"] = out["実際の的中"] / out["組の数"].replace(0, np.nan)
-    return out, (nll / n if n else float("nan")), n
+    return out, (nll / count if count else float("nan")), count
 
 
 # ---------------------------------------------------------------------------

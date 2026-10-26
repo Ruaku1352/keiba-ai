@@ -84,10 +84,19 @@ def coverage_structure(h: int):
         add("馬単", (i, j), [(i, j, k) for k in range(h) if k not in (i, j)])
     for i, j in itertools.combinations(range(h), 2):
         add("馬連", (i, j), [(a, b, k) for a, b in ((i, j), (j, i)) for k in range(h) if k not in (i, j)])
-    M = np.zeros((len(cands), len(outcomes)), dtype=np.float32)
+    M = np.zeros((len(cands), len(outcomes)), dtype=np.float64)   # float64：掛け算のたびに型を変えない
     for r, cols in enumerate(rows):
         M[r, cols] = 1.0
     return outcomes, cands, M
+
+
+@lru_cache(maxsize=None)
+def candidate_index(h: int):
+    """候補ごとの券種と、上位 h 頭の中での位置（3頭ぶん。2頭の券種は3つ目を 0 で埋める）。"""
+    _, cands, _ = coverage_structure(h)
+    kind = np.array([KINDS.index(k) for k, _ in cands])
+    pos = np.array([list(c) + [0] * (3 - len(c)) for _, c in cands])
+    return kind, pos
 
 
 def _subtensor(P: np.ndarray, order: np.ndarray, outcomes) -> np.ndarray:
@@ -95,12 +104,17 @@ def _subtensor(P: np.ndarray, order: np.ndarray, outcomes) -> np.ndarray:
     return P[order[o[:, 0]], order[o[:, 1]], order[o[:, 2]]]
 
 
-def _candidate_probs(Q: dict, order: np.ndarray, cands) -> np.ndarray:
-    """各候補の市場の確率（推定配当の元）。"""
-    out = np.empty(len(cands))
-    for n, (kind, c) in enumerate(cands):
-        ix = tuple(order[list(c)])
-        out[n] = Q[kind][ix] if kind in ("3連単", "3連複") else Q[kind][ix[0], ix[1]]
+def _candidate_probs(Q: dict, order: np.ndarray, h: int) -> np.ndarray:
+    """各候補の市場の確率（推定配当の元）。まとめて引く。"""
+    kind, pos = candidate_index(h)
+    horse = order[pos]                                     # (候補, 3) 実際の馬の位置
+    out = np.empty(len(kind))
+    for k, name in enumerate(KINDS):
+        m = kind == k
+        if name in ("3連単", "3連複"):
+            out[m] = Q[name][horse[m, 0], horse[m, 1], horse[m, 2]]
+        else:
+            out[m] = Q[name][horse[m, 0], horse[m, 1]]
     return out
 
 
@@ -181,17 +195,20 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
     order = np.argsort(-p, kind="mergesort")[:h]
     outcomes, cands, M = coverage_structure(h)
     po = _subtensor(P, order, outcomes)                         # 並びの予測確率
-    q_c = _candidate_probs(Q, order, cands)
-    est = np.array([market.estimated_payout(q, k) if q > 0 else np.nan for (k, _), q in zip(cands, q_c)])
-    stake = np.ceil(target / est) * 100                         # それ1点で基準に届く金額
-    kind_arr = np.array([k for k, _ in cands])
+    q_c = _candidate_probs(Q, order, h)
+    kind_code, _ = candidate_index(h)
+    rate = np.array([market.PAYOUT_RATE[k] for k in KINDS])[kind_code]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        est = np.where(q_c > 0, 100.0 * rate / q_c, np.nan)     # 100円あたりの推定配当
+        stake = np.ceil(target / est) * 100                     # それ1点で基準に届く金額
+    kind_arr = np.array(KINDS)[kind_code]
     usable = np.isfinite(stake) & (stake <= budget) & np.isin(kind_arr, list(kinds))
     uncovered = np.ones(len(outcomes))
     chosen, spent = [], 0
     used_per_kind = {k: 0 for k in KINDS}
+    gains = M @ po                                              # 各候補が新しく押さえる確率（毎回差分で更新）
     while True:
-        gains = M @ (po * uncovered)
-        ok = usable & (stake <= budget - spent) & (gains > 0)
+        ok = usable & (stake <= budget - spent) & (gains > 1e-15)
         if max_per_kind is not None:
             for k in KINDS:
                 if used_per_kind[k] >= max_per_kind:
@@ -203,7 +220,10 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
         chosen.append(best)
         spent += int(stake[best])
         used_per_kind[kind_arr[best]] += 1
-        uncovered = uncovered * (1 - M[best])
+        newly = np.flatnonzero((M[best] > 0) & (uncovered > 0))
+        if len(newly):
+            gains -= M[:, newly] @ po[newly]
+            uncovered[newly] = 0
         usable[best] = False
     bets = []
     for c in chosen:
@@ -274,15 +294,18 @@ def realized(plan: Plan, wins: dict) -> float:
     return total
 
 
-def summarize(results: pd.DataFrame, target: float = TARGET) -> pd.DataFrame:
-    """買い方ごとの成績（平場）。results は1レース・1買い方1行（買い方, 投資, 払戻, 予測の達成確率）。"""
+def summarize(results: pd.DataFrame, target: float = TARGET, keys=("買い方",)) -> pd.DataFrame:
+    """買い方ごとの成績（平場）。results は1レース・1買い方1行（買い方, 投資, 払戻, 予測の達成確率）。
+    keys で集計の単位を変えられる（例: ["確率", "買い方"]）。"""
     rows = []
-    for name, g in results.groupby("買い方", sort=False):
+    keys = list(keys)
+    for name, g in results.groupby(keys, sort=False):
+        name = name if isinstance(name, tuple) else (name,)
         n = len(g)
         hit = int((g["払戻"] > 0).sum())
         ach = int((g["払戻"] >= target).sum())
         lo, hi = market.wilson(ach, n)
-        rows.append({"買い方": name, "レース数": n, "的中率": hit / n if n else np.nan,
+        rows.append({**dict(zip(keys, name)), "レース数": n, "的中率": hit / n if n else np.nan,
                      "達成率": ach / n if n else np.nan, "下限": lo, "上限": hi,
                      "予測の達成確率（平均）": float(g["予測の達成確率"].mean()),
                      "平均投資": float(g["投資"].mean()),
