@@ -7,6 +7,7 @@
     py -m src.v8 trifecta          2c・2d  3連単の確率（Harville・Henery）と、配当の推定の当たり具合
     py -m src.v8 bets              2e  買い目の選び方（平場）
     py -m src.v8 trackbias         3   当日の馬場の傾向（平場の後半のレース）
+    py -m src.v8 tilt              3b・3c  市場の確率に当日の傾向・開催の進み具合の傾向で傾きをつける
 
 **v8 の新しい案（1.5・2・3）は平場だけで評価し、重賞の成績は出さない**（experiment.exploration_only）。
 例外は 1（新しい案ではない）と、確率のキャリブレーション（全レース）。
@@ -454,7 +455,7 @@ def add_mix_columns(t: pd.DataFrame, weights=MIX_WEIGHTS) -> pd.DataFrame:
 def evaluate_bets(blended: pd.DataFrame, payout: pd.DataFrame, discs: dict, disc_q: dict,
                   sources=PROB_SOURCES, sample: int = 0, seed: int = 0,
                   targets=(20_000, 30_000, 50_000, 100_000), heat_sources=HEAT_SOURCES,
-                  verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                  strategies=None, verbose: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """平場のレースで、確率の出し方 × 買い方 を実際の払戻で評価する。戻り値: (成績, 熱さの一覧, 例)。
 
     discs: 確率の列 → {fold: (γ, δ, n)}。disc_q: 市場の確率の γ・δ（配当の推定に使う）。
@@ -494,11 +495,19 @@ def evaluate_bets(blended: pd.DataFrame, payout: pd.DataFrame, discs: dict, disc
             p = probs[col]
             g, d, _ = discs[col][f]
             P = market.trifecta_tensor(p, g, d)
-            form, cards = bets.formation_cards(P, Q["3連単"], p, posts)
-            plans = [bets.box(p, posts), bets.hot_top(P, Q["3連単"], posts), form,
-                     bets.mixed(P, Q, p, posts), bets.mixed(P, Q, p, posts, max_per_kind=cap),
-                     bets.mixed(P, Q, p, posts, kinds=("3連単",))]
-            for name, plan in zip(STRATEGIES, plans):
+            cards = []
+
+            def formation():
+                plan, cs = bets.formation_cards(P, Q["3連単"], p, posts)
+                cards.extend(cs)
+                return plan
+            makers = dict(zip(STRATEGIES, [
+                lambda: bets.box(p, posts), lambda: bets.hot_top(P, Q["3連単"], posts), formation,
+                lambda: bets.mixed(P, Q, p, posts), lambda: bets.mixed(P, Q, p, posts, max_per_kind=cap),
+                lambda: bets.mixed(P, Q, p, posts, kinds=("3連単",))]))
+            names = [n for n in STRATEGIES if strategies is None or n in strategies]
+            plans = [makers[n]() for n in names]
+            for name, plan in zip(names, plans):
                 if np.isnan(plan.predicted):
                     plan.predicted = bets.predicted_success(plan, P, Q, posts, bets.TARGET)
                 rows.append({"レースID": rid, "確率": src_name, "買い方": name, "投資": plan.invest,
@@ -509,7 +518,7 @@ def evaluate_bets(blended: pd.DataFrame, payout: pd.DataFrame, discs: dict, disc
                     plan = bets.mixed(P, Q, p, posts, target=tg)
                     heat.append({"確率": src_name, "基準": tg, "予測の達成確率": plan.predicted,
                                  "実際の払戻": bets.realized(plan, wins), "投資": plan.invest})
-            if col == "blend" and len(examples) < 3:
+            if col == "blend" and len(examples) < 3 and strategies is None:
                 examples.append({"レースID": rid, "S3 のカード": bets.card_text(cards),
                                  "S4 の買い目": " / ".join(f"{x.kind} {'-'.join(map(str, x.combo))} {x.stake:,}円"
                                                           for x in plans[3].bets)})
@@ -619,6 +628,66 @@ def _cmd_trackbias(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 3b・3c 市場の確率に傾向で傾きをつける
+# ---------------------------------------------------------------------------
+S4C = STRATEGIES[4]
+
+
+def tilt_tables(ds, base: experiment.OOF):
+    """市場だけ / 市場＋当日の傾向（3b）/ 市場＋開催の傾向（3c）の確率（fold 2 以降）と係数。"""
+    from . import tilt
+    terms = tilt.build_terms(ds)
+    t = base.table.merge(terms, on=["レースID", "血統登録番号"], how="left")
+    out3b, coef3b = tilt.tilt_walk_forward(t, tilt.DAY_TERMS, "tilt3b")
+    out3c, coef3c = tilt.tilt_walk_forward(t, tilt.MEETING_TERMS, "tilt3c")
+    key = ["レースID", "血統登録番号"]
+    merged = out3b.merge(out3c[key + ["tilt3c"]], on=key, how="inner")
+    return merged, coef3b, coef3c, t
+
+
+TILT_SOURCES = [("市場だけ", "市場確率"), ("市場＋当日の傾向（3b）", "tilt3b"), ("市場＋開催の傾向（3c）", "tilt3c")]
+
+
+def _cmd_tilt(args) -> int:
+    clock = _Clock()
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    clock.step("傾向の項を作成し、係数を推定中 ...")
+    merged, coef3b, coef3c, full = tilt_tables(ds, base)
+    TRIALS.extend(["3b 市場＋当日の傾向（発走40分前まで）で傾き", "3c 市場＋開催の進み具合の傾向で傾き"])
+    print("\n=== 3b・3c 係数（その fold より前の fold の平場で推定）。θ が 0 に近ければ市場は織り込み済み ===")
+    print("--- 3b 市場＋当日の傾向 ---")
+    _show(coef3b)
+    print("--- 3c 市場＋開催の傾向 ---")
+    _show(coef3c)
+    from . import tilt as tilt_mod
+    sd = _flat(full)[tilt_mod.DAY_TERMS + tilt_mod.MEETING_TERMS].astype("float64").std()
+    print("    項の標準偏差（平場）: " + " / ".join(f"{k} {v:.4f}" for k, v in sd.items())
+          + "。θ × 標準偏差 = 項が1標準偏差変わったときの log の変化（0.05 で約5%の確率の差）")
+    flat = experiment.exploration_only(_flat(merged), "3b・3c")
+    rows = [market.summary_row(flat, c, n) for n, c in TILT_SOURCES]
+    print("\n=== 平場（fold 2 以降）：log-loss・AUC・キャリブレーション誤差 ===")
+    _show(pd.DataFrame(rows))
+    print("\n=== キャリブレーション（全レース。重賞を含む・達成率ではない） ===")
+    for n, c in TILT_SOURCES[1:]:
+        print(f"--- {n} ---")
+        _show(market.calibration_table(merged, c), pct=("平均", "勝率"))
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+    discs = {c: disc_q for _, c in TILT_SOURCES}     # 傾きは市場の小さな補正なので、γ・δ は市場のものを使う
+    clock.step(f"{S4C} を計算中（平場、最大 {args.sample:,} レース）...")
+    summary, _, _ = evaluate_bets(merged, ds.payout_df, discs, disc_q, sources=TILT_SOURCES,
+                                  sample=args.sample, heat_sources=(), strategies=[S4C])
+    print(f"\n=== 平場：{S4C}（予算 12,000円・基準 50,000円。配当はどれも市場の確率から推定、評価は実際の払戻） ===")
+    _show(summary, pct=("率", "限", "確率（"), money=("投資",))
+    _save(args, pd.DataFrame(rows), "tilt_compare")
+    _save(args, pd.concat([coef3b.assign(案="3b"), coef3c.assign(案="3c")], ignore_index=True), "tilt_coefs")
+    _save(args, summary, "tilt_s4c")
+    _trials_note()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="py -m src.v8")
     parser.add_argument("--data", default=None, help="JV-Data CSV の場所（既定: data/jvlink）")
@@ -643,6 +712,9 @@ def main(argv: list[str] | None = None) -> int:
                            help="平場から何レースを使うか（0 で全部。確率6通り×買い方6通りを計算するので重い）")
         q.set_defaults(func=func)
     sub.add_parser("trackbias", help="3 当日の馬場の傾向（平場の後半）").set_defaults(func=_cmd_trackbias)
+    q = sub.add_parser("tilt", help="3b・3c 市場の確率に当日・開催の傾向で傾きをつける（平場）")
+    q.add_argument("--sample", type=int, default=5_000, help="S4c を計算する平場のレース数（0 で全部）")
+    q.set_defaults(func=_cmd_tilt)
     args = parser.parse_args(argv)
     TRIALS.clear()
     return args.func(args)

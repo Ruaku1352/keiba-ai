@@ -559,3 +559,100 @@ def test_fast_mixed_matches_reference():
             assert fast.invest == ref_plan.invest and len(fast.bets) == len(ref_plan.bets)
             assert bets.predicted_success(fast, P, Q, posts, bets.TARGET) == pytest.approx(
                 bets.predicted_success(ref_plan, P, Q, posts, bets.TARGET), abs=1e-12)
+
+
+# ===========================================================================
+# 3b・3c 市場の確率に傾向で傾き
+# ===========================================================================
+def _meeting(ds, rr=None):
+    from src import tilt
+    d = jvmap.JVDataset(rr if rr is not None else ds.race_result, ds.lap_df, ds.payout_df, ds.report)
+    return tilt.add_meeting_features(tilt.style_frame(d))
+
+
+def test_meeting_features_use_only_previous_days_of_same_meeting(ds8):
+    from src import tilt
+    base = _meeting(ds8)
+    # 開催の初日（開催日目 1）は前日までのレースが無いので 0
+    first = base.loc[base["開催日目"] == 1]
+    assert len(first) and (first["開催_内枠傾向"] == 0).all() and (first["開催_前残り傾向"] == 0).all()
+    assert base["開催日目"].between(1, 8).all()
+    # ある日のレースの値は、その日・それより後の日の結果を書き換えても変わらない
+    rr = ds8.race_result.copy()
+    days = sorted(rr["レース日付"].unique())
+    day = days[len(days) // 2]
+    m = rr["レース日付"] >= day
+    rng = np.random.default_rng(5)
+    rr.loc[m, "着順"] = rr.loc[m].groupby("レースID")["着順"].transform(lambda s: rng.permutation(s.to_numpy()))
+    rr.loc[m, "_4コーナー順位"] = rng.integers(1, 11, m.sum())
+    after = _meeting(ds8, rr)
+    cols = ["開催_内枠傾向", "開催_前残り傾向", "開催日目"] + tilt.MEETING_TERMS
+    a = base.loc[base["レース日付"] == day].set_index(["レースID", "血統登録番号"])[cols].sort_index()
+    b = after.loc[after["レース日付"] == day].set_index(["レースID", "血統登録番号"])[cols].sort_index()
+    pd.testing.assert_frame_equal(a, b)
+    # 前の日の結果を書き換えると、同じ開催の後の日の値は変わる（＝使っている）
+    prev = days[len(days) // 2 - 1]
+    rr2 = ds8.race_result.copy()
+    m2 = rr2["レース日付"] == prev
+    rr2.loc[m2, "_4コーナー順位"] = 1
+    c = _meeting(ds8, rr2)
+    same_meeting = base.loc[(base["レース日付"] == day), "レースID"].str[:8].isin(
+        base.loc[base["レース日付"] == prev, "レースID"].str[:8])
+    if same_meeting.any():
+        cc = c.loc[c["レース日付"] == day].set_index(["レースID", "血統登録番号"])[cols].sort_index()
+        assert not cc.equals(a)
+
+
+def test_tilt_walk_forward_recovers_theta():
+    from src import tilt
+    rng = np.random.default_rng(2)
+    rows = []
+    for r in range(4500):
+        n = int(rng.integers(8, 15))
+        q = rng.dirichlet(np.ones(n))
+        x = rng.normal(size=n) * 0.3
+        u = 1.0 * np.log(q) + 2.0 * x
+        pr = np.exp(u - u.max())
+        w = rng.choice(n, p=pr / pr.sum())
+        fold = str(1 + r // 1500)
+        rows += [{"レースID": f"r{r:05d}", "馬番": h + 1, "市場確率": q[h], "当日_内枠×枠位置": x[h],
+                  "当日_前残り×脚質": 0.0, "win": int(h == w), "fold": fold, "重賞": False} for h in range(n)]
+    t = pd.DataFrame(rows)
+    out, coefs = tilt.tilt_walk_forward(t, tilt.DAY_TERMS, "tilt3b")
+    assert set(out["fold"]) == {"2", "3"}
+    last = coefs.iloc[-1]
+    assert last["β（市場）"] == pytest.approx(1.0, abs=0.15)
+    assert last["θ（当日_内枠×枠位置）"] == pytest.approx(2.0, abs=0.4)
+    assert np.allclose(out.groupby("レースID")["tilt3b"].sum(), 1.0)
+    # 項の効果が本当にあるとき、傾けた確率の方が log-loss が小さい
+    assert market.race_log_loss(out, "tilt3b") < market.race_log_loss(out, "市場確率")
+
+
+def test_cli_tilt(v8_env, capsys):
+    from src import v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "30"]) == 0
+    out = capsys.readouterr().out
+    assert "θ（当日_内枠×枠位置）" in out and "θ（開催日目×枠位置）" in out
+    assert "市場＋当日の傾向（3b）" in out and "市場＋開催の傾向（3c）" in out
+    assert v8.S4C in out and "平場で比べた案: 2 個" in out
+    s4c = pd.read_csv(v8_env.parent / "v8" / "tilt_s4c.csv", encoding="utf-8-sig")
+    assert set(s4c["確率"]) == {n for n, _ in v8.TILT_SOURCES} and set(s4c["買い方"]) == {v8.S4C}
+
+
+def test_conditional_logit_with_all_zero_column():
+    """全部 0 の列があっても、他の列の係数はちゃんと推定される（特異行列で止まらない）。"""
+    rng = np.random.default_rng(3)
+    X, y, starts = [], [], [0]
+    for _ in range(2000):
+        n = 10
+        a = np.log(rng.dirichlet(np.ones(n)))
+        u = 0.8 * a
+        pr = np.exp(u - u.max())
+        w = rng.choice(n, p=pr / pr.sum())
+        X.append(np.c_[a, np.zeros(n)])
+        yy = np.zeros(n)
+        yy[w] = 1
+        y.append(yy)
+        starts.append(starts[-1] + n)
+    beta = market.fit_conditional_logit(np.vstack(X), np.array(starts), np.concatenate(y))
+    assert beta[0] == pytest.approx(0.8, abs=0.12) and beta[1] == 0

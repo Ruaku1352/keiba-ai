@@ -83,7 +83,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 274 passed（SDK が無い環境では 268 passed, 6 skipped）
+py -m pytest tests -q          # 278 passed（SDK が無い環境では 272 passed, 6 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -140,6 +140,7 @@ py -m src.v8 market          # モデルと市場の確率を混ぜる（Benter�
 py -m src.v8 trifecta        # 3連単の確率（Harville・Henery）と配当の推定
 py -m src.v8 bets            # 買い目の選び方
 py -m src.v8 trackbias       # 当日の馬場の傾向
+py -m src.v8 tilt            # 市場の確率に当日・開催の傾向で傾きをつける
 ```
 
 確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero` /

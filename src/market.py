@@ -126,10 +126,9 @@ def fit_conditional_logit(X: np.ndarray, starts: np.ndarray, y: np.ndarray,
         grad = ((y - p)[:, None] * X).sum(axis=0)
         m = np.add.reduceat(p[:, None] * X, starts[:-1], axis=0)          # レースごとの Σ p x
         hess = -(X.T @ (p[:, None] * X) - m.T @ m)
-        try:
-            step = np.linalg.solve(-hess, grad)
-        except np.linalg.LinAlgError:
-            break
+        # 項が全部 0 の列などで行列が特異なときも止まらないよう、最小二乗で解く
+        # （止めると係数が 0 のまま返ってしまう。その列の係数は 0 のまま、他の列は推定される）
+        step = np.linalg.lstsq(-hess, grad, rcond=None)[0]
         t = 1.0
         while t > 1e-6:
             nb = beta + t * step
