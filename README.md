@@ -83,7 +83,7 @@ git clone https://github.com/Ruaku1352/keiba-ai.git
 cd keiba-ai
 py -m pip install -r requirements.txt
 $env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
-py -m pytest tests -q          # 278 passed（SDK が無い環境では 272 passed, 6 skipped）
+py -m pytest tests -q          # 294 passed（SDK が無い環境では 287 passed, 7 skipped）
 ```
 
 JRA-VAN Data Lab. の契約・利用キーの登録・JV-Link のインストールが必要。
@@ -140,7 +140,16 @@ py -m src.v8 market          # モデルと市場の確率を混ぜる（Benter�
 py -m src.v8 trifecta        # 3連単の確率（Harville・Henery）と配当の推定
 py -m src.v8 bets            # 買い目の選び方
 py -m src.v8 trackbias       # 当日の馬場の傾向
-py -m src.v8 tilt            # 市場の確率に当日・開催の傾向で傾きをつける
+py -m src.v8 tilt            # 市場の確率に当日・開催の傾向で傾きをつける（3b+3c も）
+py -m src.v8 stakes          # 券種混合の金額の余裕・スマッピーの点数の上限
+```
+
+確定オッズの保存・当日の速報オッズ（任意。いつもの fetch は変わらない）:
+
+```powershell
+py -m src.jvlink fetch-odds                          # 月曜の fetch のあと。確定オッズ（O1〜O6）を data\jvlink\odds に保存
+py -m src.jvlink rt-odds --date 20261101 --race 11   # 当日の速報オッズ（0B30）を取得時刻つきで保存
+py -m src.v8 odds-drift --date 20261101              # 速報と確定のずれ
 ```
 
 確認・診断: `py -m src.v6 diagnose weight`（馬体重の代用の影響）/ `payout-trend` / `check-3f` / `style-zero` /
@@ -217,6 +226,8 @@ JV-Link ──▶ jvlink.py ──▶ data/jvlink/{RA,SE,HR}.csv（生データ�
 | `src/levels.py` / `trackbias.py` | v8：格・着差・推移・タイム指数 / 当日の馬場の傾向（検証用。本番の特徴量には入れていない） |
 | `src/market.py` / `bets.py` | v8：市場の確率との混合・3連単の確率・配当の推定 / 買い目の選び方 |
 | `src/v8.py` | v8 の検証の実行入口 |
+| `src/odds.py` | v8：オッズ（O1〜O6）の読み取り（仕様書の位置で直接）と保存（圧縮した numpy） |
+| `src/tilt.py` | v8：市場の確率に当日・開催の傾向で傾きをつける |
 
 Kaggle データ用の入口（`train.run_pipeline`、`validate.run_v4` など）も残してあり、v1〜v4 と同じ流れで回せる。
 ただし調教師成績のリークを直したので、数字は v4 当時と完全には一致しない。

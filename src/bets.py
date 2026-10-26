@@ -186,8 +186,14 @@ def formation_cards(P: np.ndarray, Q3: np.ndarray, p: np.ndarray, posts: np.ndar
 
 def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int = BUDGET,
           target: float = TARGET, kinds=KINDS, max_per_kind: int | None = None,
-          h: int = TOP_H, name: str = "券種混合") -> Plan:
-    """S4 / S4c / S5：券種と金額を混ぜて、払戻の合計が基準以上になる確率を大きくする（貪欲法）。"""
+          h: int = TOP_H, name: str = "券種混合", margin: float = 1.0,
+          max_points: int | None = None) -> Plan:
+    """S4 / S4c / S5：券種と金額を混ぜて、払戻の合計が基準以上になる確率を大きくする（貪欲法）。
+
+    margin     : 1点の金額を「推定配当 × 金額 ≥ 基準 × margin」にする（1.2 なら推定より2割下振れしても届く）。
+                 達成の判定（予測・実際とも）は基準のまま
+    max_points : 入力する点数の合計の上限（スマッピーの1つの QR に入る点数。券種は問わない）
+    """
     n = len(p)
     h = min(h, n)
     if h < 3:
@@ -200,7 +206,7 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
     rate = np.array([market.PAYOUT_RATE[k] for k in KINDS])[kind_code]
     with np.errstate(divide="ignore", invalid="ignore"):
         est = np.where(q_c > 0, 100.0 * rate / q_c, np.nan)     # 100円あたりの推定配当
-        stake = np.ceil(target / est) * 100                     # それ1点で基準に届く金額
+        stake = np.ceil(target * margin / est) * 100            # それ1点で基準（× 余裕）に届く金額
     kind_arr = np.array(KINDS)[kind_code]
     usable = np.isfinite(stake) & (stake <= budget) & np.isin(kind_arr, list(kinds))
     uncovered = np.ones(len(outcomes))
@@ -213,6 +219,8 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
             for k in KINDS:
                 if used_per_kind[k] >= max_per_kind:
                     ok &= kind_arr != k
+        if max_points is not None and len(chosen) >= max_points:
+            break
         if not ok.any():
             break
         ratio = np.where(ok, gains / stake, -1)
@@ -233,12 +241,10 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
             horses = tuple(sorted(horses))
         bets.append(Bet(k, horses, int(stake[c])))
     plan = Plan(name, bets)
-    # 予測の達成確率：選んだ全部の推定払戻の合計が基準以上になる並びの確率
-    if chosen:
-        total = (M[chosen] * (stake[chosen] / 100 * est[chosen])[:, None]).sum(axis=0)
-        plan.predicted = float(po[total >= target].sum())
-    else:
-        plan.predicted = 0.0
+    # 予測の達成確率：選んだ全部の推定払戻の合計が基準以上になる並びの確率。
+    # 候補選びは上位 h 頭の並びだけで行うが、ここは全頭の並びで計算する（馬単・3連複などは、残りの着に
+    # 上位 h 頭以外の馬が来ても当たるため。上位 h 頭だけで数えると少し小さく出る）
+    plan.predicted = predicted_success(plan, P, Q, posts, target) if chosen else 0.0
     return plan
 
 

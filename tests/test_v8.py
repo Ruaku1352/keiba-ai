@@ -633,11 +633,28 @@ def test_cli_tilt(v8_env, capsys):
     assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "30"]) == 0
     out = capsys.readouterr().out
     assert "θ（当日_内枠×枠位置）" in out and "θ（開催日目×枠位置）" in out
-    assert "市場＋当日の傾向（3b）" in out and "市場＋開催の傾向（3c）" in out
-    assert v8.S4C in out and "平場で比べた案: 2 個" in out
+    for name, _ in v8.TILT_SOURCES:
+        assert name in out
+    assert v8.S4C in out and "平場で比べた案: 3 個" in out and "対応のある比較" in out
     s4c = pd.read_csv(v8_env.parent / "v8" / "tilt_s4c.csv", encoding="utf-8-sig")
     assert set(s4c["確率"]) == {n for n, _ in v8.TILT_SOURCES} and set(s4c["買い方"]) == {v8.S4C}
-
+    paired = pd.read_csv(v8_env.parent / "v8" / "tilt_s4c_paired.csv", encoding="utf-8-sig")
+    assert set(paired["確率"]) == {n for n, _ in v8.TILT_SOURCES[1:]}
+    # 2回目は傾きの表を保存から読む
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "30"]) == 0
+    assert "保存済みの傾きの表を使います" in capsys.readouterr().out
+    # stakes は tilt の結果から確率を選ぶ
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "stakes", "--sample", "25"]) == 0
+    out = capsys.readouterr().out
+    assert "金額の余裕" in out and "予測 − 実際" in out
+    n = len(v8.MARGINS) * len(v8.POINT_LIMITS)
+    assert f"平場で比べた案: {n} 個" in out
+    summ = pd.read_csv(v8_env.parent / "v8" / "stakes_summary.csv", encoding="utf-8-sig")
+    assert len(summ) == n
+    assert (summ.loc[summ["点数の上限"] == "10", "平均点数"] <= 10).all()
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "50"]) == 0
+    t = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", encoding="utf-8-sig", dtype={"レースID": str})
+    assert (t["区分"] == "平場サンプル").sum() == 50 and (t["区分"] == "重賞").sum() > 0
 
 def test_conditional_logit_with_all_zero_column():
     """全部 0 の列があっても、他の列の係数はちゃんと推定される（特異行列で止まらない）。"""
@@ -656,3 +673,75 @@ def test_conditional_logit_with_all_zero_column():
         starts.append(starts[-1] + n)
     beta = market.fit_conditional_logit(np.vstack(X), np.array(starts), np.concatenate(y))
     assert beta[0] == pytest.approx(0.8, abs=0.12) and beta[1] == 0
+
+
+
+# ===========================================================================
+# v8b：金額の余裕・点数の上限・対応のある比較・オッズのずれ
+# ===========================================================================
+def _race_tensors(seed=4, n=14):
+    rng = np.random.default_rng(seed)
+    p, q = rng.dirichlet(np.ones(n) * 0.8), rng.dirichlet(np.ones(n) * 0.8)
+    P = market.trifecta_tensor(p, 0.86, 0.75)
+    Q = market.combo_probabilities(market.trifecta_tensor(q, 0.86, 0.75))
+    return p, P, Q, np.arange(1, n + 1)
+
+
+def test_mixed_margin_raises_stakes_but_judges_at_target():
+    p, P, Q, posts = _race_tensors()
+    for m in (1.0, 1.2, 1.4):
+        plan = bets.mixed(P, Q, p, posts, margin=m)
+        assert plan.invest <= bets.BUDGET
+        for b in plan.bets:
+            ix = [x - 1 for x in b.combo]
+            q_ = Q[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else Q[b.kind][ix[0], ix[1]]
+            est = market.estimated_payout(q_, b.kind) * b.stake / 100
+            assert est >= bets.TARGET * m - 1e-6
+        # 予測の達成確率は「推定払戻の合計 ≥ 50,000円」で計算する（余裕の分は判定に入れない）
+        assert plan.predicted == pytest.approx(bets.predicted_success(plan, P, Q, posts, bets.TARGET))
+    a, b = bets.mixed(P, Q, p, posts, margin=1.0), bets.mixed(P, Q, p, posts, margin=1.4)
+    assert np.mean([x.stake for x in b.bets]) >= np.mean([x.stake for x in a.bets])
+
+
+def test_mixed_point_limit():
+    p, P, Q, posts = _race_tensors(seed=9)
+    free = bets.mixed(P, Q, p, posts)
+    for lim in (3, 10, 15):
+        plan = bets.mixed(P, Q, p, posts, max_points=lim)
+        assert len(plan.bets) <= lim and plan.invest <= bets.BUDGET
+        assert plan.predicted <= free.predicted + 1e-12
+
+
+def test_paired_vs_counts_discordant_races():
+    from src import v8
+    rows = pd.DataFrame({"レースID": ["a", "a", "b", "b", "c", "c"], "確率": ["市場だけ", "X"] * 3,
+                         "払戻": [60000, 0, 0, 70000, 0, 0]})
+    t = v8.paired_vs(rows, "市場だけ").iloc[0]
+    assert t["確率"] == "X" and t["こちらだけ熱い当たり"] == 1 and t["市場だけだけ熱い当たり"] == 1 and t["レース数"] == 3
+
+
+def test_odds_targets_deterministic():
+    from src import v8
+    rng = np.random.default_rng(0)
+    t = pd.DataFrame({"レースID": [f"r{i:05d}" for i in range(3000)],
+                      "レース日付": pd.date_range("2011-01-01", periods=3000, freq="D"),
+                      "fold": np.repeat(["1", "2", "3"], 1000), "重賞": rng.random(3000) < 0.05})
+    a = v8.odds_targets(t, n_flat=500)
+    b = v8.odds_targets(t, n_flat=500)
+    assert a.equals(b)
+    assert (a["区分"] == "重賞").sum() == t["重賞"].sum()
+    flat = a.loc[a["区分"] == "平場サンプル"]
+    assert len(flat) == 500 and set(flat["fold"]) <= {"2", "3"}
+
+
+def test_odds_drift_against_final():
+    from src import v8
+    final = pd.DataFrame({"レースID": "202605040311", "券種": "3連単", "組番": [10203, 10204, 20103],
+                          "オッズ": [100.0, 200.0, 50.0]})
+    snaps = pd.DataFrame({"レースID": "202605040311", "券種": "3連単", "組番": [10203, 10204, 20103] * 2,
+                          "オッズ": [110.0, 200.0, 50.0, 100.0, 300.0, 50.0], "データ区分": "1",
+                          "発表": ["11011420"] * 3 + ["11011520"] * 3, "取得時刻": "2026-11-01 14:21:00"})
+    post = pd.Series({"202605040311": pd.Timestamp("2026-11-01 15:40")})
+    t = v8.odds_drift(snaps, final, post)
+    assert list(t["発走まで（分）"]) == [80.0, 20.0]
+    assert t["±10%以内"].iloc[0] == pytest.approx(1.0) and t["±25%以内"].iloc[1] == pytest.approx(2 / 3)

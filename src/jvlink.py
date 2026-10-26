@@ -314,6 +314,13 @@ class JVLinkClient:
             return OpenResult(int(ret[0]), int(ret[1] or 0), int(ret[2] or 0), str(ret[3] or ""))
         return OpenResult(int(ret))
 
+    def rt_open(self, dataspec: str, key: str) -> int:
+        """JVRTOpen（速報系）。戻り値 0 = 正常、-1 = 該当データなし、その他の負 = エラー。"""
+        ret = self.jv.JVRTOpen(dataspec, key)
+        if isinstance(ret, (list, tuple)):
+            ret = ret[0]
+        return int(ret)
+
     def status(self) -> int:
         return int(self.jv.JVStatus())
 
@@ -907,6 +914,279 @@ def _next_seq(out_dir: Path, record_types) -> int:
 
 
 # ---------------------------------------------------------------------------
+# オッズ（O1〜O6）の取得：確定オッズ（蓄積系 RACE）と速報オッズ（JVRTOpen）
+# ---------------------------------------------------------------------------
+def _odds_buffer() -> int:
+    from . import odds
+    return max(odds.RECORD_LENGTHS.values()) + 16          # O6（3連単）83,285 バイトが入る大きさ
+
+
+def _odds_buffer_for(record_type: str) -> int:
+    """そのファイルの2件目以降に使うバッファ。1ファイル = 1レコード種別なので、種別に合わせて小さくする
+    （JVGets はバッファの大きさにほぼ比例して時間がかかる：約 0.5ms / 1KB。BUFFER_SIZE の説明を参照）。"""
+    from . import odds
+    return odds.RECORD_LENGTHS.get(record_type, _odds_buffer() - 16) + 16
+
+
+@dataclass
+class OddsFetchResult:
+    fromtime: str
+    option: int
+    open_code: int = 0
+    read_count: int = 0
+    download_count: int = 0
+    last_file_timestamp: str = ""
+    records: dict = field(default_factory=dict)
+    saved: int = 0
+    dropped: int = 0
+    truncated: int = 0
+    skipped_files: int = 0
+    resumed_files: int = 0
+    paths: list = field(default_factory=list)
+    seconds: float = 0.0
+
+    def summary(self) -> str:
+        return (f"オッズの取得: JVOpen={self.open_code} 読込ファイル={self.read_count} "
+                f"ダウンロード={self.download_count} 最新ファイル時刻={self.last_file_timestamp}\n"
+                f"  読んだレコード {self.records}  保存 {self.saved:,} / 対象外 {self.dropped:,}"
+                f"  読み飛ばしたファイル {self.skipped_files:,}  再開で飛ばしたファイル {self.resumed_files:,}\n"
+                f"  切れていたレコード {self.truncated}（0 のはず）  {self.seconds:.0f}秒  保存ファイル {len(self.paths)}")
+
+
+def fetch_odds(fromtime: str | None = None, option: int = 1, out_dir: str | os.PathLike | None = None,
+               types: tuple[str, ...] | None = None, targets=None, kubun=None,
+               client: JVLinkClient | None = None, sid: str = "UNKNOWN",
+               retry_sleep_sec: float = 1.0, max_retry_sec: float = 600, max_reopen: int = 3,
+               reopen_wait_sec: float = 10.0, sleep=time.sleep, log=print,
+               flush_every: int = 500) -> OddsFetchResult:
+    """蓄積系 RACE から確定オッズ（O1〜O6）だけを読んで data/jvlink/odds/ に保存する。
+
+    いつもの fetch（RA/SE/HR）は変えずに、これを別に実行する。fetch で JV-Link がすでにダウンロードした
+    ファイルは手元にあるので、もう一度開いてもダウンロードはほとんど発生しない（読み直すだけ）。
+    オッズ以外のファイルは先頭の1件を見て JVSkip で飛ばす。
+
+    fromtime : 省略時は、前回の fetch-odds の最新ファイル時刻（初回は前回の fetch の開始時刻）
+    targets  : レースID の集合を渡すと、そのレースだけ保存する（過去分の取り直しで容量を抑える）
+    kubun    : 保存するデータ区分（既定は確定オッズ 4・5）
+    中断しても同じコマンドで続きから読む（読み終えたファイルの記録 progress_RACE_ODDS_*）。
+    """
+    from . import odds
+
+    out_dir = Path(out_dir or config.JV_DATA_DIR)
+    types = set(types or odds.DEFAULT_TYPES)
+    state = load_state(out_dir)
+    if fromtime is None:
+        fromtime = (state.get("ODDS", {}).get("last_file_timestamp")
+                    or state.get("RACE", {}).get("fromtime")
+                    or (datetime.now() - timedelta(days=30)).strftime("%Y%m%d000000"))
+    big = _odds_buffer()
+    client = client or JVLinkClient(buffer_size=big)
+    client.buffer_size = big
+    writer = odds.OddsWriter(odds.odds_dir(out_dir), label=f"opt{option}",
+                             race_filter=targets, kubun_filter=kubun or odds.FINAL_KUBUN)
+    progress = Progress(out_dir, "RACE_ODDS", option, fromtime)
+    if progress.done:
+        log(f"前回の続きから再開します（読み終えたファイル {len(progress.done)} 個を飛ばす）")
+    result = OddsFetchResult(fromtime, option)
+    started = time.time()
+    pending: list[str] = []            # 書き出し前に読み終えたファイル（書き出してから「読み終えた」と記録する）
+
+    def flush():
+        result.paths += writer.flush()
+        for f in pending:
+            progress.mark(f)
+        pending.clear()
+
+    client.init(sid)
+    try:
+        attempt = 0
+        while True:
+            try:
+                _read_odds(client, fromtime, option, types, writer, progress, pending, result, flush,
+                           retry_sleep_sec, max_retry_sec, sleep, log, flush_every, big)
+                break
+            except JVLinkError as e:
+                if e.code not in REOPEN_CODES or attempt >= max_reopen:
+                    raise
+                attempt += 1
+                log(f"  {e}\n  → JVClose して開き直します（{attempt}/{max_reopen}回目）")
+                flush()
+                client.close()
+                sleep(reopen_wait_sec)
+        flush()
+        result.saved, result.dropped = writer.kept, writer.dropped
+        if result.open_code != -1:
+            st = load_state(out_dir)
+            st["ODDS"] = {"last_file_timestamp": result.last_file_timestamp or fromtime,
+                          "fetched_at": datetime.now().isoformat(timespec="seconds"),
+                          "fromtime": fromtime, "option": option}
+            out_dir.mkdir(parents=True, exist_ok=True)
+            _state_path(out_dir).write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+            progress.clear()
+        return result
+    except KeyboardInterrupt:
+        log("\n中断を受け付けました（Ctrl+C）。読めた分を保存して JVClose します…")
+        raise
+    finally:
+        with _ignore_ctrl_c():
+            try:
+                flush()
+            except Exception as e:
+                log(f"  オッズの書き出しに失敗: {e}")
+            client.close()
+            result.seconds = time.time() - started
+
+
+def _read_odds(client, fromtime, option, types, writer, progress, pending, result, flush,
+               retry_sleep_sec, max_retry_sec, sleep, log, flush_every, big):
+    from . import odds
+
+    log(f"JVOpen('RACE', {fromtime!r}, option={option})  ※ オッズ（{', '.join(sorted(types))}）だけ保存")
+    opened = client.open("RACE", fromtime, option)
+    result.open_code = opened.code
+    result.read_count, result.download_count = opened.read_count, opened.download_count
+    result.last_file_timestamp = opened.last_file_timestamp
+    if opened.code == -1:
+        log("該当データなし（エラーではありません）")
+        return
+    if opened.code < 0:
+        raise JVLinkError("JVOpen", opened.code, ERROR_ADVICE.get(opened.code, ""))
+    log(f"  読込対象ファイル {opened.read_count} / ダウンロード {opened.download_count}")
+    wait_for_download(client, opened.download_count, sleep=sleep, log=log)
+    current, m3, waited, since_flush = "", 0, 0.0, 0
+    while True:
+        code, raw, fname = client.gets()
+        if code > 0:
+            m3, waited = 0, 0.0
+            if fname != current:
+                if current:
+                    pending.append(current)
+                current = fname
+            if fname in progress:
+                result.resumed_files += 1
+                client.skip()
+                current = ""
+                client.buffer_size = big
+                continue
+            rt = raw[:2].decode("ascii", errors="replace")
+            if rt not in types:
+                result.skipped_files += 1
+                client.skip()
+                pending.append(fname)
+                current = ""
+                client.buffer_size = big
+                continue
+            client.buffer_size = _odds_buffer_for(rt)      # このファイルの2件目以降は小さいバッファで
+            result.records[rt] = result.records.get(rt, 0) + 1
+            if len(raw) < odds.RECORD_LENGTHS[rt] - 2:
+                result.truncated += 1
+                continue
+            rec = odds.parse_odds(raw)
+            if rec is not None:
+                writer.add(rec)
+                since_flush += 1
+            if since_flush >= flush_every:
+                flush()
+                since_flush = 0
+        elif code == -1:
+            if current:
+                pending.append(current)
+            current = ""
+            client.buffer_size = big                       # 次のファイルの種別は分からないので大きく戻す
+        elif code == 0:
+            if current:
+                pending.append(current)
+            return
+        elif code == -3:
+            if waited >= max_retry_sec:
+                raise JVLinkError("JVGets", code, f"{max_retry_sec:.0f} 秒待ってもダウンロードが終わりません")
+            wait = min(0.05 * (2 ** m3), retry_sleep_sec)
+            m3 += 1
+            sleep(wait)
+            waited += wait
+        elif code in (-402, -403):
+            client.delete_file(fname)
+            raise JVLinkError("JVGets", code, ERROR_ADVICE[code] + f"（{fname}）")
+        else:
+            raise JVLinkError("JVGets", code, ERROR_ADVICE.get(code, ""))
+
+
+def race_keys_for_date(date: str, out_dir: str | os.PathLike | None = None, graded_only: bool = True,
+                       race_no: int | None = None) -> list[tuple[str, str]]:
+    """その日のレースの JVRTOpen 用キー "YYYYMMDDJJKKHHRR" と 12桁のレースID（RA.csv の出馬表・成績から）。"""
+    from . import jvmap
+
+    raw = jvmap.load_raw(out_dir, record_types=("RA",))
+    ra = jvmap.central_only(jvmap.dedupe_records(raw["RA"]))
+    ra = ra.loc[(ra["id.Year"] + ra["id.MonthDay"]) == date]
+    if graded_only:
+        ra = ra.loc[ra["GradeCD"].astype(str).str.strip().isin({"A", "B", "C", "D"})]
+    if race_no is not None:
+        ra = ra.loc[ra["id.RaceNum"].astype(int) == race_no]
+    keys = (ra["id.Year"] + ra["id.MonthDay"] + ra["id.JyoCD"] + ra["id.Kaiji"].str.zfill(2)
+            + ra["id.Nichiji"].str.zfill(2) + ra["id.RaceNum"].str.zfill(2))
+    return list(zip(keys, jvmap.make_race_id(ra)))
+
+
+def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.PathLike | None = None,
+                  date: str = "", client: JVLinkClient | None = None, sid: str = "UNKNOWN",
+                  sleep=time.sleep, log=print, max_wait_sec: float = 60) -> dict:
+    """速報オッズ（JVRTOpen）をレースごとに取り、data/jvlink/odds/rt/<日付>/ に保存する。
+
+    何回実行してもよい（実行するたびに、その時点のオッズが「取得時刻」つきで別のファイルに残る）。
+    データ区分は 1:中間 / 2:前日売最終 / 3:最終 / 4:確定。発表月日時分は中間オッズのときだけ入る。
+    """
+    from . import odds
+
+    out_dir = Path(out_dir or config.JV_DATA_DIR)
+    client = client or JVLinkClient(buffer_size=_odds_buffer())
+    client.buffer_size = _odds_buffer()
+    writer = odds.OddsWriter(odds.odds_dir(out_dir) / "rt" / (date or datetime.now().strftime("%Y%m%d")),
+                             label=dataspec, kubun_filter=None)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    counts = {"レース": 0, "データなし": 0, "エラー": 0, "レコード": 0}
+    client.init(sid)
+    for key in keys:
+        code = client.rt_open(dataspec, key)
+        if code == -1:
+            counts["データなし"] += 1
+            log(f"  {key}: データなし（まだ発売前・提供期間外など）")
+            client.close()
+            continue
+        if code < 0:
+            counts["エラー"] += 1
+            log(f"  {key}: JVRTOpen エラー {code} {ERROR_ADVICE.get(code, '')}")
+            client.close()
+            continue
+        n, waited = 0, 0.0
+        while True:
+            c, raw, _ = client.gets()
+            if c > 0:
+                rec = odds.parse_odds(raw)
+                if rec is not None:
+                    writer.add(rec, fetched_at=now)
+                    n += 1
+            elif c == -1:
+                continue
+            elif c == 0:
+                break
+            elif c == -3 and waited < max_wait_sec:
+                sleep(0.2)
+                waited += 0.2
+            else:
+                counts["エラー"] += 1
+                log(f"  {key}: JVGets {c}")
+                break
+        client.close()
+        counts["レース"] += 1
+        counts["レコード"] += n
+        log(f"  {key}: {n} レコード")
+    counts["保存ファイル"] = [str(p) for p in writer.flush()]
+    counts["取得時刻"] = now
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # コマンドライン（Windows で 1 コマンドずつ確認するため）
 # ---------------------------------------------------------------------------
 def _cmd_check(args) -> int:
@@ -1019,6 +1299,46 @@ def _cmd_summary(args) -> int:
     return 0
 
 
+def _cmd_fetch_odds(args) -> int:
+    from . import odds
+    targets = None
+    if args.targets:
+        import pandas as pd
+        targets = set(pd.read_csv(args.targets, dtype=str, encoding="utf-8-sig")["レースID"].astype(str))
+        print(f"保存するレースを {len(targets):,} に絞ります（{args.targets}）")
+    types = tuple(t.strip() for t in args.types.split(",") if t.strip()) if args.types else None
+    try:
+        result = fetch_odds(fromtime=args.fromtime, option=args.option, out_dir=args.out,
+                            types=types, targets=targets)
+    except KeyboardInterrupt:
+        return 130
+    print(result.summary())
+    print(odds.summary(args.out).to_string(index=False))
+    return 0
+
+
+def _cmd_rt_odds(args) -> int:
+    date = args.date or datetime.now().strftime("%Y%m%d")
+    pairs = race_keys_for_date(date, args.out, graded_only=not args.all, race_no=args.race)
+    if not pairs:
+        print(f"{date} の対象レースが RA.csv にありません（先に fetch --option 1 で出馬表を取ってください）")
+        return 1
+    print(f"{date} の {len(pairs)} レースの速報オッズ（{args.spec}）を取得します")
+    counts = fetch_rt_odds([k for k, _ in pairs], dataspec=args.spec, out_dir=args.out, date=date)
+    print(f"取得時刻 {counts['取得時刻']}  レース {counts['レース']} / データなし {counts['データなし']} / "
+          f"エラー {counts['エラー']} / レコード {counts['レコード']}")
+    for p in counts["保存ファイル"]:
+        print(f"  保存: {p}")
+    return 0
+
+
+def _cmd_odds_summary(args) -> int:
+    from . import odds
+    t = odds.summary(args.out)
+    print("保存した確定オッズはありません" if t.empty else t.to_string(index=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="py -m src.jvlink", description="JV-Link からの取得")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1051,6 +1371,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--profile", action="store_true", help="cProfile で関数ごとの時間も出す")
     p.add_argument("--out", default=None)
     p.set_defaults(func=_cmd_bench)
+
+    p = sub.add_parser("fetch-odds", help="確定オッズ（O1〜O6）を取得して data/jvlink/odds/ に保存（fetch とは別）")
+    p.add_argument("--from", dest="fromtime", default=None,
+                   help="YYYYMMDDhhmmss（省略時は前回の fetch-odds の続き。初回は前回の fetch の開始時刻）")
+    p.add_argument("--option", type=int, default=1, choices=[1, 3, 4],
+                   help="1=通常（毎週）/ 4=セットアップ（過去分の取り直し）")
+    p.add_argument("--types", default=None, help="保存する種別（既定 O1,O2,O4,O5,O6。ワイド O3 は既定では保存しない）")
+    p.add_argument("--targets", default=None, help="このCSV（列 レースID）のレースだけ保存する")
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=_cmd_fetch_odds)
+
+    p = sub.add_parser("rt-odds", help="当日の速報オッズ（JVRTOpen 0B30 など）を取って保存")
+    p.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
+    p.add_argument("--race", type=int, default=None, help="レース番号だけに絞る（例 11）")
+    p.add_argument("--all", action="store_true", help="重賞以外も取る（既定は重賞だけ）")
+    p.add_argument("--spec", default="0B30",
+                   help="0B30=全券種（既定）/ 0B31=単複枠 / 0B32=馬連 / 0B34=馬単 / 0B35=3連複 / 0B36=3連単")
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=_cmd_rt_odds)
+
+    p = sub.add_parser("odds-summary", help="保存した確定オッズの件数・容量")
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=_cmd_odds_summary)
 
     p = sub.add_parser("summary", help="保存済み CSV の中身を集計して表示")
     p.add_argument("--out", default=None)
