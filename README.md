@@ -142,6 +142,8 @@ py -m src.v8 bets            # 買い目の選び方
 py -m src.v8 trackbias       # 当日の馬場の傾向
 py -m src.v8 tilt            # 市場の確率に当日・開催の傾向で傾きをつける（3b+3c も）
 py -m src.v8 stakes          # 券種混合の金額の余裕・スマッピーの点数の上限
+py -m src.v8 rating          # v8c 馬のレーティング（逐次の Plackett-Luce）を市場の確率への傾きに
+py -m src.v8 final-compare   # 今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
 ```
 
 確定オッズの保存・当日の速報オッズ（任意。いつもの fetch は変わらない）:

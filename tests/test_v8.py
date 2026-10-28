@@ -656,6 +656,45 @@ def test_cli_tilt(v8_env, capsys):
     t = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", encoding="utf-8-sig", dtype={"レースID": str})
     assert (t["区分"] == "平場サンプル").sum() == 50 and (t["区分"] == "重賞").sum() > 0
 
+def test_cli_rating_and_final_compare(v8_env, capsys):
+    from src import v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "rating", "--sample", "30"]) == 0
+    out = capsys.readouterr().out
+    assert "θ×SD（レーティング_相対）" in out and "θ（レーティング_伸び）" in out
+    assert "レーティングだけ（μ）" in out and "平場で比べた案: 2 個" in out
+    assert v8.FAVORITE_PLAN in out and "差 = こちら − 市場＋当日の傾向（3b）" in out
+    summ = pd.read_csv(v8_env.parent / "v8" / "rating_plan.csv", encoding="utf-8-sig")
+    assert set(summ["確率"]) == {n for n, _ in v8.RATING_SOURCES}
+    assert (summ["平均点数"] <= v8.FAVORITE_LIMIT).all()
+    paired = pd.read_csv(v8_env.parent / "v8" / "rating_plan_paired.csv", encoding="utf-8-sig")
+    assert set(paired["比べる相手"]) == {"市場だけ", "市場＋当日の傾向（3b）"}
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "final-compare", "--sample", "20"]) == 0
+    out = capsys.readouterr().out
+    assert "保存済みの傾きの表を使います" in out and "fold ごと" in out
+    fc = pd.read_csv(v8_env.parent / "v8" / "final_compare.csv", encoding="utf-8-sig")
+    assert set(fc["確率"]) == {n for n, _ in v8.FINAL_SOURCES} and len(v8.FINAL_SOURCES) == 6
+    assert fc["レース数"].nunique() == 1                      # どの確率も同じレースで比べている
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "final-compare", "--sample", "10",
+                    "--no-rating"]) == 0
+    fc = pd.read_csv(v8_env.parent / "v8" / "final_compare.csv", encoding="utf-8-sig")
+    assert set(fc["確率"]) == {n for n, _ in v8.TILT_SOURCES}
+
+
+def test_evaluate_plan_matches_stakes(v8_env):
+    """本命の買い方の評価（evaluate_plan）が、stakes の同じ条件と同じ結果になる。"""
+    from src import v8
+    args = v8.main.__globals__["argparse"].Namespace(folds=None, rounds=10, refresh=False)
+    ds = jvmap.build_dataset(v8_env)
+    base = experiment.load_or_run(ds, "base", folds=validate.V5_FOLDS, rounds=10)
+    merged, _, _ = v8.tilt_tables(args, ds, base, verbose=False)
+    disc_q = v8.fold_discounts(merged, "市場確率", base.table)
+    a = v8.evaluate_plan(merged, ds.payout_df, [("3b", "tilt3b")], disc_q, sample=15, verbose=False)
+    b = v8.evaluate_stakes(merged, ds.payout_df, "tilt3b", disc_q, sample=15, margins=(1.4,), limits=(15,),
+                           verbose=False)
+    assert len(a) == len(b) > 0
+    assert np.allclose(a["払戻"], b["払戻"]) and np.allclose(a["投資"], b["投資"])
+
+
 def test_conditional_logit_with_all_zero_column():
     """全部 0 の列があっても、他の列の係数はちゃんと推定される（特異行列で止まらない）。"""
     rng = np.random.default_rng(3)

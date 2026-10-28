@@ -9,6 +9,8 @@
     py -m src.v8 trackbias         3   当日の馬場の傾向（平場の後半のレース）
     py -m src.v8 tilt              3b・3c  市場の確率に当日の傾向・開催の進み具合の傾向で傾きをつける（3b+3c も）
     py -m src.v8 stakes            券種混合の金額の余裕・スマッピーの点数の上限
+    py -m src.v8 rating            v8c レーティング（Plackett-Luce を逐次で）を市場の確率への傾きに
+    py -m src.v8 final-compare     今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
     py -m src.v8 odds-targets      過去の確定オッズを取り直すレースの一覧（重賞＋平場の検証用5,000）
     py -m src.v8 odds-drift        速報オッズ（rt-odds）と確定オッズ（fetch-odds）のずれ
 
@@ -638,13 +640,34 @@ def _cmd_trackbias(args) -> int:
 S4C = STRATEGIES[4]
 
 
+def rating_frame(ds, verbose: bool = True) -> pd.DataFrame:
+    """v8c のレーティング（1986年から順番に。data/v8/ratings.pkl に保存して使い回す）。"""
+    from . import preprocess, ratings
+    rr = preprocess.basic_clean(ds.race_result)
+    key = hashlib.sha1("|".join(["ratings-v1", str(len(rr)), str(rr["レースID"].nunique()),
+                                 str(rr["レース日付"].min()), str(rr["レース日付"].max())]).encode()).hexdigest()
+    path = experiment.v8_dir() / "ratings.pkl"
+    if path.exists():
+        saved = pd.read_pickle(path)
+        if saved.get("key") == key:
+            return saved["table"]
+    if verbose:
+        print(f"[v8] レーティングを計算中（{rr['レースID'].nunique():,} レースを日付順に。数分）...", flush=True)
+    t0 = time.perf_counter()
+    table = ratings.compute_ratings(rr, verbose=verbose)
+    if verbose:
+        print(f"[v8] レーティング完了: {time.perf_counter() - t0:.0f}秒", flush=True)
+    pd.to_pickle({"key": key, "table": table}, path)
+    return table
+
+
 def tilt_tables(args, ds, base: experiment.OOF, verbose: bool = True):
-    """市場だけ / 3b / 3c / 3b+3c の確率（fold 2 以降）と係数。data/v8/tilt_tables.pkl に保存して使い回す。"""
-    from . import tilt
+    """市場だけ / 3b / 3c / 3b+3c / R / 3b+R の確率（fold 2 以降）と係数。data/v8/tilt_tables.pkl に保存して使い回す。"""
+    from . import ratings, tilt
     path = experiment.v8_dir() / "tilt_tables.pkl"
     meta = experiment.v8_dir() / "oof_base.json"
     pkl = experiment.v8_dir() / "oof_base.pkl"
-    key = hashlib.sha1("|".join(["tilt-v2", str(args.folds), str(args.rounds),
+    key = hashlib.sha1("|".join(["tilt-v3", str(args.folds), str(args.rounds),
                                  meta.read_text(encoding="utf-8") if meta.exists() else "",
                                  str(pkl.stat().st_mtime_ns) if pkl.exists() else ""]).encode()).hexdigest()
     if path.exists() and not args.refresh:
@@ -656,13 +679,16 @@ def tilt_tables(args, ds, base: experiment.OOF, verbose: bool = True):
     if verbose:
         print("[v8] 傾向の項を作成し、係数を推定中 ...", flush=True)
     terms = tilt.build_terms(ds)
-    t = base.table.merge(terms, on=["レースID", "血統登録番号"], how="left")
-    out3b, coef3b = tilt.tilt_walk_forward(t, tilt.DAY_TERMS, "tilt3b")
-    out3c, coef3c = tilt.tilt_walk_forward(t, tilt.MEETING_TERMS, "tilt3c")
-    out3bc, coef3bc = tilt.tilt_walk_forward(t, tilt.DAY_TERMS + tilt.MEETING_TERMS, "tilt3bc")
     k = ["レースID", "血統登録番号"]
-    merged = out3b.merge(out3c[k + ["tilt3c"]], on=k, how="inner").merge(out3bc[k + ["tilt3bc"]], on=k, how="inner")
-    coefs = {"3b": coef3b, "3c": coef3c, "3b+3c": coef3bc}
+    rt = rating_frame(ds, verbose=verbose)[k + ["μ", "σ", "出走数"] + ratings.RATING_TERMS]
+    t = base.table.merge(terms, on=k, how="left").merge(rt, on=k, how="left")
+    specs = [("3b", tilt.DAY_TERMS, "tilt3b"), ("3c", tilt.MEETING_TERMS, "tilt3c"),
+             ("3b+3c", tilt.DAY_TERMS + tilt.MEETING_TERMS, "tilt3bc"),
+             ("R", ratings.RATING_TERMS, "tiltR"), ("3b+R", tilt.DAY_TERMS + ratings.RATING_TERMS, "tilt3bR")]
+    merged, coefs = None, {}
+    for name, cols, out_col in specs:
+        out, coefs[name] = tilt.tilt_walk_forward(t, cols, out_col)
+        merged = out if merged is None else merged.merge(out[k + [out_col]], on=k, how="inner")
     pd.to_pickle({"key": key, "merged": merged, "coefs": coefs, "full": t}, path)
     return merged, coefs, t
 
@@ -753,10 +779,10 @@ def _best_tilt_source(args) -> tuple[str, str]:
     return best, dict(TILT_SOURCES)[best]
 
 
-def evaluate_stakes(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q: dict, sample: int = 0,
-                    seed: int = 0, margins=MARGINS, limits=POINT_LIMITS, verbose: bool = True) -> pd.DataFrame:
-    """券種混合（S4）を、金額の余裕 × 点数の上限 の組み合わせで実際の払戻で評価する（1レース・1条件1行）。"""
-    flat = experiment.exploration_only(_flat(table), "金額の余裕・点数の上限")
+def _plan_races(table: pd.DataFrame, payout: pd.DataFrame, cols: list[str], disc_q: dict, sample: int, seed: int,
+                what: str, verbose: bool):
+    """平場（γ・δ のある fold）のレースを1つずつ：(レースID, fold, 馬番, 当たりの組, 市場の組の確率 Q, {列: (P, p)})。"""
+    flat = experiment.exploration_only(_flat(table), what)
     flat = flat.loc[flat["fold"].isin(set(disc_q))]
     rids = flat["レースID"].unique()
     if sample and len(rids) > sample:
@@ -764,24 +790,37 @@ def evaluate_stakes(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q:
         flat = flat.loc[flat["レースID"].isin(set(rids))]
     t, starts = market.race_slices(flat)
     pay = payout.set_index("レースID")
-    rows = []
+    t0, n_all = time.perf_counter(), len(starts) - 1
     for n_done, (a, b) in enumerate(zip(starts[:-1], starts[1:])):
+        if verbose and n_done and n_done % 1000 == 0:
+            left = (time.perf_counter() - t0) / n_done * (n_all - n_done)
+            print(f"    {n_done:,} / {n_all:,} レース（残り約 {left / 60:.0f} 分）", flush=True)
         rid = t["レースID"].iloc[a]
         if rid not in pay.index or b - a < 4:
             continue
         r = t.iloc[a:b]
         q = r["市場確率"].to_numpy(dtype="float64")
-        p = r[col].to_numpy(dtype="float64")
+        ps = {c: r[c].to_numpy(dtype="float64") for c in cols}
         posts = pd.to_numeric(r["馬番"], errors="coerce").to_numpy()
-        if not (np.isfinite(q).all() and (q > 0).all() and np.isfinite(p).all() and np.isfinite(posts).all()):
+        if not (np.isfinite(q).all() and (q > 0).all() and np.isfinite(posts).all()
+                and all(np.isfinite(p).all() for p in ps.values())):
             continue
-        posts = posts.astype(int)
         wins = bets.winning_combos(pay.loc[rid])
         if not wins["3連単"]:
             continue
         g, d, _ = disc_q[r["fold"].iloc[0]]
         Q = market.combo_probabilities(market.trifecta_tensor(q, g, d))
-        P = market.trifecta_tensor(p, g, d)
+        yield rid, r["fold"].iloc[0], posts.astype(int), wins, Q, {c: (market.trifecta_tensor(p, g, d), p)
+                                                                   for c, p in ps.items()}
+
+
+def evaluate_stakes(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q: dict, sample: int = 0,
+                    seed: int = 0, margins=MARGINS, limits=POINT_LIMITS, verbose: bool = True) -> pd.DataFrame:
+    """券種混合（S4）を、金額の余裕 × 点数の上限 の組み合わせで実際の払戻で評価する（1レース・1条件1行）。"""
+    rows = []
+    for rid, _, posts, wins, Q, ps in _plan_races(table, payout, [col], disc_q, sample, seed,
+                                                  "金額の余裕・点数の上限", verbose):
+        P, p = ps[col]
         for m in margins:
             for lim in limits:
                 plan = bets.mixed(P, Q, p, posts, margin=m, max_points=lim)
@@ -789,9 +828,44 @@ def evaluate_stakes(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q:
                              "条件": f"余裕×{m:.1f}・" + ("上限なし" if lim is None else f"{lim}点まで"),
                              "投資": plan.invest, "払戻": bets.realized(plan, wins),
                              "予測の達成確率": plan.predicted, "点数": len(plan.bets)})
-        if verbose and (n_done + 1) % 1000 == 0:
-            print(f"    {n_done + 1:,} / {len(starts) - 1:,} レース", flush=True)
     return pd.DataFrame(rows)
+
+
+# 今の本命の買い方（v8b の stakes の結果から）：券種混合・金額の余裕 ×1.4・スマッピー 15点まで
+FAVORITE_MARGIN = 1.4
+FAVORITE_LIMIT = 15
+FAVORITE_PLAN = f"券種混合・金額の余裕×{FAVORITE_MARGIN:.1f}・{FAVORITE_LIMIT}点まで"
+
+
+def evaluate_plan(table: pd.DataFrame, payout: pd.DataFrame, sources: list[tuple[str, str]], disc_q: dict,
+                  sample: int = 0, seed: int = 0, margin: float = FAVORITE_MARGIN, limit: int | None = FAVORITE_LIMIT,
+                  verbose: bool = True) -> pd.DataFrame:
+    """今の本命の買い方を、確率の出し方ごとに同じレースで実際の払戻で評価する（1レース・1確率1行）。"""
+    rows = []
+    for rid, fold, posts, wins, Q, ps in _plan_races(table, payout, [c for _, c in sources], disc_q, sample, seed,
+                                                     FAVORITE_PLAN, verbose):
+        for name, col in sources:
+            P, p = ps[col]
+            plan = bets.mixed(P, Q, p, posts, margin=margin, max_points=limit)
+            rows.append({"レースID": rid, "fold": fold, "確率": name, "投資": plan.invest,
+                         "払戻": bets.realized(plan, wins), "予測の達成確率": plan.predicted, "点数": len(plan.bets)})
+    return pd.DataFrame(rows)
+
+
+def plan_summary(rows: pd.DataFrame, by=("確率",), target: float = bets.TARGET) -> pd.DataFrame:
+    out = []
+    for key, g in rows.groupby(list(by), sort=False):
+        key = key if isinstance(key, tuple) else (key,)
+        n = len(g)
+        ach = int((g["払戻"] >= target).sum())
+        lo, hi = market.wilson(ach, n)
+        pred = float(g["予測の達成確率"].mean())
+        out.append({**dict(zip(by, key)), "レース数": n, "的中率": float((g["払戻"] > 0).mean()),
+                    "達成率": ach / n, "下限": lo, "上限": hi, "予測の達成確率（平均）": pred,
+                    "予測 − 実際": pred - ach / n, "平均点数": float(g["点数"].mean()),
+                    "平均投資": float(g["投資"].mean()),
+                    "回収率": float(g["払戻"].sum() / g["投資"].sum()) if g["投資"].sum() else np.nan})
+    return pd.DataFrame(out)
 
 
 def stakes_summary(rows: pd.DataFrame, target: float = bets.TARGET) -> pd.DataFrame:
@@ -836,6 +910,111 @@ def _cmd_stakes(args) -> int:
     _save(args, summ, "stakes_summary")
     _save(args, paired, "stakes_paired")
     _trials_note()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v8c レーティング（能力が時間とともに変わる）を市場の確率への傾きに
+# ---------------------------------------------------------------------------
+RATING_SOURCES = [("市場だけ", "市場確率"), ("市場＋レーティング", "tiltR"), ("市場＋当日の傾向（3b）", "tilt3b"),
+                  ("市場＋3b＋レーティング", "tilt3bR")]
+FINAL_SOURCES = TILT_SOURCES + RATING_SOURCES[1:2] + RATING_SOURCES[3:]
+
+
+def _coef_with_sd(coef: pd.DataFrame, sd: pd.Series) -> pd.DataFrame:
+    """係数（fold ごと）に、θ × 標準偏差（項が1標準偏差変わったときの log の変化）の列を足す。"""
+    c = coef.copy()
+    for term, s in sd.items():
+        col = f"θ（{term}）"
+        if col in c.columns:
+            c[f"θ×SD（{term}）"] = c[col] * s
+    return c
+
+
+def _paired_report(rows: pd.DataFrame, bases: list[str]) -> pd.DataFrame:
+    out = []
+    for b in bases:
+        p = paired_vs(rows, b)
+        print(f"\n=== {FAVORITE_PLAN} の達成率の差（同じレースの対応のある比較。差 = こちら − {b}） ===")
+        _show(p, pct=("差",))
+        out.append(p.assign(比べる相手=b))
+    return pd.concat(out, ignore_index=True)
+
+
+def _cmd_rating(args) -> int:
+    from . import ratings, tilt
+    clock = _Clock()
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    merged, coefs, full = tilt_tables(args, ds, base)
+    TRIALS.extend(["R 市場＋レーティング（相対・伸び・不確かさ）で傾き", "3b+R 市場＋当日の傾向＋レーティングで傾き"])
+    sd = _flat(full)[tilt.DAY_TERMS + ratings.RATING_TERMS].astype("float64").std()
+    print("\n=== 係数（その fold より前の fold の平場で推定）。θ×SD = 項が1標準偏差変わったときの log の変化"
+          "（0.05 で約5%の確率の差）。θ が 0 に近ければ市場は織り込み済み ===")
+    for name in ("R", "3b+R"):
+        print(f"--- {name} ---")
+        _show(_coef_with_sd(coefs[name], sd))
+    print("    項の標準偏差（平場）: " + " / ".join(f"{k} {v:.4f}" for k, v in sd.items()))
+    flat = experiment.exploration_only(_flat(merged), "レーティング")
+    rows = [market.summary_row(flat, c, n) for n, c in RATING_SOURCES]
+    print("\n=== 平場（fold 2 以降）：log-loss・AUC・キャリブレーション誤差 ===")
+    _show(pd.DataFrame(rows))
+    print("\n=== 参考：1着の予測の AUC（平場・fold 2 以降。レーティングだけ＝傾きにせず、そのまま順位づけ） ===")
+    ref = [{"予測": "今のモデル（base）", "AUC": market.auc(flat["win"], flat["prob"])},
+           {"予測": "市場（単勝オッズ）", "AUC": market.auc(flat["win"], flat["市場確率"])},
+           {"予測": "レーティングだけ（μ）", "AUC": market.auc(flat["win"], flat["μ"])},
+           {"予測": "レーティングだけ（μ − 2σ。不確かな馬を割り引く）",
+            "AUC": market.auc(flat["win"], flat["μ"] - 2 * flat["σ"])}]
+    _show(pd.DataFrame(ref))
+    print("\n=== キャリブレーション（全レース。重賞を含む・達成率ではない） ===")
+    for n, c in (RATING_SOURCES[1], RATING_SOURCES[3]):
+        print(f"--- {n} ---")
+        _show(market.calibration_table(merged, c), pct=("平均", "勝率"))
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+    clock.step(f"{FAVORITE_PLAN} を計算中（平場、最大 {args.sample:,} レース × {len(RATING_SOURCES)} 通り）...")
+    plan_rows = evaluate_plan(merged, ds.payout_df, RATING_SOURCES, disc_q, sample=args.sample)
+    clock.step("完了\n")
+    summ = plan_summary(plan_rows)
+    print(f"=== 平場：{FAVORITE_PLAN}（予算 12,000円・基準 50,000円。配当は市場の確率から推定、評価は実際の払戻） ===")
+    _show(summ, pct=("率", "限", "確率（", "予測 −"), money=("投資",))
+    paired = _paired_report(plan_rows, ["市場だけ", "市場＋当日の傾向（3b）"])
+    _save(args, pd.DataFrame(rows), "rating_compare")
+    _save(args, pd.DataFrame(ref), "rating_auc")
+    _save(args, pd.concat([_coef_with_sd(coefs[n], sd).assign(案=n) for n in ("R", "3b+R")], ignore_index=True),
+          "rating_coefs")
+    _save(args, summ, "rating_plan")
+    _save(args, paired, "rating_plan_paired")
+    _trials_note()
+    return 0
+
+
+def _cmd_final_compare(args) -> int:
+    clock = _Clock()
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    merged, _, _ = tilt_tables(args, ds, base)
+    sources = FINAL_SOURCES if args.with_rating else TILT_SOURCES
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+    n = merged.loc[~merged["重賞"] & merged["fold"].isin(set(disc_q)), "レースID"].nunique()
+    n = min(n, args.sample) if args.sample else n
+    clock.step(f"{FAVORITE_PLAN} を計算中（平場 {n:,} レース × {len(sources)} 通り）...")
+    rows = evaluate_plan(merged, ds.payout_df, sources, disc_q, sample=args.sample)
+    clock.step("完了\n")
+    print("[記録] 新しい案ではなく、これまでに試した案を全レースで見直すだけ（試した案の数は増やさない）")
+    summ = plan_summary(rows)
+    print(f"\n=== 平場の全レース：{FAVORITE_PLAN}（予算 12,000円・基準 50,000円） ===")
+    _show(summ, pct=("率", "限", "確率（", "予測 −"), money=("投資",))
+    by_fold = plan_summary(rows, by=("fold", "確率"))
+    print("\n=== fold ごと（年によって順位が入れ替わらないか） ===")
+    _show(by_fold[["fold", "確率", "レース数", "達成率", "下限", "上限", "予測の達成確率（平均）"]],
+          pct=("率", "限", "確率（"))
+    bases = ["市場だけ", "市場＋当日の傾向（3b）"]
+    paired = _paired_report(rows, bases)
+    _save(args, summ, "final_compare")
+    _save(args, by_fold, "final_compare_by_fold")
+    _save(args, paired, "final_compare_paired")
     return 0
 
 
@@ -970,6 +1149,14 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--sample", type=int, default=5_000, help="平場のレース数（0 で全部）")
     q.add_argument("--source", default=None, help="確率（既定は tilt の S4c で一番良かったもの。例 tilt3bc）")
     q.set_defaults(func=_cmd_stakes)
+    q = sub.add_parser("rating", help="v8c レーティングを市場の確率への傾きに（平場。今の本命の買い方で比べる）")
+    q.add_argument("--sample", type=int, default=5_000, help="達成率を計算する平場のレース数（0 で全部）")
+    q.set_defaults(func=_cmd_rating)
+    q = sub.add_parser("final-compare", help="市場だけ / 3b / 3c / 3b+3c / R / 3b+R を今の本命の買い方で（平場の全レース）")
+    q.add_argument("--sample", type=int, default=0, help="平場のレース数（既定 0 = 全部、約4万2千。数十分）")
+    q.add_argument("--no-rating", dest="with_rating", action="store_false",
+                   help="レーティングの版（R・3b+R）を入れない（4通りになり、時間は約2/3）")
+    q.set_defaults(func=_cmd_final_compare)
     args = parser.parse_args(argv)
     TRIALS.clear()
     return args.func(args)
