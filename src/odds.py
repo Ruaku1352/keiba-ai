@@ -173,6 +173,23 @@ def _load_files(paths) -> list[dict]:
     return out
 
 
+def select_versions(files: list[dict], race_ids=None, final_only: bool = True, latest: bool = True) -> pd.DataFrame:
+    """読むレースの版（1版1行。file・local = そのファイルの何番目のレースか）。
+
+    latest=True なら、同じレースの版から1つ（データ区分の優先度 → 作成日 → 取得順）。
+    """
+    races = pd.concat([pd.DataFrame({**{k: f[k] for k in RACE_KEYS}, "file": f["file"],
+                                     "local": np.arange(len(f["race_id"]))}) for f in files], ignore_index=True)
+    if final_only:
+        races = races.loc[races["kubun"].isin(FINAL_KUBUN)]
+    if race_ids is not None:
+        races = races.loc[races["race_id"].isin(set(race_ids))]
+    if latest and not races.empty:
+        races = races.assign(_pri=races["kubun"].map(KUBUN_PRIORITY).fillna(0))
+        races = races.sort_values(["race_id", "_pri", "make_date", "file", "seq"]).drop_duplicates("race_id", keep="last")
+    return races
+
+
 def load_odds(record_type: str, base: str | os.PathLike | None = None, race_ids=None,
               final_only: bool = True, latest: bool = True, directory=None) -> pd.DataFrame:
     """保存したオッズを読む。戻り値は1組1行（レースID・券種・データ区分・発表・取得時刻・組番・オッズ・人気）。
@@ -185,15 +202,7 @@ def load_odds(record_type: str, base: str | os.PathLike | None = None, race_ids=
     cols = ["レースID", "券種", "データ区分", "発表", "取得時刻", "組番", "オッズ", "人気"]
     if not files:
         return pd.DataFrame(columns=cols)
-    races = pd.concat([pd.DataFrame({**{k: f[k] for k in RACE_KEYS}, "file": f["file"],
-                                     "local": np.arange(len(f["race_id"]))}) for f in files], ignore_index=True)
-    if final_only:
-        races = races.loc[races["kubun"].isin(FINAL_KUBUN)]
-    if race_ids is not None:
-        races = races.loc[races["race_id"].isin(set(race_ids))]
-    if latest and not races.empty:
-        races = races.assign(_pri=races["kubun"].map(KUBUN_PRIORITY).fillna(0))
-        races = races.sort_values(["race_id", "_pri", "make_date", "file", "seq"]).drop_duplicates("race_id", keep="last")
+    races = select_versions(files, race_ids, final_only, latest)
     parts = []
     for f in files:
         local = races.loc[races["file"] == f["file"], "local"].to_numpy()

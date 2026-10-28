@@ -784,3 +784,121 @@ def test_odds_drift_against_final():
     t = v8.odds_drift(snaps, final, post)
     assert list(t["発走まで（分）"]) == [80.0, 20.0]
     assert t["±10%以内"].iloc[0] == pytest.approx(1.0) and t["±25%以内"].iloc[1] == pytest.approx(2 / 3)
+
+
+# ===========================================================================
+# v8d 本物の確定オッズ
+# ===========================================================================
+def _estimated_tables(Q):
+    return {k: np.where(Q[k] > 0, 100.0 * market.PAYOUT_RATE[k] / np.where(Q[k] > 0, Q[k], 1), np.nan)
+            for k in bets.KINDS}
+
+
+def test_mixed_with_odds_equal_to_estimate_is_unchanged():
+    """本物のオッズの表が推定の配当と同じなら、選ぶ買い目も予測の達成確率も同じ。"""
+    for seed in (1, 2, 3):
+        p, P, Q, posts = _race_tensors(seed=seed)
+        a = bets.mixed(P, Q, p, posts, margin=1.4, max_points=15)
+        b = bets.mixed(P, Q, p, posts, margin=1.4, max_points=15, odds=_estimated_tables(Q))
+        assert [(x.kind, x.combo, x.stake) for x in a.bets] == [(x.kind, x.combo, x.stake) for x in b.bets]
+        assert a.predicted == pytest.approx(b.predicted)
+
+
+def test_mixed_with_odds_skips_missing_and_uses_real_payout():
+    p, P, Q, posts = _race_tensors(seed=4)
+    T = _estimated_tables(Q)
+    T = {k: v * 2 for k, v in T.items()}                  # 本物は推定の2倍 → 金額は約半分で済む
+    a = bets.mixed(P, Q, p, posts, margin=1.0)
+    b = bets.mixed(P, Q, p, posts, margin=1.0, odds=T)
+    assert b.predicted >= a.predicted
+    T["3連単"][:] = np.nan                                  # オッズの無い組は買わない
+    c = bets.mixed(P, Q, p, posts, odds=T)
+    assert all(x.kind != "3連単" for x in c.bets)
+
+
+def _entry_from_tables(T, posts):
+    from src import realodds
+    entry = {}
+    n = len(posts)
+    for kind in realodds.KIND_TYPES:
+        combos = (list(itertools.permutations(range(n), 3)) if kind == "3連単" else
+                  list(itertools.combinations(range(n), 3)) if kind == "3連複" else
+                  list(itertools.permutations(range(n), 2)) if kind == "馬単" else
+                  list(itertools.combinations(range(n), 2)))
+        entry[kind] = (np.array([[posts[i] for i in c] for c in combos]),
+                       np.array([T[kind][c] for c in combos]))
+    return entry
+
+
+def test_payout_tables_and_ratio():
+    from src import realodds
+    p, P, Q, posts = _race_tensors(seed=5)
+    T = _estimated_tables(Q)
+    entry = _entry_from_tables(T, posts)
+    back = realodds.payout_tables(entry, posts)
+    for k in bets.KINDS:
+        assert np.allclose(back[k], T[k], equal_nan=True)
+    assert realodds.payout_tables({k: v for k, v in entry.items() if k != "馬連"}, posts) is None
+    s = realodds.RatioStats()
+    s.add(realodds.ratio_arrays(Q, back, P))
+    t = s.summary()
+    allrow = t.loc[t["本物のオッズ"] == "全部"]
+    assert np.allclose(allrow["推定÷本物（中央値）"], 1.0, atol=0.01) and np.allclose(allrow["±10%以内"], 1.0)
+    n = len(posts)
+    assert allrow.set_index("券種")["組の数"].to_dict() == {
+        "3連単": n * (n - 1) * (n - 2), "3連複": n * (n - 1) * (n - 2) // 6, "馬単": n * (n - 1), "馬連": n * (n - 1) // 2}
+    s2 = realodds.RatioStats()
+    s2.add(realodds.ratio_arrays(Q, {k: v / 1.5 for k, v in back.items()}, P))     # 本物が推定の 1/1.5
+    assert np.allclose(s2.summary()["推定÷本物（中央値）"], 1.5, atol=0.02)
+
+
+def test_cli_real_odds(v8_env, capsys):
+    """odds-targets の平場サンプルに合成の確定オッズを置いて、real-odds を最後まで通す。重賞のオッズは読まない。"""
+    from src import odds as odds_mod, realodds, v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "40"]) == 0
+    capsys.readouterr()
+    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    ds = jvmap.build_dataset(v8_env)
+    rr = ds.race_result.assign(レースID=ds.race_result["レースID"].astype(str))
+    pay = ds.payout_df.assign(レースID=ds.payout_df["レースID"].astype(str)).set_index("レースID")
+    rng = np.random.default_rng(0)
+    w = odds_mod.OddsWriter(odds_mod.odds_dir(v8_env), label="test")
+    rt_of = realodds.KIND_TYPES
+    for rid in targets["レースID"]:                     # 重賞にも置く（読まれないことを確かめる）
+        posts = np.sort(pd.to_numeric(rr.loc[rr["レースID"] == rid, "馬番"]).astype(int).to_numpy())
+        if len(posts) < 4:
+            continue
+        n = len(posts)
+        q = rng.dirichlet(np.ones(n))
+        Q = market.combo_probabilities(market.trifecta_tensor(q, 0.9, 0.8))
+        T = _estimated_tables(Q)
+        T = {k: v * rng.lognormal(0, 0.2, v.shape) for k, v in T.items()}
+        entry = _entry_from_tables(T, posts)
+        wins = bets.winning_combos(pay.loc[rid]) if rid in pay.index else {}
+        for kind, (horses, payv) in entry.items():
+            payv = payv.copy()
+            for combo, v in wins.get(kind, {}).items():   # 当たりの組は実際の払戻と同じにする
+                m = (np.sort(horses, axis=1) == np.sort(combo)).all(axis=1) if kind in ("3連複", "馬連") \
+                    else (horses == np.array(combo)).all(axis=1)
+                payv[m] = v
+            kumi = sum(horses[:, i] * 100 ** (horses.shape[1] - 1 - i) for i in range(horses.shape[1]))
+            w.add(odds_mod.OddsRecord(rt_of[kind], rid, rid[:8], "5", 20200101, "",
+                                      kumi.astype(np.int32), np.round(np.clip(np.nan_to_num(payv / 10), 0, 9_999_999)).astype(np.int32),
+                                      np.ones(len(kumi), np.int16)))
+    w.flush()
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "real-odds"]) == 0
+    out = capsys.readouterr().out
+    assert "推定した配当 ÷ 本物の確定オッズ" in out and "平場で比べた案: 4 個" in out
+    import re
+    hit, total = map(lambda x: int(x.replace(",", "")), re.search(r"一致: ([\d,]+) / ([\d,]+)", out).groups())
+    assert total > 0 and hit == total
+    summ = pd.read_csv(v8_env.parent / "v8" / "real_odds_summary.csv", encoding="utf-8-sig")
+    assert set(summ["条件"]) == {v8.ESTIMATED_COND} | {v8._real_cond(m) for m in v8.REAL_MARGINS}
+    assert summ["レース数"].nunique() == 1 and summ["レース数"].iloc[0] > 0
+    assert (summ["平均点数"] <= v8.FAVORITE_LIMIT).all()
+    # 予測の達成確率と比べるときに重賞を含めない：使ったのは平場サンプルだけ
+    ratio = pd.read_csv(v8_env.parent / "v8" / "real_odds_ratio.csv", encoding="utf-8-sig")
+    assert set(ratio["券種"]) == set(bets.KINDS)
+    paired = pd.read_csv(v8_env.parent / "v8" / "real_odds_paired.csv", encoding="utf-8-sig")
+    assert len(paired) == len(v8.REAL_MARGINS)

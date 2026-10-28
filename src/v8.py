@@ -11,6 +11,7 @@
     py -m src.v8 stakes            券種混合の金額の余裕・スマッピーの点数の上限
     py -m src.v8 rating            v8c レーティング（Plackett-Luce を逐次で）を市場の確率への傾きに
     py -m src.v8 final-compare     今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
+    py -m src.v8 real-odds         v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
     py -m src.v8 odds-targets      過去の確定オッズを取り直すレースの一覧（重賞＋平場の検証用5,000）
     py -m src.v8 odds-drift        速報オッズ（rt-odds）と確定オッズ（fetch-odds）のずれ
 
@@ -1019,6 +1020,138 @@ def _cmd_final_compare(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# v8d 本物の確定オッズで買い目を選ぶ（平場サンプル）
+# ---------------------------------------------------------------------------
+REAL_MARGINS = (1.0, 1.1, 1.2, 1.4)
+ESTIMATED_COND = f"推定の配当・余裕×{FAVORITE_MARGIN:.1f}（今の本命）"
+PRED_BINS = [0, 0.05, 0.10, 0.15, 0.20, 0.30, 1.0001]
+
+
+def _real_cond(m: float) -> str:
+    return f"本物のオッズ・余裕×{m:.1f}"
+
+
+def evaluate_real_odds(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q: dict, real: dict,
+                       margins=REAL_MARGINS, limit: int | None = FAVORITE_LIMIT, verbose: bool = True):
+    """同じレースで、推定の配当（余裕×1.4）と本物の確定オッズ（余裕 margins）で券種混合を選び、実際の払戻で評価する。
+
+    戻り値: (1レース・1条件1行, 推定÷本物 の集計, 推定の配当で選んだ組の本物のオッズでの確認, 確定オッズと払戻の突き合わせ)
+    """
+    from . import realodds
+    table = table.loc[table["レースID"].astype(str).isin(set(real))]
+    rows, chosen = [], []
+    stats = realodds.RatioStats()
+    check = {"的中組": 0, "一致": 0}
+    for rid, fold, posts, wins, Q, ps in _plan_races(table, payout, [col], disc_q, 0, 0, "本物のオッズ", verbose):
+        T = realodds.payout_tables(real[str(rid)], posts)
+        if T is None:
+            continue
+        P, p = ps[col]
+        stats.add(realodds.ratio_arrays(Q, T, P))
+        index = {int(x): i for i, x in enumerate(posts)}
+        for kind, d in wins.items():                         # 確定オッズ × 100 と実際の払戻（同着でないとき一致するはず）
+            if len(d) != 1:
+                continue
+            (combo, pay), = d.items()
+            if all(x in index for x in combo):
+                ix = [index[x] for x in combo]
+                v = T[kind][tuple(ix)]
+                if np.isfinite(v):
+                    check["的中組"] += 1
+                    check["一致"] += int(abs(v - pay) < 10)     # オッズは 0.1倍刻み＝払戻 10円刻み
+        plans = [(ESTIMATED_COND, bets.mixed(P, Q, p, posts, margin=FAVORITE_MARGIN, max_points=limit))]
+        plans += [(_real_cond(m), bets.mixed(P, Q, p, posts, margin=m, max_points=limit, odds=T)) for m in margins]
+        for name, plan in plans:
+            rows.append({"レースID": rid, "fold": fold, "条件": name, "投資": plan.invest,
+                         "払戻": bets.realized(plan, wins), "予測の達成確率": plan.predicted, "点数": len(plan.bets)})
+        for b in plans[0][1].bets:                            # 推定の配当で選んだ組は、本物のオッズだといくらだったか
+            ix = [index[x] for x in b.combo]
+            q = Q[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else Q[b.kind][ix[0], ix[1]]
+            r = T[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else T[b.kind][ix[0], ix[1]]
+            chosen.append({"券種": b.kind, "推定": market.estimated_payout(float(q), b.kind), "本物": float(r),
+                           "金額": b.stake})
+    return pd.DataFrame(rows), stats.summary(), pd.DataFrame(chosen), check
+
+
+def chosen_summary(chosen: pd.DataFrame, target: float = bets.TARGET) -> pd.DataFrame:
+    """推定の配当で選んだ組：本物のオッズだと、当たっても基準に届かなかった割合など（券種ごと）。"""
+    out = []
+    c = chosen.loc[np.isfinite(chosen["本物"])]
+    for kind, g in [("全部", c)] + list(c.groupby("券種", sort=False)):
+        r = g["推定"] / g["本物"]
+        out.append({"券種": kind, "点数": len(g), "推定÷本物（中央値）": float(r.median()),
+                    "本物だと基準に届かない割合": float((g["本物"] * g["金額"] / 100 < target).mean()),
+                    "本物だと基準×0.8に届かない割合": float((g["本物"] * g["金額"] / 100 < 0.8 * target).mean())})
+    return pd.DataFrame(out)
+
+
+def prediction_calibration(rows: pd.DataFrame, target: float = bets.TARGET) -> pd.DataFrame:
+    """予測の達成確率の区間ごとに、予測の平均と実際の達成率（条件ごと）。"""
+    t = rows.assign(区間=pd.cut(rows["予測の達成確率"], PRED_BINS, right=False).astype(str),
+                    達成=rows["払戻"] >= target)
+    out = t.groupby(["条件", "区間"], sort=False).agg(レース数=("達成", "size"), 予測の平均=("予測の達成確率", "mean"),
+                                                   実際の達成率=("達成", "mean")).reset_index()
+    return out
+
+
+def _cmd_real_odds(args) -> int:
+    from . import realodds
+    clock = _Clock()
+    path = experiment.v8_dir() / "odds_targets.csv"
+    if not path.exists():
+        raise SystemExit("先に `py -m src.v8 odds-targets` を実行してください（取り直したレースの一覧）")
+    targets = pd.read_csv(path, dtype={"レースID": str, "fold": str}, encoding="utf-8-sig")
+    flat_ids = targets.loc[targets["区分"] == "平場サンプル", "レースID"].tolist()   # 重賞は読まない
+    if args.sample and len(flat_ids) > args.sample:
+        flat_ids = list(np.random.default_rng(0).choice(flat_ids, size=args.sample, replace=False))
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    merged, _, _ = tilt_tables(args, ds, base)
+    name, col = _best_tilt_source(args) if args.source else ("市場＋当日の傾向（3b）", "tilt3b")
+    clock.step(f"確定オッズを読み込み中（平場サンプル {len(flat_ids):,} レース。馬連・馬単・3連複・3連単）...")
+    real = realodds.load_final_odds(flat_ids, base=args.data)
+    print(f"         確定オッズのあるレース: {len(real):,}（4券種そろい: "
+          f"{sum(all(k in v for k in realodds.KIND_TYPES) for v in real.values()):,}）", flush=True)
+    if not real:
+        print("確定オッズがありません（`py -m src.jvlink fetch-odds --targets ...` で取り直す）")
+        return 1
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+    n_cond = 1 + len(REAL_MARGINS)
+    clock.step(f"券種混合（{name}・{FAVORITE_LIMIT}点まで）を {n_cond} 条件で計算中 ...")
+    rows, ratio, chosen, check = evaluate_real_odds(merged, ds.payout_df, col, disc_q, real)
+    clock.step("完了\n")
+    TRIALS.extend([f"券種混合｜{name}｜本物の確定オッズで金額を決める｜余裕×{m:.1f}｜{FAVORITE_LIMIT}点まで"
+                   for m in REAL_MARGINS])
+    print(f"確率: {name}。確定オッズ×100 と実際の払戻の一致: {check['一致']:,} / {check['的中組']:,} 組"
+          "（差が10円未満。同着のレースは除く。ほぼ全部一致するはず）")
+    summ = plan_summary(rows, by=("条件",))
+    print(f"\n=== 1・3 平場サンプル：券種混合 × {name} × {FAVORITE_LIMIT}点まで。金額を推定の配当で決める / 本物の確定オッズで決める ===")
+    print("    本物のオッズで決めると、当たれば基準に届くことがほぼ確実（確定オッズ＝払戻のため）。"
+          "残るずれは、勝ち馬・並びの予測の確率のずれ")
+    _show(summ, pct=("率", "限", "確率（", "予測 −"), money=("投資",))
+    paired = paired_vs(rows, ESTIMATED_COND, by="条件")
+    print(f"\n=== 2 対応のある比較（同じレース。差 = その条件 − {ESTIMATED_COND}） ===")
+    _show(paired, pct=("差",))
+    cal = prediction_calibration(rows)
+    print("\n=== 3 予測の達成確率の区間ごとの、予測と実際 ===")
+    _show(cal, pct=("平均", "達成率"))
+    print("\n=== 4 推定した配当 ÷ 本物の確定オッズ（全部の組。1 より大きい = 推定が高すぎる）===")
+    print("    確率で重みづけ = 予測の確率（P）が高い組ほど重く（買い目になりやすい組でのずれ）")
+    _show(ratio, pct=("以内", "割以上"))
+    cs = chosen_summary(chosen)
+    print(f"\n=== 4 補足：{ESTIMATED_COND} で選んだ組を本物の確定オッズで見ると ===")
+    _show(cs, pct=("割合",))
+    _save(args, summ, "real_odds_summary")
+    _save(args, paired, "real_odds_paired")
+    _save(args, cal, "real_odds_calibration")
+    _save(args, ratio, "real_odds_ratio")
+    _save(args, cs, "real_odds_chosen")
+    _trials_note()
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # 本物のオッズ：取り直すレースの一覧と、速報オッズと確定オッズのずれ
 # ---------------------------------------------------------------------------
 def odds_targets(table: pd.DataFrame, n_flat: int = 5_000, seed: int = 0,
@@ -1157,6 +1290,10 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--no-rating", dest="with_rating", action="store_false",
                    help="レーティングの版（R・3b+R）を入れない（4通りになり、時間は約2/3）")
     q.set_defaults(func=_cmd_final_compare)
+    q = sub.add_parser("real-odds", help="v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）")
+    q.add_argument("--sample", type=int, default=0, help="平場サンプルのうち何レース（既定 0 = 全部の約5,000）")
+    q.add_argument("--source", default=None, help="確率（既定 tilt3b ＝ 市場＋当日の傾向）")
+    q.set_defaults(func=_cmd_real_odds)
     args = parser.parse_args(argv)
     TRIALS.clear()
     return args.func(args)

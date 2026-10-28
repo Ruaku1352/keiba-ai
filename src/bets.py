@@ -105,7 +105,7 @@ def _subtensor(P: np.ndarray, order: np.ndarray, outcomes) -> np.ndarray:
 
 
 def _candidate_probs(Q: dict, order: np.ndarray, h: int) -> np.ndarray:
-    """各候補の市場の確率（推定配当の元）。まとめて引く。"""
+    """各候補の表の値（市場の確率、または本物の配当）。まとめて引く。"""
     kind, pos = candidate_index(h)
     horse = order[pos]                                     # (候補, 3) 実際の馬の位置
     out = np.empty(len(kind))
@@ -187,12 +187,14 @@ def formation_cards(P: np.ndarray, Q3: np.ndarray, p: np.ndarray, posts: np.ndar
 def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int = BUDGET,
           target: float = TARGET, kinds=KINDS, max_per_kind: int | None = None,
           h: int = TOP_H, name: str = "券種混合", margin: float = 1.0,
-          max_points: int | None = None) -> Plan:
+          max_points: int | None = None, odds: dict | None = None) -> Plan:
     """S4 / S4c / S5：券種と金額を混ぜて、払戻の合計が基準以上になる確率を大きくする（貪欲法）。
 
     margin     : 1点の金額を「推定配当 × 金額 ≥ 基準 × margin」にする（1.2 なら推定より2割下振れしても届く）。
                  達成の判定（予測・実際とも）は基準のまま
     max_points : 入力する点数の合計の上限（スマッピーの1つの QR に入る点数。券種は問わない）
+    odds       : 券種 → 100円あたりの本物の配当（オッズ × 100）の表（Q と同じ形。無い組は NaN）。
+                 渡すと、推定配当の代わりにこれで金額を決め、予測の達成確率もこれで計算する（v8d）
     """
     n = len(p)
     h = min(h, n)
@@ -201,11 +203,14 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
     order = np.argsort(-p, kind="mergesort")[:h]
     outcomes, cands, M = coverage_structure(h)
     po = _subtensor(P, order, outcomes)                         # 並びの予測確率
-    q_c = _candidate_probs(Q, order, h)
     kind_code, _ = candidate_index(h)
-    rate = np.array([market.PAYOUT_RATE[k] for k in KINDS])[kind_code]
     with np.errstate(divide="ignore", invalid="ignore"):
-        est = np.where(q_c > 0, 100.0 * rate / q_c, np.nan)     # 100円あたりの推定配当
+        if odds is None:
+            q_c = _candidate_probs(Q, order, h)
+            rate = np.array([market.PAYOUT_RATE[k] for k in KINDS])[kind_code]
+            est = np.where(q_c > 0, 100.0 * rate / q_c, np.nan)     # 100円あたりの推定配当
+        else:
+            est = _candidate_probs(odds, order, h)                  # 100円あたりの本物の配当（無い組は NaN）
         stake = np.ceil(target * margin / est) * 100            # それ1点で基準（× 余裕）に届く金額
     kind_arr = np.array(KINDS)[kind_code]
     usable = np.isfinite(stake) & (stake <= budget) & np.isin(kind_arr, list(kinds))
@@ -244,12 +249,13 @@ def mixed(P: np.ndarray, Q: dict, p: np.ndarray, posts: np.ndarray, budget: int 
     # 予測の達成確率：選んだ全部の推定払戻の合計が基準以上になる並びの確率。
     # 候補選びは上位 h 頭の並びだけで行うが、ここは全頭の並びで計算する（馬単・3連複などは、残りの着に
     # 上位 h 頭以外の馬が来ても当たるため。上位 h 頭だけで数えると少し小さく出る）
-    plan.predicted = predicted_success(plan, P, Q, posts, target) if chosen else 0.0
+    plan.predicted = predicted_success(plan, P, Q, posts, target, odds=odds) if chosen else 0.0
     return plan
 
 
-def predicted_success(plan: Plan, P: np.ndarray, Q: dict, posts: np.ndarray, target: float) -> float:
-    """選んだ買い目の推定払戻の合計が基準以上になる並びの確率（全頭の並びで）。"""
+def predicted_success(plan: Plan, P: np.ndarray, Q: dict, posts: np.ndarray, target: float,
+                      odds: dict | None = None) -> float:
+    """選んだ買い目の推定払戻の合計が基準以上になる並びの確率（全頭の並びで）。odds があれば本物の配当で。"""
     if not plan.bets:
         return 0.0
     index = {int(x): i for i, x in enumerate(posts)}
@@ -257,8 +263,12 @@ def predicted_success(plan: Plan, P: np.ndarray, Q: dict, posts: np.ndarray, tar
     total = np.zeros((n, n, n))
     for b in plan.bets:
         ix = [index[x] for x in b.combo]
-        q = Q[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else Q[b.kind][ix[0], ix[1]]
-        pay = market.estimated_payout(float(q), b.kind) * b.stake / 100 if q > 0 else 0.0
+        T = Q if odds is None else odds
+        q = T[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else T[b.kind][ix[0], ix[1]]
+        if odds is None:
+            pay = market.estimated_payout(float(q), b.kind) * b.stake / 100 if q > 0 else 0.0
+        else:
+            pay = float(q) * b.stake / 100 if np.isfinite(q) else 0.0
         if b.kind == "3連単":
             total[ix[0], ix[1], ix[2]] += pay
         elif b.kind == "3連複":

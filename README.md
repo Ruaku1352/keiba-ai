@@ -144,6 +144,7 @@ py -m src.v8 tilt            # 市場の確率に当日・開催の傾向で傾�
 py -m src.v8 stakes          # 券種混合の金額の余裕・スマッピーの点数の上限
 py -m src.v8 rating          # v8c 馬のレーティング（逐次の Plackett-Luce）を市場の確率への傾きに
 py -m src.v8 final-compare   # 今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
+py -m src.v8 real-odds       # v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
 ```
 
 確定オッズの保存・当日の速報オッズ（任意。いつもの fetch は変わらない）:
