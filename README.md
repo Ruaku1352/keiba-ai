@@ -149,6 +149,12 @@ py -m src.v8 growth-check    # v8d 市場＋3b＋伸び と 市場＋3b（平場
 py -m src.v8 place-check     # v8e 2・3着への来やすさ P1・P2・P3 と F（記述的な確認・採用の判定つき）
 ```
 
+重賞で1回だけの確認のテスト（F・F2・B。内容とルールは先に固定。[docs/v9_confirm.md](docs/v9_confirm.md)）:
+
+```powershell
+py -m src.v9 confirm         # 判定（F を採用 / F2 を採用 / B のまま）が最初に出る。やり直しは --rerun-reason が要る
+```
+
 確定オッズの保存・当日の速報オッズ（任意。いつもの fetch は変わらない）:
 
 ```powershell
