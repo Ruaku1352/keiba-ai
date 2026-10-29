@@ -9,7 +9,7 @@
     py -m src.v8 trackbias         3   当日の馬場の傾向（平場の後半のレース）
     py -m src.v8 tilt              3b・3c  市場の確率に当日の傾向・開催の進み具合の傾向で傾きをつける（3b+3c も）
     py -m src.v8 stakes            券種混合の金額の余裕・スマッピーの点数の上限
-    py -m src.v8 rating            v8c レーティング（Plackett-Luce を逐次で）を市場の確率への傾きに
+    py -m src.v8 rating            v8c レーティング（Plackett-Luce 型・AtCoder 型）を市場の確率への傾きに
     py -m src.v8 final-compare     今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
     py -m src.v8 real-odds         v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
     py -m src.v8 odds-targets      過去の確定オッズを取り直すレースの一覧（重賞＋平場の検証用5,000）
@@ -642,10 +642,10 @@ S4C = STRATEGIES[4]
 
 
 def rating_frame(ds, verbose: bool = True) -> pd.DataFrame:
-    """v8c のレーティング（1986年から順番に。data/v8/ratings.pkl に保存して使い回す）。"""
+    """v8c のレーティング2方式（Plackett-Luce・AtCoder 型。1986年から順番に。data/v8/ratings.pkl に保存して使い回す）。"""
     from . import preprocess, ratings
     rr = preprocess.basic_clean(ds.race_result)
-    key = hashlib.sha1("|".join(["ratings-v1", str(len(rr)), str(rr["レースID"].nunique()),
+    key = hashlib.sha1("|".join(["ratings-v2", str(len(rr)), str(rr["レースID"].nunique()),
                                  str(rr["レース日付"].min()), str(rr["レース日付"].max())]).encode()).hexdigest()
     path = experiment.v8_dir() / "ratings.pkl"
     if path.exists():
@@ -656,6 +656,8 @@ def rating_frame(ds, verbose: bool = True) -> pd.DataFrame:
         print(f"[v8] レーティングを計算中（{rr['レースID'].nunique():,} レースを日付順に。数分）...", flush=True)
     t0 = time.perf_counter()
     table = ratings.compute_ratings(rr, verbose=verbose)
+    ac = ratings.compute_atcoder_ratings(rr, verbose=verbose)
+    table = table.merge(ac, on=["レースID", "血統登録番号"], how="left")
     if verbose:
         print(f"[v8] レーティング完了: {time.perf_counter() - t0:.0f}秒", flush=True)
     pd.to_pickle({"key": key, "table": table}, path)
@@ -663,12 +665,12 @@ def rating_frame(ds, verbose: bool = True) -> pd.DataFrame:
 
 
 def tilt_tables(args, ds, base: experiment.OOF, verbose: bool = True):
-    """市場だけ / 3b / 3c / 3b+3c / R / 3b+R の確率（fold 2 以降）と係数。data/v8/tilt_tables.pkl に保存して使い回す。"""
+    """市場だけ / 3b / 3c / 3b+3c / R / 3b+R / A / 3b+A の確率（fold 2 以降）と係数。data/v8/tilt_tables.pkl に保存して使い回す。"""
     from . import ratings, tilt
     path = experiment.v8_dir() / "tilt_tables.pkl"
     meta = experiment.v8_dir() / "oof_base.json"
     pkl = experiment.v8_dir() / "oof_base.pkl"
-    key = hashlib.sha1("|".join(["tilt-v3", str(args.folds), str(args.rounds),
+    key = hashlib.sha1("|".join(["tilt-v4", str(args.folds), str(args.rounds),
                                  meta.read_text(encoding="utf-8") if meta.exists() else "",
                                  str(pkl.stat().st_mtime_ns) if pkl.exists() else ""]).encode()).hexdigest()
     if path.exists() and not args.refresh:
@@ -681,11 +683,13 @@ def tilt_tables(args, ds, base: experiment.OOF, verbose: bool = True):
         print("[v8] 傾向の項を作成し、係数を推定中 ...", flush=True)
     terms = tilt.build_terms(ds)
     k = ["レースID", "血統登録番号"]
-    rt = rating_frame(ds, verbose=verbose)[k + ["μ", "σ", "出走数"] + ratings.RATING_TERMS]
+    rt = rating_frame(ds, verbose=verbose)[k + ["μ", "σ", "出走数", "AtCoder型_レーティング", "AtCoder型_出走数"]
+                                           + ratings.RATING_TERMS + ratings.AC_TERMS]
     t = base.table.merge(terms, on=k, how="left").merge(rt, on=k, how="left")
     specs = [("3b", tilt.DAY_TERMS, "tilt3b"), ("3c", tilt.MEETING_TERMS, "tilt3c"),
              ("3b+3c", tilt.DAY_TERMS + tilt.MEETING_TERMS, "tilt3bc"),
-             ("R", ratings.RATING_TERMS, "tiltR"), ("3b+R", tilt.DAY_TERMS + ratings.RATING_TERMS, "tilt3bR")]
+             ("R", ratings.RATING_TERMS, "tiltR"), ("3b+R", tilt.DAY_TERMS + ratings.RATING_TERMS, "tilt3bR"),
+             ("A", ratings.AC_TERMS, "tiltA"), ("3b+A", tilt.DAY_TERMS + ratings.AC_TERMS, "tilt3bA")]
     merged, coefs = None, {}
     for name, cols, out_col in specs:
         out, coefs[name] = tilt.tilt_walk_forward(t, cols, out_col)
@@ -917,9 +921,11 @@ def _cmd_stakes(args) -> int:
 # ---------------------------------------------------------------------------
 # v8c レーティング（能力が時間とともに変わる）を市場の確率への傾きに
 # ---------------------------------------------------------------------------
-RATING_SOURCES = [("市場だけ", "市場確率"), ("市場＋レーティング", "tiltR"), ("市場＋当日の傾向（3b）", "tilt3b"),
-                  ("市場＋3b＋レーティング", "tilt3bR")]
-FINAL_SOURCES = TILT_SOURCES + RATING_SOURCES[1:2] + RATING_SOURCES[3:]
+# R = Plackett-Luce 型（ベイズ）、A = AtCoder 型（パフォーマンスの重み付き平均）
+RATING_ONLY = [("市場＋レーティング", "tiltR"), ("市場＋3b＋レーティング", "tilt3bR"),
+               ("市場＋AtCoder型", "tiltA"), ("市場＋3b＋AtCoder型", "tilt3bA")]
+RATING_SOURCES = [("市場だけ", "市場確率"), ("市場＋当日の傾向（3b）", "tilt3b")] + RATING_ONLY
+FINAL_SOURCES = TILT_SOURCES + RATING_ONLY
 
 
 def _coef_with_sd(coef: pd.DataFrame, sd: pd.Series) -> pd.DataFrame:
@@ -948,11 +954,13 @@ def _cmd_rating(args) -> int:
     ds = _load(args, clock)
     base = _oof(args, ds, "base")
     merged, coefs, full = tilt_tables(args, ds, base)
-    TRIALS.extend(["R 市場＋レーティング（相対・伸び・不確かさ）で傾き", "3b+R 市場＋当日の傾向＋レーティングで傾き"])
-    sd = _flat(full)[tilt.DAY_TERMS + ratings.RATING_TERMS].astype("float64").std()
+    TRIALS.extend(["A 市場＋AtCoder型（相対・伸び・出走の少なさ・ばらつき）で傾き",
+                   "3b+A 市場＋当日の傾向＋AtCoder型で傾き"])
+    print("[記録] R・3b+R（Plackett-Luce 型）は v8c で数えた2個。今回の新しい案は AtCoder 型の2個")
+    sd = _flat(full)[tilt.DAY_TERMS + ratings.RATING_TERMS + ratings.AC_TERMS].astype("float64").std()
     print("\n=== 係数（その fold より前の fold の平場で推定）。θ×SD = 項が1標準偏差変わったときの log の変化"
           "（0.05 で約5%の確率の差）。θ が 0 に近ければ市場は織り込み済み ===")
-    for name in ("R", "3b+R"):
+    for name in ("R", "3b+R", "A", "3b+A"):
         print(f"--- {name} ---")
         _show(_coef_with_sd(coefs[name], sd))
     print("    項の標準偏差（平場）: " + " / ".join(f"{k} {v:.4f}" for k, v in sd.items()))
@@ -965,10 +973,12 @@ def _cmd_rating(args) -> int:
            {"予測": "市場（単勝オッズ）", "AUC": market.auc(flat["win"], flat["市場確率"])},
            {"予測": "レーティングだけ（μ）", "AUC": market.auc(flat["win"], flat["μ"])},
            {"予測": "レーティングだけ（μ − 2σ。不確かな馬を割り引く）",
-            "AUC": market.auc(flat["win"], flat["μ"] - 2 * flat["σ"])}]
+            "AUC": market.auc(flat["win"], flat["μ"] - 2 * flat["σ"])},
+           {"予測": "AtCoder型レーティングだけ（出走が少ない馬の割り引きあり）",
+            "AUC": market.auc(flat["win"], flat["AtCoder型_レーティング"])}]
     _show(pd.DataFrame(ref))
     print("\n=== キャリブレーション（全レース。重賞を含む・達成率ではない） ===")
-    for n, c in (RATING_SOURCES[1], RATING_SOURCES[3]):
+    for n, c in RATING_ONLY:
         print(f"--- {n} ---")
         _show(market.calibration_table(merged, c), pct=("平均", "勝率"))
     clock.step("市場の γ・δ を推定中 ...")
@@ -982,7 +992,8 @@ def _cmd_rating(args) -> int:
     paired = _paired_report(plan_rows, ["市場だけ", "市場＋当日の傾向（3b）"])
     _save(args, pd.DataFrame(rows), "rating_compare")
     _save(args, pd.DataFrame(ref), "rating_auc")
-    _save(args, pd.concat([_coef_with_sd(coefs[n], sd).assign(案=n) for n in ("R", "3b+R")], ignore_index=True),
+    _save(args, pd.concat([_coef_with_sd(coefs[n], sd).assign(案=n) for n in ("R", "3b+R", "A", "3b+A")],
+                          ignore_index=True),
           "rating_coefs")
     _save(args, summ, "rating_plan")
     _save(args, paired, "rating_plan_paired")
@@ -1285,10 +1296,10 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("rating", help="v8c レーティングを市場の確率への傾きに（平場。今の本命の買い方で比べる）")
     q.add_argument("--sample", type=int, default=5_000, help="達成率を計算する平場のレース数（0 で全部）")
     q.set_defaults(func=_cmd_rating)
-    q = sub.add_parser("final-compare", help="市場だけ / 3b / 3c / 3b+3c / R / 3b+R を今の本命の買い方で（平場の全レース）")
+    q = sub.add_parser("final-compare", help="市場だけ / 3b / 3c / 3b+3c / R / 3b+R / A / 3b+A を今の本命の買い方で（平場の全レース）")
     q.add_argument("--sample", type=int, default=0, help="平場のレース数（既定 0 = 全部、約4万2千。数十分）")
     q.add_argument("--no-rating", dest="with_rating", action="store_false",
-                   help="レーティングの版（R・3b+R）を入れない（4通りになり、時間は約2/3）")
+                   help="レーティングの版（R・3b+R・A・3b+A）を入れない（4通りになり、時間は約半分）")
     q.set_defaults(func=_cmd_final_compare)
     q = sub.add_parser("real-odds", help="v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）")
     q.add_argument("--sample", type=int, default=0, help="平場サンプルのうち何レース（既定 0 = 全部の約5,000）")

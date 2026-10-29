@@ -661,6 +661,7 @@ def test_cli_rating_and_final_compare(v8_env, capsys):
     assert v8.main(["--data", str(v8_env), "--rounds", "10", "rating", "--sample", "30"]) == 0
     out = capsys.readouterr().out
     assert "θ×SD（レーティング_相対）" in out and "θ（レーティング_伸び）" in out
+    assert "θ×SD（AtCoder型_ばらつき）" in out and "AtCoder型レーティングだけ" in out
     assert "レーティングだけ（μ）" in out and "平場で比べた案: 2 個" in out
     assert v8.FAVORITE_PLAN in out and "差 = こちら − 市場＋当日の傾向（3b）" in out
     summ = pd.read_csv(v8_env.parent / "v8" / "rating_plan.csv", encoding="utf-8-sig")
@@ -672,7 +673,7 @@ def test_cli_rating_and_final_compare(v8_env, capsys):
     out = capsys.readouterr().out
     assert "保存済みの傾きの表を使います" in out and "fold ごと" in out
     fc = pd.read_csv(v8_env.parent / "v8" / "final_compare.csv", encoding="utf-8-sig")
-    assert set(fc["確率"]) == {n for n, _ in v8.FINAL_SOURCES} and len(v8.FINAL_SOURCES) == 6
+    assert set(fc["確率"]) == {n for n, _ in v8.FINAL_SOURCES} and len(v8.FINAL_SOURCES) == 8
     assert fc["レース数"].nunique() == 1                      # どの確率も同じレースで比べている
     assert v8.main(["--data", str(v8_env), "--rounds", "10", "final-compare", "--sample", "10",
                     "--no-rating"]) == 0

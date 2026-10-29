@@ -80,9 +80,15 @@ def make_results(n_days=60, races_per_day=4, horses=60, field=10, seed=0) -> pd.
     return pd.DataFrame(rows)
 
 
-def test_no_leak_as_of_day():
+METHODS = [(ratings.compute_ratings, ["μ", "σ", "出走数"] + ratings.RATING_TERMS, "μ"),
+           (ratings.compute_atcoder_ratings, ["AtCoder型_レーティング", "AtCoder型_出走数"] + ratings.AC_TERMS,
+            "AtCoder型_レーティング")]
+
+
+@pytest.mark.parametrize("compute,cols,main", METHODS)
+def test_no_leak_as_of_day(compute, cols, main):
     df = make_results()
-    base = ratings.compute_ratings(df)
+    base = compute(df)
     dates = sorted(df["レース日付"].unique())
     D = dates[30]
     on_d = df.loc[df["レース日付"] == D, "レースID"].unique()
@@ -91,20 +97,30 @@ def test_no_leak_as_of_day():
     alt = df.copy()
     m = alt["レース日付"] >= D
     alt.loc[m, "着順"] = alt.loc[m].groupby("レースID")["着順"].transform(lambda s: s.max() + 1 - s)
-    changed = ratings.compute_ratings(alt)
+    changed = compute(alt)
     k = ["レースID", "血統登録番号"]
     a = base.loc[base["レースID"].isin(on_d)].sort_values(k).reset_index(drop=True)
     b = changed.loc[changed["レースID"].isin(on_d)].sort_values(k).reset_index(drop=True)
-    cols = ["μ", "σ", "出走数"] + ratings.RATING_TERMS
     pd.testing.assert_frame_equal(a[k + cols], b[k + cols])
 
     # 前日（前の開催日）の着順を変えると変わる（テストが空振りしていないことの確認）
     alt2 = df.copy()
     m = alt2["レース日付"] == dates[29]
     alt2.loc[m, "着順"] = alt2.loc[m].groupby("レースID")["着順"].transform(lambda s: s.max() + 1 - s)
-    c = ratings.compute_ratings(alt2)
+    c = compute(alt2)
     c = c.loc[c["レースID"].isin(on_d)].sort_values(k).reset_index(drop=True)
-    assert not np.allclose(a["μ"], c["μ"])
+    assert not np.allclose(a[main], c[main])
+
+
+@pytest.mark.parametrize("compute,cols,main", METHODS)
+def test_same_day_results_not_used_both(compute, cols, main):
+    rows = []
+    for r in (1, 2):
+        for rank, h in enumerate(["A", "B", "C", "D"], 1):
+            rows.append({"レースID": f"2015010305{r:02d}", "レース日付": pd.Timestamp("2015-01-03"),
+                         "血統登録番号": h, "着順": rank, "馬番": rank})
+    t = compute(pd.DataFrame(rows))
+    assert t[main].nunique() == 1 and (t[cols[2 if main == "μ" else 1]] == 0).all()
 
 
 def test_same_day_results_not_used():
@@ -155,3 +171,90 @@ def test_speed_estimate():
     per_race = (time.perf_counter() - t0) / df["レースID"].nunique()
     print(f"\n1レース {per_race * 1e3:.3f} ミリ秒 → 14万レースで約 {per_race * 140_000:.0f} 秒")
     assert per_race < 0.01
+
+
+# ===========================================================================
+# AtCoder 型
+# ===========================================================================
+def test_atcoder_performance_solves_expected_rank():
+    rng = np.random.default_rng(1)
+    aperf = rng.normal(1200, 300, 12)
+    perf = ratings.atcoder_performance(aperf)
+    for i, x in enumerate(perf):
+        expected = (1 / (1 + 6 ** ((x - aperf) / 400))).sum()
+        assert expected == pytest.approx(i + 0.5, abs=1e-6)
+    assert np.all(np.diff(perf) < 0)                 # 上の着順ほど高い
+    # 同じ着順でも、強い相手の中なら高く出る
+    assert ratings.atcoder_performance(np.full(8, 1600.0))[0] > ratings.atcoder_performance(np.full(8, 1000.0))[0]
+
+
+def test_atcoder_correction_values():
+    f = ratings.atcoder_correction([0, 1, 2, 10, 1000])
+    assert f[0] == 1200 and f[1] == pytest.approx(1200) and f[2] < f[1] and f[3] < f[2] and f[4] == pytest.approx(0, abs=1e-6)
+
+
+def test_atcoder_rating_matches_direct_formula():
+    """レース前のレーティング = 800 log2(Σ 2^(perf/800) 0.9^i / Σ 0.9^i) − f(n)。伸び・ばらつきも直接の計算と一致。"""
+    df = make_results()
+    t = ratings.compute_atcoder_ratings(df).merge(df[["レースID", "血統登録番号", "レース日付", "着順"]])
+    # 各レースのパフォーマンスを、次の出走のレース前の値の差からではなく、同じ手順で直接計算し直す
+    hist: dict[str, list[float]] = {}
+    aperf: dict[str, float] = {}
+    by_day = t.sort_values(["レース日付", "レースID", "着順"])
+    checked = 0
+    for _, day in by_day.groupby("レース日付", sort=True):
+        updates = []
+        for _, race in day.groupby("レースID", sort=False):
+            hs = race["血統登録番号"].tolist()
+            for h, row in zip(hs, race.itertuples()):
+                p = hist.get(h, [])
+                if p:
+                    w = 0.9 ** np.arange(len(p))                        # p[0] が一番新しい
+                    raw = 800 * np.log2((2 ** (np.array(p) / 800) * w).sum() / w.sum())
+                    assert row.AtCoder型_レーティング == pytest.approx(raw - ratings.atcoder_correction(len(p)))
+                    if len(p) >= 2:
+                        assert row.AtCoder型_伸び == pytest.approx(p[0] - raw)
+                    if len(p) >= 3:
+                        assert row.AtCoder型_パフォーマンスの標準偏差 == pytest.approx(np.std(p[:5], ddof=1))
+                    checked += 1
+                else:
+                    assert row.AtCoder型_レーティング == 0
+            ap = np.array([aperf.get(h, 1200.0) for h in hs])
+            updates.append((hs, ratings.atcoder_performance(ap)))
+        for hs, perf in updates:
+            for h, x in zip(hs, perf):
+                hist.setdefault(h, []).insert(0, float(x))
+                p = np.array(hist[h])
+                w = 0.9 ** np.arange(len(p))
+                aperf[h] = float((p * w).sum() / w.sum())
+    assert checked > 1000
+
+
+def test_atcoder_growth_and_spread_terms():
+    df = make_results()
+    t = ratings.compute_atcoder_ratings(df)
+    assert (t.loc[t["AtCoder型_出走数"] < 2, "AtCoder型_伸び"] == 0).all()
+    assert t.loc[t["AtCoder型_出走数"] < 3, "AtCoder型_パフォーマンスの標準偏差"].isna().all()
+    assert t["AtCoder型_ばらつき"].notna().all()
+    for c in ("AtCoder型_相対", "AtCoder型_出走の少なさ"):
+        assert np.allclose(t.groupby("レースID")[c].sum(), 0, atol=1e-6)
+    # 波の大きい馬（交互に1着・最下位）はばらつきが大きい
+    rows = []
+    for d in range(8):
+        date = pd.Timestamp("2015-01-03") + pd.Timedelta(days=7 * d)
+        order = ["W", "A", "B", "C", "S"] if d % 2 == 0 else ["A", "B", "S", "C", "W"]
+        for rank, h in enumerate(order, 1):
+            rows.append({"レースID": f"{date:%Y%m%d}0501", "レース日付": date, "血統登録番号": h, "着順": rank,
+                         "馬番": rank})
+    u = ratings.compute_atcoder_ratings(pd.DataFrame(rows))
+    last = u.loc[u["レースID"] == u["レースID"].max()].set_index("血統登録番号")
+    assert last.loc["W", "AtCoder型_ばらつき"] > last.loc["S", "AtCoder型_ばらつき"]
+
+
+def test_atcoder_speed_estimate():
+    df = make_results(n_days=250, races_per_day=12, horses=1500, field=14)
+    t0 = time.perf_counter()
+    ratings.compute_atcoder_ratings(df)
+    per_race = (time.perf_counter() - t0) / df["レースID"].nunique()
+    print(f"\nAtCoder 型 1レース {per_race * 1e3:.3f} ミリ秒 → 14万レースで約 {per_race * 140_000:.0f} 秒")
+    assert per_race < 0.02
