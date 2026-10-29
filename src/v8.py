@@ -12,6 +12,7 @@
     py -m src.v8 rating            v8c レーティング（Plackett-Luce 型・AtCoder 型）を市場の確率への傾きに
     py -m src.v8 final-compare     今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
     py -m src.v8 real-odds         v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
+    py -m src.v8 growth-check      v8d 市場＋3b＋伸び と 市場＋3b を平場の全レースで（採用の判定つき）
     py -m src.v8 odds-targets      過去の確定オッズを取り直すレースの一覧（重賞＋平場の検証用5,000）
     py -m src.v8 odds-drift        速報オッズ（rt-odds）と確定オッズ（fetch-odds）のずれ
 
@@ -1001,6 +1002,90 @@ def _cmd_rating(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v8d 「市場＋3b＋伸び」：AtCoder 型の伸びだけを 3b に足す（採用のルールは結果を見る前に決めたもの）
+# ---------------------------------------------------------------------------
+GROWTH_TERM = "AtCoder型_伸び"
+GROWTH_SOURCES = [("市場だけ", "市場確率"), ("市場＋当日の傾向（3b）", "tilt3b"), ("市場＋3b＋伸び", "tilt3bG")]
+GROWTH_RULE = ("「市場＋3b＋伸び」−「市場＋3b」の達成率の差の 95% 区間の下限が 0 を超えたら、重賞のテストの F の確率を"
+               "「市場＋3b＋伸び」に差し替える。超えなければ F は「市場＋当日の傾向（3b）」のまま")
+
+
+def growth_judgement(paired: pd.DataFrame) -> tuple[bool, dict]:
+    """採用のルールでの判定（True = 差し替える）。paired は paired_vs(..., '市場＋当日の傾向（3b）') の結果。"""
+    row = paired.loc[paired["確率"] == GROWTH_SOURCES[2][0]].iloc[0].to_dict()
+    return bool(row["差の下限"] > 0), row
+
+
+def _cmd_growth_check(args) -> int:
+    from . import tilt
+    clock = _Clock()
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    merged, _, full = tilt_tables(args, ds, base)
+    terms = tilt.DAY_TERMS + [GROWTH_TERM]
+    clock.step("「市場＋3b＋伸び」の係数を推定中（その fold より前の fold の平場で）...")
+    out, coef = tilt.tilt_walk_forward(full, terms, "tilt3bG")
+    k = ["レースID", "血統登録番号"]
+    merged = merged.merge(out[k + ["tilt3bG"]], on=k, how="inner")
+    TRIALS.append("3b+伸び 市場＋当日の傾向＋AtCoder 型の伸びだけで傾き")
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+    n = merged.loc[~merged["重賞"] & merged["fold"].isin(set(disc_q)), "レースID"].nunique()
+    n = min(n, args.sample) if args.sample else n
+    clock.step(f"{FAVORITE_PLAN} を計算中（平場 {n:,} レース × {len(GROWTH_SOURCES)} 通り）...")
+    rows = evaluate_plan(merged, ds.payout_df, GROWTH_SOURCES, disc_q, sample=args.sample)
+    clock.step("完了\n")
+    vs3b = paired_vs(rows, GROWTH_SOURCES[1][0])
+    adopt, row = growth_judgement(vs3b)
+    verdict = "差し替える（F の確率を「市場＋3b＋伸び」に）" if adopt else "差し替えない（F は「市場＋当日の傾向（3b）」のまま）"
+    print("=" * 100)
+    print(f"■ 判定：{verdict}")
+    print(f"  差（市場＋3b＋伸び − 市場＋3b）= {row['差']:+.2%}  95% 区間 [{row['差の下限']:+.2%}, {row['差の上限']:+.2%}]"
+          f"  p値 {row['p値']:.4f}  レース数 {int(row['レース数']):,}")
+    print(f"  ルール（結果を見る前に決めたもの）：{GROWTH_RULE}")
+    print("=" * 100)
+    print(f"\n=== {FAVORITE_PLAN} の達成率の差（同じレースの対応のある比較。差 = こちら − 市場＋当日の傾向（3b）） ===")
+    _show(vs3b, pct=("差",))
+    vsm = paired_vs(rows, "市場だけ")
+    print(f"\n=== 参考：差 = こちら − 市場だけ ===")
+    _show(vsm, pct=("差",))
+    summ = plan_summary(rows)
+    print(f"\n=== 平場（fold 2 以降）：{FAVORITE_PLAN}（予算 12,000円・基準 50,000円） ===")
+    _show(summ, pct=("率", "限", "確率（", "予測 −"), money=("投資",))
+    by_fold = plan_summary(rows, by=("fold", "確率"))
+    print("\n=== fold ごとの達成率 ===")
+    _show(by_fold[["fold", "確率", "レース数", "達成率", "下限", "上限", "予測の達成確率（平均）"]],
+          pct=("率", "限", "確率（"))
+    flat = experiment.exploration_only(_flat(merged), "3b+伸び")
+    metrics = pd.DataFrame([market.summary_row(flat, c, nm) for nm, c in GROWTH_SOURCES])
+    print("\n=== 平場（fold 2 以降）：log-loss・AUC・キャリブレーション誤差 ===")
+    _show(metrics)
+    print("\n=== キャリブレーション（平場） ===")
+    for nm, c in GROWTH_SOURCES[1:]:
+        print(f"--- {nm} ---")
+        _show(market.calibration_table(flat, c), pct=("平均", "勝率"))
+    sd = _flat(full)[terms].astype("float64").std()
+    print("\n=== 係数（fold ごと。その fold より前の fold の平場で推定）と θ×SD ===")
+    _show(_coef_with_sd(coef, sd))
+    print("    項の標準偏差（平場）: " + " / ".join(f"{a} {b:.4f}" for a, b in sd.items()))
+    judge = pd.DataFrame([{"判定": verdict, "差し替える": adopt, **{c: row[c] for c in
+                                                                ("レース数", "差", "差の下限", "差の上限", "p値")},
+                           "ルール": GROWTH_RULE, "サンプル": args.sample}])
+    _save(args, judge, "growth_judgement")
+    _save(args, pd.concat([vs3b.assign(比べる相手="市場＋当日の傾向（3b）"), vsm.assign(比べる相手="市場だけ")],
+                          ignore_index=True), "growth_paired")
+    _save(args, summ, "growth_summary")
+    _save(args, by_fold, "growth_by_fold")
+    _save(args, metrics, "growth_metrics")
+    _save(args, _coef_with_sd(coef, sd), "growth_coefs")
+    _trials_note()
+    print(f"\n■ 判定（再掲）：{verdict}")
+    if args.sample:
+        print(f"  ※ --sample {args.sample} で一部のレースだけ。判定には --sample 0（既定）の結果を使ってください")
+    return 0
+
+
 def _cmd_final_compare(args) -> int:
     clock = _Clock()
     ds = _load(args, clock)
@@ -1301,6 +1386,9 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--no-rating", dest="with_rating", action="store_false",
                    help="レーティングの版（R・3b+R・A・3b+A）を入れない（4通りになり、時間は約半分）")
     q.set_defaults(func=_cmd_final_compare)
+    q = sub.add_parser("growth-check", help="v8d 市場＋3b＋伸び（AtCoder 型）と 市場＋3b を平場の全レースで（採用の判定つき）")
+    q.add_argument("--sample", type=int, default=0, help="平場のレース数（既定 0 = 全部、約4万2千）")
+    q.set_defaults(func=_cmd_growth_check)
     q = sub.add_parser("real-odds", help="v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）")
     q.add_argument("--sample", type=int, default=0, help="平場サンプルのうち何レース（既定 0 = 全部の約5,000）")
     q.add_argument("--source", default=None, help="確率（既定 tilt3b ＝ 市場＋当日の傾向）")

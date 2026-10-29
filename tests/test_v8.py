@@ -903,3 +903,29 @@ def test_cli_real_odds(v8_env, capsys):
     assert set(ratio["券種"]) == set(bets.KINDS)
     paired = pd.read_csv(v8_env.parent / "v8" / "real_odds_paired.csv", encoding="utf-8-sig")
     assert len(paired) == len(v8.REAL_MARGINS)
+
+
+def test_growth_judgement_rule():
+    from src import v8
+    def paired(lo):
+        return pd.DataFrame([{"確率": "市場＋3b＋伸び", "レース数": 100, "差": lo + 0.01, "差の下限": lo,
+                              "差の上限": lo + 0.02, "p値": 0.1}, {"確率": "市場だけ", "レース数": 100, "差": -0.05,
+                                                              "差の下限": -0.07, "差の上限": -0.03, "p値": 0.01}])
+    assert v8.growth_judgement(paired(0.001))[0] is True
+    assert v8.growth_judgement(paired(0.0))[0] is False          # 「0 を超えたら」なので 0 ちょうどは差し替えない
+    assert v8.growth_judgement(paired(-0.01))[0] is False
+
+
+def test_cli_growth_check(v8_env, capsys):
+    from src import v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "growth-check", "--sample", "25"]) == 0
+    out = capsys.readouterr().out
+    first = [l for l in out.splitlines() if l.startswith("■ 判定")]
+    assert len(first) == 2 and first[0].split("：", 1)[1] == first[1].split("：", 1)[1]
+    assert out.index("■ 判定") < out.index("fold ごとの達成率")   # 判定が最初に出る
+    assert "θ×SD（AtCoder型_伸び）" in out and "平場で比べた案: 1 個" in out
+    assert "θ（AtCoder型_相対）" not in out                        # 伸び以外のレーティングの項は入れない
+    j = pd.read_csv(v8_env.parent / "v8" / "growth_judgement.csv", encoding="utf-8-sig")
+    assert bool(j["差し替える"].iloc[0]) == (j["差の下限"].iloc[0] > 0)
+    s = pd.read_csv(v8_env.parent / "v8" / "growth_summary.csv", encoding="utf-8-sig")
+    assert set(s["確率"]) == {n for n, _ in v8.GROWTH_SOURCES} and s["レース数"].nunique() == 1
