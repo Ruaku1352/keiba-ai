@@ -1186,6 +1186,56 @@ def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.Pat
     return counts
 
 
+def fetch_rt_results(date: str, out_dir: str | os.PathLike, client: JVLinkClient | None = None,
+                     sid: str = "UNKNOWN", struct_module: ModuleType | None = None, keys: list[str] | None = None,
+                     dataspec: str = "0B12", sleep=time.sleep, log=print, max_wait_sec: float = 60) -> dict:
+    """その日の速報成績（JVRTOpen 0B12。RA・SE・HR）を取り、out_dir/RA.csv・SE.csv・HR.csv に追記する（v10 当日の仕組み）。
+
+    キーは開催日単位の "YYYYMMDD"。keys（"YYYYMMDDJJKKHHRR" のレース単位）を渡すとレースごとに取る
+    （開催日単位のキーが使えないときの予備）。何回実行してもよい（同じレースの版は読むときに jvmap.dedupe_records で1つにする）。
+    戻り値: {"レコード": {種別: 件数}, "エラー": [..], "データなし": 件数}
+    """
+    out_dir = Path(out_dir)
+    module = struct_module or load_struct_module()
+    client = client or JVLinkClient()                 # RA・SE・HR は最大 1,272 バイトなので既定の 2,048 で足りる（速い）
+    writers = {rt: CsvAppender(out_dir / f"{rt}.csv", columns_for(rt, module)) for rt in RECORD_STRUCTS}
+    counts = {"レコード": {rt: 0 for rt in RECORD_STRUCTS}, "エラー": [], "データなし": 0}
+    client.init(sid)
+    for key in keys or [date]:
+        code = client.rt_open(dataspec, key)
+        if code == -1:
+            counts["データなし"] += 1
+            client.close()
+            continue
+        if code < 0:
+            counts["エラー"].append(f"{key}: JVRTOpen {code} {ERROR_ADVICE.get(code, '')}")
+            client.close()
+            continue
+        waited = 0.0
+        while True:
+            c, raw, _ = client.gets()
+            if c > 0:
+                parsed = parse_record(raw, module)
+                if parsed is not None:
+                    rt, row = parsed
+                    writers[rt].append(row)
+                    counts["レコード"][rt] += 1
+            elif c == -1:
+                continue
+            elif c == 0:
+                break
+            elif c == -3 and waited < max_wait_sec:
+                sleep(0.2)
+                waited += 0.2
+            else:
+                counts["エラー"].append(f"{key}: JVGets {c}")
+                break
+        client.close()
+    for w in writers.values():
+        w.flush()
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # コマンドライン（Windows で 1 コマンドずつ確認するため）
 # ---------------------------------------------------------------------------

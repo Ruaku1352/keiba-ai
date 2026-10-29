@@ -149,6 +149,15 @@ py -m src.v8 growth-check    # v8d 市場＋3b＋伸び と 市場＋3b（平場
 py -m src.v8 place-check     # v8e 2・3着への来やすさ P1・P2・P3 と F（記述的な確認・採用の判定つき）
 ```
 
+当日の仕組み（F の買い目を毎週末の重賞で自動で。有馬記念のリハーサル。手順は [docs/v10_raceday.md](docs/v10_raceday.md)）:
+
+```powershell
+py -m src.raceday prep --date 20261101 --schedule   # 前の晩（出馬表の取り込みのあと）。タスクスケジューラにも登録
+py -m src.raceday update --date 20261101            # 当日（タスクスケジューラが10分おき＋発走60分前・20分前に）
+py -m src.raceday score --sheet                     # 月曜：最終の買い目を実際の払戻で答え合わせ（6頭BOX と並べる）
+py -m src.raceday replay --date 20261025            # 練習：過去の日の流れを再現（平日に）
+```
+
 重賞で1回だけの確認のテスト（F・F2・B。内容とルールは先に固定。[docs/v9_confirm.md](docs/v9_confirm.md)）:
 
 ```powershell

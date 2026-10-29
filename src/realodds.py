@@ -142,3 +142,49 @@ class RatioStats:
                              "推定が2割以上高い": frac(h, np.log(1.2), np.inf),
                              "推定が2割以上低い": frac(h, -np.inf, -np.log(1.2))})
         return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# v10 当日の仕組み：1レースぶんのオッズ（速報のその時点の版、または確定）
+# ---------------------------------------------------------------------------
+SNAPSHOT_TYPES = {"単勝": "O1", **KIND_TYPES}
+
+
+def load_race_odds(directory, race_id: str, before: str | None = None, final_only: bool = False) -> dict | None:
+    """directory に保存したオッズ（npz）から、1レースぶんの一番新しい版を読む。
+
+    before（"YYYY-MM-DD HH:MM:SS"）を渡すと、その時刻までに取ったものだけ（ドライランで「その時点」を再現する）。
+    戻り値: {"単勝": {馬番: オッズ}, "馬連"・"馬単"・"3連複"・"3連単": (組の馬番, 100円あたりの配当),
+             "発表": "MMDDhhmm", "取得時刻": ..., "データ区分": ...}。単勝が無ければ None。
+    """
+    from pathlib import Path
+
+    d = Path(directory)
+    out: dict = {}
+    for kind, rt in SNAPSHOT_TYPES.items():
+        files = odds._load_files(d.glob(f"{rt}_*.npz"))
+        if not files:
+            continue
+        races = odds.select_versions(files, {str(race_id)}, final_only=final_only, latest=False)
+        if before is not None:
+            races = races.loc[races["fetched_at"].astype(str) <= before]
+        if races.empty:
+            continue
+        races = races.assign(_pri=races["kubun"].map(odds.KUBUN_PRIORITY).fillna(0))
+        last = races.sort_values(["fetched_at", "_pri", "make_date", "file", "seq"]).iloc[-1]
+        f = next(x for x in files if x["file"] == last["file"])
+        bounds = np.searchsorted(f["row_race"], np.arange(len(f["race_id"]) + 1))
+        a, b = bounds[last["local"]], bounds[last["local"] + 1]
+        k = f["kumi"][a:b].astype(np.int64)
+        o = f["odds10"][a:b]
+        ok = o > 0
+        k, o = k[ok], o[ok].astype("float64")
+        if kind == "単勝":
+            out["単勝"] = {int(x): float(v) / 10 for x, v in zip(k, o)}
+            out.update({"発表": str(last["announced"]), "取得時刻": str(last["fetched_at"]),
+                        "データ区分": str(last["kubun"])})
+        else:
+            horses = (np.column_stack([k // 10000, (k // 100) % 100, k % 100]) if rt in ("O5", "O6")
+                      else np.column_stack([k // 100, k % 100]))
+            out[kind] = (horses, o * 10)
+    return out if "単勝" in out else None

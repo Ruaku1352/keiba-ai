@@ -223,3 +223,27 @@ def prediction_rows(table: pd.DataFrame) -> pd.DataFrame:
     out = table[ENTRY_COLUMNS].copy()
     out["予測確率"] = out["予測確率"].astype(float).round(4)
     return out
+
+
+# ---------------------------------------------------------------------------
+# v10 当日の買い目：タブ全体を書き直す（手入力の欄が無い、こちらで作るだけのタブ）
+# ---------------------------------------------------------------------------
+def open_or_add_worksheet(settings: SheetSettings, title: str, rows: int = 400, cols: int = 14):
+    """ワークシートを開く。無ければ作る。"""
+    import gspread
+
+    client = gspread.service_account(filename=settings.key_file)
+    book = client.open_by_key(settings.spreadsheet_id)
+    try:
+        return book.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return book.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def write_grid(ws, values: list[list]) -> None:
+    """タブの中身を values で置き換える（前の内容は消す）。行ごとに長さが違ってよい。"""
+    width = max((len(r) for r in values), default=1)
+    grid = [[_cell(v, "") for v in r] + [""] * (width - len(r)) for r in values]
+    ws.clear()
+    if grid:
+        ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
