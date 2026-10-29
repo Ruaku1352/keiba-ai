@@ -13,6 +13,7 @@
     py -m src.v8 final-compare     今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
     py -m src.v8 real-odds         v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
     py -m src.v8 growth-check      v8d 市場＋3b＋伸び と 市場＋3b を平場の全レースで（採用の判定つき）
+    py -m src.v8 place-check       v8e 2・3着への来やすさ（P1・P2・P3）と F（記述的な確認・採用の判定つき）
     py -m src.v8 odds-targets      過去の確定オッズを取り直すレースの一覧（重賞＋平場の検証用5,000）
     py -m src.v8 odds-drift        速報オッズ（rt-odds）と確定オッズ（fetch-odds）のずれ
 
@@ -26,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import statistics
 import time
 from dataclasses import dataclass
 
@@ -703,8 +705,9 @@ TILT_SOURCES = [("市場だけ", "市場確率"), ("市場＋当日の傾向（3
                 ("市場＋当日＋開催（3b+3c）", "tilt3bc")]
 
 
-def paired_vs(rows: pd.DataFrame, base_name: str, by: str = "確率", target: float = bets.TARGET) -> pd.DataFrame:
-    """同じレースで、base_name と他の条件の「熱い当たり（払戻 ≥ 基準）」を対応のある比較で。"""
+def paired_vs(rows: pd.DataFrame, base_name: str, by: str = "確率", target: float = bets.TARGET,
+              z: float = 1.96) -> pd.DataFrame:
+    """同じレースで、base_name と他の条件の「熱い当たり（払戻 ≥ 基準）」を対応のある比較で（区間の幅は z）。"""
     from . import trifecta as tri
     hot = rows.assign(熱い=rows["払戻"] >= target).pivot_table(index="レースID", columns=by, values="熱い",
                                                                aggfunc="first")
@@ -713,7 +716,7 @@ def paired_vs(rows: pd.DataFrame, base_name: str, by: str = "確率", target: fl
         if name == base_name:
             continue
         both = hot[[name, base_name]].dropna()
-        t = tri.paired_proportion_test(both[name].astype(bool).to_numpy(), both[base_name].astype(bool).to_numpy())
+        t = tri.paired_proportion_test(both[name].astype(bool).to_numpy(), both[base_name].astype(bool).to_numpy(), z)
         out.append({by: name, "レース数": t["n"], "こちらだけ熱い当たり": t["xだけ"],
                     f"{base_name}だけ熱い当たり": t["yだけ"], "両方": t["両方"],
                     "差": t["差"], "差の下限": t["差下限"], "差の上限": t["差上限"], "p値": t["p値"]})
@@ -786,8 +789,11 @@ def _best_tilt_source(args) -> tuple[str, str]:
 
 
 def _plan_races(table: pd.DataFrame, payout: pd.DataFrame, cols: list[str], disc_q: dict, sample: int, seed: int,
-                what: str, verbose: bool):
-    """平場（γ・δ のある fold）のレースを1つずつ：(レースID, fold, 馬番, 当たりの組, 市場の組の確率 Q, {列: (P, p)})。"""
+                what: str, verbose: bool, with_rows: bool = False):
+    """平場（γ・δ のある fold）のレースを1つずつ：(レースID, fold, 馬番, 当たりの組, 市場の組の確率 Q, {列: (P, p)})。
+
+    with_rows=True なら、最後に (そのレースの行, γ, δ) も付ける（段ごとの強さを変えた 3連単の確率を作るため）。
+    """
     flat = experiment.exploration_only(_flat(table), what)
     flat = flat.loc[flat["fold"].isin(set(disc_q))]
     rids = flat["レースID"].unique()
@@ -816,8 +822,9 @@ def _plan_races(table: pd.DataFrame, payout: pd.DataFrame, cols: list[str], disc
             continue
         g, d, _ = disc_q[r["fold"].iloc[0]]
         Q = market.combo_probabilities(market.trifecta_tensor(q, g, d))
-        yield rid, r["fold"].iloc[0], posts.astype(int), wins, Q, {c: (market.trifecta_tensor(p, g, d), p)
-                                                                   for c, p in ps.items()}
+        out = (rid, r["fold"].iloc[0], posts.astype(int), wins, Q, {c: (market.trifecta_tensor(p, g, d), p)
+                                                                    for c, p in ps.items()})
+        yield out + ((r, g, d),) if with_rows else out
 
 
 def evaluate_stakes(table: pd.DataFrame, payout: pd.DataFrame, col: str, disc_q: dict, sample: int = 0,
@@ -1081,6 +1088,334 @@ def _cmd_growth_check(args) -> int:
     _save(args, _coef_with_sd(coef, sd), "growth_coefs")
     _trials_note()
     print(f"\n■ 判定（再掲）：{verdict}")
+    if args.sample:
+        print(f"  ※ --sample {args.sample} で一部のレースだけ。判定には --sample 0（既定）の結果を使ってください")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v8e 2・3着への来やすさ（P1・P2・P3）。採用のルールは結果を見る前に決めたもの
+# ---------------------------------------------------------------------------
+F_NAME = "F（市場＋3b）"
+PLACE_NAMES = {"P1": "P1 過去の成績から見た2・3着への来やすさ", "P2": "P2 3連複のオッズから見た来やすさ",
+               "P3": "P3 伸びを1着の段だけに"}
+PLACE_Z = statistics.NormalDist().inv_cdf(1 - 0.05 / 3 / 2)        # 98.3% 区間（95% を3案で割った厳しさ）
+PLACE_RULE = ("各案と F（市場＋3b）の達成率の差の 98.3% 区間（95% を3案で割った厳しさ）の下限が 0 を超えた案を合格とし、"
+              "合格が複数なら差が一番大きい案を採用して重賞のテストの F をその案に差し替える。"
+              "どれも合格しなければ F は「市場＋当日の傾向（3b）」のまま")
+
+
+def place_judgement(paired: pd.DataFrame) -> tuple[str | None, pd.DataFrame]:
+    """採用のルールでの判定。paired は案ごとの F との比較（列 確率・差・差の下限）。戻り値: (採用する案の名前 or None, 合格の表)。"""
+    t = paired.assign(合格=paired["差の下限"] > 0)
+    ok = t.loc[t["合格"]]
+    return (None if ok.empty else str(ok.sort_values("差", ascending=False).iloc[0]["確率"])), t
+
+
+def place_feature_frame(ds, cutoff: pd.Timestamp, verbose: bool = True):
+    """P1 の来やすさ（data/v8/place_feature.pkl に保存して使い回す）。"""
+    from . import place, preprocess
+    rr = preprocess.basic_clean(ds.race_result)
+    key = hashlib.sha1("|".join(["place-v1", str(cutoff), str(len(rr)), str(rr["レースID"].nunique()),
+                                 str(rr["レース日付"].max())]).encode()).hexdigest()
+    path = experiment.v8_dir() / "place_feature.pkl"
+    if path.exists():
+        saved = pd.read_pickle(path)
+        if saved.get("key") == key:
+            return saved["table"], saved["base"]
+    if verbose:
+        print(f"[v8] 2・3着への来やすさ（P1）を計算中（{rr['レースID'].nunique():,} レース。数分）...", flush=True)
+    table, base = place.past_place_feature(rr, cutoff)
+    pd.to_pickle({"key": key, "table": table, "base": base}, path)
+    return table, base
+
+
+def _with_growth(full: pd.DataFrame, merged: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """市場＋3b＋伸び（growth-check と同じ推定）の確率 tilt3bG を merged に足す。"""
+    from . import tilt
+    out, coef = tilt.tilt_walk_forward(full, tilt.DAY_TERMS + [GROWTH_TERM], "tilt3bG")
+    k = ["レースID", "血統登録番号"]
+    return merged.merge(out[k + ["tilt3bG"]], on=k, how="inner"), coef
+
+
+def place_descriptive(flat: pd.DataFrame, disc_q: dict, prob_col: str = "tilt3b") -> pd.DataFrame:
+    """0 の記述的な確認：F の確率（Henery 型）で予測した 1着・2・3着・3着以内の確率と実際を、過去の成績の型で分けて比べる。"""
+    from . import place
+    parts = []
+    for f, g in flat.groupby("fold", sort=False):
+        if f not in disc_q:
+            continue
+        c = place.clean_races(g, prob_col)
+        rows, m = place._batched_marginals(c, prob_col, {"γ": disc_q[f][0], "δ": disc_q[f][1]})
+        parts.append(c.loc[rows].assign(予測_1着=m[:, 0], 予測_23着=m[:, 1] + m[:, 2]))
+    t = pd.concat(parts)
+    rank = pd.to_numeric(t["着順"], errors="coerce")
+    t["実際_1着"] = (rank == 1).astype(float)
+    t["実際_23着"] = rank.isin([2, 3]).astype(float)
+    enough = t["過去の有効走数"] >= 3
+    t["型A"] = "過去3走未満"
+    t.loc[enough, "型A"] = pd.qcut(t.loc[enough, "来やすさ"].rank(method="first"), 5,
+                                  labels=[f"来やすさ 第{i}五分位（{'小' if i == 1 else '大' if i == 5 else '中'}）"
+                                          for i in range(1, 6)]).astype(str)
+    ratio = (t["過去の2・3着"] + 1) / (t["過去の1着"] + 1)
+    t["型B"] = "過去3走未満"
+    t.loc[enough, "型B"] = pd.cut(ratio[enough], [0, 1, 2, 3, 5, np.inf], right=False,
+                                 labels=["(2・3着+1)÷(1着+1) <1", "1〜2", "2〜3", "3〜5", "5以上"]).astype(str)
+    out = []
+    for kind, col in [("A 来やすさ（1着の確率から見込まれる以上に2・3着に来ていたか）", "型A"),
+                      ("B 過去の2・3着の多さ÷1着の多さ", "型B")]:
+        for name, g in t.groupby(col, sort=True):
+            row = {"型": kind, "区分": name, "頭数": len(g)}
+            for what in ("1着", "23着"):
+                pr, ac = g[f"予測_{what}"], g[f"実際_{what}"]
+                se = float(np.sqrt((pr * (1 - pr)).sum())) / len(g)
+                label = "2・3着" if what == "23着" else "1着"
+                row.update({f"予測の{label}率": pr.mean(), f"実際の{label}率": ac.mean(),
+                            f"{label}のずれ（実際−予測）": ac.mean() - pr.mean(),
+                            f"{label}のずれの下限": ac.mean() - pr.mean() - 1.96 * se,
+                            f"{label}のずれの上限": ac.mean() - pr.mean() + 1.96 * se})
+            out.append(row)
+    return pd.DataFrame(out)
+
+
+def _descriptive_verdict(desc: pd.DataFrame) -> str:
+    """来やすさの一番上と一番下の五分位で、2・3着のずれに差があるか（差の 95% 区間が 0 をまたぐか）。"""
+    a = desc.loc[desc["区分"].str.contains("第5五分位")]
+    b = desc.loc[desc["区分"].str.contains("第1五分位")]
+    if a.empty or b.empty:
+        return "（五分位が作れず、判定できません）"
+    col = "2・3着のずれ（実際−予測）"
+    diff = float(a[col].iloc[0] - b[col].iloc[0])
+    se = np.hypot((a[col].iloc[0] - a["2・3着のずれの下限"].iloc[0]) / 1.96,
+                  (b[col].iloc[0] - b["2・3着のずれの下限"].iloc[0]) / 1.96)
+    lo, hi = diff - 1.96 * se, diff + 1.96 * se
+    seen = "系統的なずれがある（仮説を支える）" if lo > 0 or hi < 0 else "系統的なずれは見えない（仮説は弱い）"
+    return (f"来やすさ 第5五分位 − 第1五分位 の「2・3着のずれ」の差 = {diff:+.2%} [{lo:+.2%}, {hi:+.2%}] → {seen}")
+
+
+def _stage_fits(table: pd.DataFrame, folds: list, prob_col: str, x_col: str, avail=None) -> tuple[dict, pd.DataFrame]:
+    """fold ごとに、それより前の fold の平場で (γ, φ, δ, ψ) を推定する。avail: 推定に使える fold（P2 は平場サンプルのある fold）。"""
+    from . import place
+    coefs, rows = {}, []
+    flat = table.loc[~table["重賞"]]
+    for i, f in enumerate(folds):
+        if i == 0:
+            continue
+        use = [x for x in folds[:i] if avail is None or x in avail]
+        fit_rows = flat.loc[flat["fold"].isin(use)]
+        if fit_rows["レースID"].nunique() < 30:
+            continue
+        c = place.fit_stages(fit_rows, prob_col, x_col)
+        plain = place.fit_stages(fit_rows, prob_col)
+        coefs[f] = c
+        rows.append({"検証fold": f, "推定に使った fold": ",".join(map(str, use)), "推定レース数": c["レース数"],
+                     "γ": c["γ"], "φ（2着の段）": c["φ"], "δ": c["δ"], "ψ（3着の段）": c["ψ"],
+                     "γ（項なし）": plain["γ"], "δ（項なし）": plain["δ"]})
+    return coefs, pd.DataFrame(rows)
+
+
+def evaluate_place_plans(table: pd.DataFrame, payout: pd.DataFrame, disc_q: dict, specs: dict, cols: list[str],
+                         race_ids=None, sample: int = 0, verbose: bool = True) -> pd.DataFrame:
+    """今の本命の買い方を、3連単の確率の作り方（specs: 名前 → 関数(行, fold, γ, δ, F の P) → (P, 順位づけの p)）ごとに。
+
+    1レース・1確率1行（並びの −log 尤度の列も）。
+    """
+    if race_ids is not None:
+        table = table.loc[table["レースID"].isin(set(race_ids))]
+    out = []
+    for rid, fold, posts, wins, Q, ps, (r, g, d) in _plan_races(table, payout, cols, disc_q, sample, 0, "2・3着",
+                                                                 verbose, with_rows=True):
+        rank = pd.to_numeric(r["着順"], errors="coerce").to_numpy()
+        pos = [np.flatnonzero(rank == k) for k in (1, 2, 3)]
+        clean = all(len(x) == 1 for x in pos)
+        for name, make in specs.items():
+            made = make(r, fold, g, d, ps)
+            if made is None:
+                continue
+            P, p = made
+            plan = bets.mixed(P, Q, p, posts, margin=FAVORITE_MARGIN, max_points=FAVORITE_LIMIT)
+            nll = float(-np.log(max(P[pos[0][0], pos[1][0], pos[2][0]], 1e-12))) if clean else np.nan
+            out.append({"レースID": rid, "fold": fold, "確率": name, "投資": plan.invest,
+                        "払戻": bets.realized(plan, wins), "予測の達成確率": plan.predicted,
+                        "点数": len(plan.bets), "並びの−log尤度": nll})
+    return pd.DataFrame(out)
+
+
+def _nll_table(rows: pd.DataFrame) -> pd.DataFrame:
+    return (rows.groupby("確率", sort=False)["並びの−log尤度"].agg(["mean", "count"])
+            .rename(columns={"mean": "並びの−log尤度（1レース平均。小さいほど良い）", "count": "レース数"}).reset_index())
+
+
+def _cmd_place_check(args) -> int:
+    from . import place, realodds
+    clock = _Clock()
+    ds = _load(args, clock)
+    base = _oof(args, ds, "base")
+    merged, _, full = tilt_tables(args, ds, base)
+    folds = [f.name for f in _folds(args)]
+    cutoff = pd.Timestamp(min(f.test_years[0] for f in _folds(args)), 1, 1)
+    pf, pf_base = place_feature_frame(ds, cutoff)
+    k = ["レースID", "血統登録番号"]
+    feat = pf[k + [place.PLACE_TERM, "過去の有効走数", "過去の1着", "過去の2・3着"]]
+    clock.step("市場＋3b＋伸び（P3 の1着の段）を推定中 ...")
+    merged, coef_g = _with_growth(full, merged)
+    merged = merged.merge(feat, on=k, how="left")
+    TRIALS.extend([PLACE_NAMES["P1"], PLACE_NAMES["P2"], PLACE_NAMES["P3"]])
+    clock.step("市場の γ・δ を推定中 ...")
+    disc_q = fold_discounts(merged, "市場確率", base.table)
+
+    # ---- 0 記述的な確認（案の数には入れない） ----
+    clock.step("0 記述的な確認（F の確率で予測した 1着・2・3着の確率と実際）...")
+    flat = experiment.exploration_only(_flat(merged), "2・3着の記述的な確認")
+    desc = place_descriptive(flat, disc_q)
+    verdict0 = _descriptive_verdict(desc)
+
+    # ---- P1 の係数（その fold より前の fold の平場。1つ目の fold は1段目のモデルの表から） ----
+    early = base.table.loc[~base.table["fold"].isin(set(merged["fold"]))].merge(feat, on=k, how="left")
+    fit_table = pd.concat([early, merged], ignore_index=True)
+    coef1, coef1_t = _stage_fits(fit_table, folds, "市場確率", place.PLACE_TERM)
+
+    # ---- P2：平場サンプルの 3連複の確定オッズ ----
+    p2_rows = pd.DataFrame()
+    coef2_t = pd.DataFrame()
+    path = experiment.v8_dir() / "odds_targets.csv"
+    sample_ids = []
+    if path.exists():
+        targets = pd.read_csv(path, dtype={"レースID": str}, encoding="utf-8-sig")
+        sample_ids = targets.loc[targets["区分"] == "平場サンプル", "レースID"].tolist()   # 重賞は読まない
+    trio = realodds.load_final_odds(sample_ids, base=args.data, kinds=("3連複",)) if sample_ids else {}
+    if trio:
+        clock.step(f"P2 市場の来やすさを計算中（3連複の確定オッズ {len(trio):,} レース）...")
+        s = merged.loc[merged["レースID"].astype(str).isin(set(trio)) & ~merged["重賞"]
+                       & merged["fold"].isin(set(disc_q))]
+        s, starts = market.race_slices(s)
+        x2 = np.full(len(s), np.nan)
+        for a, b in zip(starts[:-1], starts[1:]):
+            r = s.iloc[a:b]
+            e = trio[str(r["レースID"].iloc[0])].get("3連複")
+            q = r["市場確率"].to_numpy(dtype="float64")
+            posts = pd.to_numeric(r["馬番"], errors="coerce").to_numpy()
+            if e is None or not (np.isfinite(q).all() and (q > 0).all() and np.isfinite(posts).all()):
+                continue
+            g, d, _ = disc_q[r["fold"].iloc[0]]
+            w2, w3 = place.stage_weights(q, {"γ": g, "δ": d})
+            hen = place.marginals_batch(place.stage_tensor(q, w2, w3)[None])[0].sum(axis=1)
+            mk = place.trio_top3(e[0], e[1], posts.astype(int))
+            with np.errstate(divide="ignore"):
+                x2[a:b] = np.where((mk > 0) & (hen > 0), np.log(mk) - np.log(hen), np.nan)
+        s[place.MARKET_PLACE_TERM] = x2
+        merged = merged.merge(s[k + [place.MARKET_PLACE_TERM]], on=k, how="left")
+        avail = sorted(set(s["fold"]), key=folds.index)
+        coef2, coef2_t = _stage_fits(merged.loc[merged["レースID"].astype(str).isin(set(trio))], folds, "市場確率",
+                                     place.MARKET_PLACE_TERM, avail=set(avail))
+    else:
+        coef2 = {}
+        print("[v8] 3連複の確定オッズ（O5）が見つからないので P2 は飛ばします"
+              "（`py -m src.v8 odds-targets` と `py -m src.jvlink fetch-odds --targets ...` のあと）")
+
+    # ---- 3連単の確率の作り方 ----
+    def make_f(r, fold, g, d, ps):
+        return ps["tilt3b"]
+
+    def make_p1(r, fold, g, d, ps):
+        if fold not in coef1:
+            return None
+        p = ps["tilt3b"][1]
+        w2, w3 = place.stage_weights(p, coef1[fold], r[place.PLACE_TERM].to_numpy(dtype="float64"))
+        return place.stage_tensor(p, w2, w3), p
+
+    def make_p2(r, fold, g, d, ps):
+        if fold not in coef2:
+            return None
+        p = ps["tilt3b"][1]
+        x = r[place.MARKET_PLACE_TERM].to_numpy(dtype="float64")
+        if not np.isfinite(x).any():
+            return None
+        w2, w3 = place.stage_weights(p, coef2[fold], x)
+        return place.stage_tensor(p, w2, w3), p
+
+    def make_p3(r, fold, g, d, ps):
+        pg = ps["tilt3bG"][1]
+        w2, w3 = place.stage_weights(ps["tilt3b"][1], {"γ": g, "δ": d})   # 2・3着の段は 市場＋3b のまま
+        return place.stage_tensor(pg, w2, w3), pg
+
+    n_all = merged.loc[~merged["重賞"] & merged["fold"].isin(set(disc_q)), "レースID"].nunique()
+    n_all = min(n_all, args.sample) if args.sample else n_all
+    clock.step(f"P1・P3 と F を計算中（平場 {n_all:,} レース × 3通り）...")
+    rows13 = evaluate_place_plans(merged, ds.payout_df, disc_q,
+                                  {F_NAME: make_f, PLACE_NAMES["P1"]: make_p1, PLACE_NAMES["P3"]: make_p3},
+                                  ["tilt3b", "tilt3bG"], sample=args.sample)
+    rows2 = pd.DataFrame()
+    if coef2:
+        ids2 = merged.loc[merged[place.MARKET_PLACE_TERM].notna() & merged["fold"].isin(set(coef2)), "レースID"].unique()
+        clock.step(f"P2 と F を計算中（平場サンプル {len(ids2):,} レース × 2通り）...")
+        rows2 = evaluate_place_plans(merged, ds.payout_df, disc_q, {F_NAME: make_f, PLACE_NAMES["P2"]: make_p2},
+                                     ["tilt3b"], race_ids=ids2)
+        # P2 の無いレース（3連複のオッズが欠けた・fold に係数が無い）は F の行も落として同じレースで比べる
+        has = set(rows2.loc[rows2["確率"] == PLACE_NAMES["P2"], "レースID"])
+        rows2 = rows2.loc[rows2["レースID"].isin(has)]
+    clock.step("完了\n")
+    rows13 = rows13.loc[rows13["レースID"].isin(set(rows13.loc[rows13["確率"] == PLACE_NAMES["P1"], "レースID"]))]
+
+    paired = [paired_vs(rows13, F_NAME, z=PLACE_Z)]
+    if not rows2.empty:
+        paired.append(paired_vs(rows2, F_NAME, z=PLACE_Z))
+    paired = pd.concat(paired, ignore_index=True)
+    adopt, judged = place_judgement(paired)
+
+    print("=" * 110)
+    print(f"■ 判定：{'差し替える → ' + adopt if adopt else '差し替えない（F は「市場＋当日の傾向（3b）」のまま）'}")
+    for _, r in judged.iterrows():
+        print(f"  {r['確率']}: 差 {r['差']:+.2%}  98.3% 区間 [{r['差の下限']:+.2%}, {r['差の上限']:+.2%}]  p値 {r['p値']:.4f}"
+              f"  レース数 {int(r['レース数']):,}  → {'合格' if r['合格'] else '不合格'}")
+    if rows2.empty:
+        print("  P2 は計算していません（3連複の確定オッズが無い）。判定は P1・P3 だけで、区間は 98.3% のまま")
+    print(f"  ルール（結果を見る前に決めたもの）：{PLACE_RULE}")
+    print(f"  0 記述的な確認：{verdict0}")
+    print("=" * 110)
+
+    print("\n=== 0 記述的な確認（平場 fold 2 以降。F の確率＝市場＋3b を Henery 型にしたもので予測。案の数には入れない） ===")
+    print(f"    来やすさの基準（過去のレースの予測）に使った γ・δ：{pf_base['γ']:.3f}・{pf_base['δ']:.3f}"
+          f"（{cutoff:%Y-%m-%d} より前の {pf_base['推定レース数']:,} レースで推定）")
+    _show(desc, pct=("率", "ずれ"))
+    print(f"    {verdict0}")
+    print(f"\n=== 対応のある比較（同じレース。差 = その案 − {F_NAME}。区間は 98.3%） ===")
+    _show(judged.drop(columns=["合格"]), pct=("差",))
+    summ = [plan_summary(rows13).assign(比べたレース="平場の全レース（fold 2〜5）")]
+    if not rows2.empty:
+        summ.append(plan_summary(rows2).assign(比べたレース="平場サンプル（3連複のオッズあり）"))
+    summ = pd.concat(summ, ignore_index=True)
+    print(f"\n=== {FAVORITE_PLAN} の達成率 ===")
+    _show(summ, pct=("率", "限", "確率（", "予測 −"), money=("投資",))
+    by_fold = pd.concat([plan_summary(x, by=("fold", "確率")) for x in (rows13, rows2) if not x.empty],
+                        ignore_index=True)
+    print("\n=== fold ごとの達成率 ===")
+    _show(by_fold[["fold", "確率", "レース数", "達成率", "下限", "上限", "予測の達成確率（平均）"]],
+          pct=("率", "限", "確率（"))
+    nll = pd.concat([_nll_table(x).assign(比べたレース=w) for x, w in
+                     [(rows13, "平場の全レース"), (rows2, "平場サンプル")] if not x.empty], ignore_index=True)
+    print("\n=== 3連単の並びの −log 尤度（2c と同じ指標。実際の 1〜3着の並びの確率） ===")
+    _show(nll)
+    print("\n=== 係数 P1（2・3着の段。その fold より前の fold の平場で、実際の 2着・3着の選ばれ方の尤度で推定） ===")
+    _show(coef1_t)
+    sd1 = float(_flat(merged)[place.PLACE_TERM].std())
+    print(f"    来やすさの標準偏差（平場）: {sd1:.4f}。φ×SD・ψ×SD = 1標準偏差で 2・3着の段の強さの log がどれだけ変わるか："
+          + " / ".join(f"fold{r['検証fold']} {r['φ（2着の段）'] * sd1:+.3f}・{r['ψ（3着の段）'] * sd1:+.3f}"
+                       for _, r in coef1_t.iterrows()))
+    if not coef2_t.empty:
+        print("\n=== 係数 P2（平場サンプルの、それより前の fold で推定。fold 2 は前の fold にサンプルが無いので評価しない） ===")
+        _show(coef2_t)
+    print("\n=== 係数 P3 の1着の段（市場＋3b＋伸び。growth-check と同じ） ===")
+    _show(coef_g)
+    judge = judged.assign(採用=judged["確率"] == adopt, ルール=PLACE_RULE)
+    _save(args, judge, "place_judgement")
+    _save(args, desc, "place_descriptive")
+    _save(args, summ, "place_summary")
+    _save(args, by_fold, "place_by_fold")
+    _save(args, nll, "place_loglik")
+    _save(args, pd.concat([coef1_t.assign(案="P1"), coef2_t.assign(案="P2")], ignore_index=True), "place_coefs")
+    _trials_note()
+    print(f"\n■ 判定（再掲）：{'差し替える → ' + adopt if adopt else '差し替えない（F は「市場＋当日の傾向（3b）」のまま）'}")
     if args.sample:
         print(f"  ※ --sample {args.sample} で一部のレースだけ。判定には --sample 0（既定）の結果を使ってください")
     return 0
@@ -1389,6 +1724,9 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("growth-check", help="v8d 市場＋3b＋伸び（AtCoder 型）と 市場＋3b を平場の全レースで（採用の判定つき）")
     q.add_argument("--sample", type=int, default=0, help="平場のレース数（既定 0 = 全部、約4万2千）")
     q.set_defaults(func=_cmd_growth_check)
+    q = sub.add_parser("place-check", help="v8e 2・3着への来やすさ P1・P2・P3 と F（市場＋3b）を平場で（採用の判定つき）")
+    q.add_argument("--sample", type=int, default=0, help="P1・P3 の平場のレース数（既定 0 = 全部、約4万2千）")
+    q.set_defaults(func=_cmd_place_check)
     q = sub.add_parser("real-odds", help="v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）")
     q.add_argument("--sample", type=int, default=0, help="平場サンプルのうち何レース（既定 0 = 全部の約5,000）")
     q.add_argument("--source", default=None, help="確率（既定 tilt3b ＝ 市場＋当日の傾向）")

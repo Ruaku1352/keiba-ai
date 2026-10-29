@@ -146,6 +146,7 @@ py -m src.v8 rating          # v8c 馬のレーティング（Plackett-Luce 型�
 py -m src.v8 final-compare   # 今の本命の買い方で、確率の出し方を平場の全レースで比べる（夜に回す）
 py -m src.v8 real-odds       # v8d 本物の確定オッズで券種混合の金額を決める（平場サンプル）
 py -m src.v8 growth-check    # v8d 市場＋3b＋伸び と 市場＋3b（平場の全レース。採用の判定つき）
+py -m src.v8 place-check     # v8e 2・3着への来やすさ P1・P2・P3 と F（記述的な確認・採用の判定つき）
 ```
 
 確定オッズの保存・当日の速報オッズ（任意。いつもの fetch は変わらない）:

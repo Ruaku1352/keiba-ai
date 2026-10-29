@@ -192,7 +192,7 @@ def two_proportion_test(hits_a: int, n_a: int, hits_b: int, n_b: int) -> dict:
             "差下限": lower, "差上限": upper, "有意": bool(p_value < 0.05)}
 
 
-def paired_proportion_test(x, y) -> dict:
+def paired_proportion_test(x, y, z: float = 1.96) -> dict:
     """同じレースを2通りで判定したときの割合の差（x − y）の検定と信頼区間。
 
     例）同じ検証レースで、学習開始 1995年のモデルと 2003年のモデルの「熱い当たり」を比べる。
@@ -200,6 +200,7 @@ def paired_proportion_test(x, y) -> dict:
     この相関を無視するので区間が広すぎる。ここでは対応のある比較を使う:
       差の区間: Newcombe (1998) の方法10（各割合の Wilson 区間と、2つの判定の相関 φ から組み立てる）
       p値     : 正確な McNemar 検定（片方だけが当たったレース b, c の二項検定）
+    z は区間の幅（1.96 = 95%。複数の案を比べるときに厳しくする。例: 2.394 = 98.3%）
     """
     x = np.asarray(x, dtype=bool)
     y = np.asarray(y, dtype=bool)
@@ -212,8 +213,8 @@ def paired_proportion_test(x, y) -> dict:
     c = int((~x & y).sum())
     d = n - a - b - c
     p1, p2 = (a + b) / n, (a + c) / n
-    l1, u1 = wilson_interval(a + b, n)
-    l2, u2 = wilson_interval(a + c, n)
+    l1, u1 = wilson_interval(a + b, n, z)
+    l2, u2 = wilson_interval(a + c, n, z)
     denom = math.sqrt((a + b) * (c + d) * (a + c) * (b + d))
     if denom == 0:
         phi = 0.0

@@ -19,13 +19,15 @@ ODDS_BINS = [0, 10, 50, 100, 300, 1000, 1e9]          # 倍
 ODDS_BIN_LABELS = ["〜10倍", "10〜50倍", "50〜100倍", "100〜300倍", "300〜1000倍", "1000倍〜"]
 
 
-def load_final_odds(race_ids, base=None) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
+def load_final_odds(race_ids, base=None, kinds=None) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
     """レースID → 券種 → (組の馬番の配列 (組, 2 or 3), 100円あたりの配当)。オッズの無い組は入れない。
 
     3連単は1レース数千組あるので、組ごとの表（DataFrame）にはせず、保存した配列をレースごとに切り出す。
     """
     out: dict[str, dict] = {}
     for kind, rt in KIND_TYPES.items():
+        if kinds is not None and kind not in kinds:
+            continue
         files = odds._load_files(odds.odds_dir(base).glob(f"{rt}_*.npz"))
         if not files:
             continue

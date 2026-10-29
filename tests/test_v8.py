@@ -853,13 +853,9 @@ def test_payout_tables_and_ratio():
     assert np.allclose(s2.summary()["推定÷本物（中央値）"], 1.5, atol=0.02)
 
 
-def test_cli_real_odds(v8_env, capsys):
-    """odds-targets の平場サンプルに合成の確定オッズを置いて、real-odds を最後まで通す。重賞のオッズは読まない。"""
-    from src import odds as odds_mod, realodds, v8
-    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
-    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "40"]) == 0
-    capsys.readouterr()
-    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+def _write_synthetic_odds(v8_env, targets):
+    """odds_targets のレースに合成の確定オッズ（4券種）を置く。当たりの組は実際の払戻と同じ。"""
+    from src import odds as odds_mod, realodds
     ds = jvmap.build_dataset(v8_env)
     rr = ds.race_result.assign(レースID=ds.race_result["レースID"].astype(str))
     pay = ds.payout_df.assign(レースID=ds.payout_df["レースID"].astype(str)).set_index("レースID")
@@ -888,6 +884,16 @@ def test_cli_real_odds(v8_env, capsys):
                                       kumi.astype(np.int32), np.round(np.clip(np.nan_to_num(payv / 10), 0, 9_999_999)).astype(np.int32),
                                       np.ones(len(kumi), np.int16)))
     w.flush()
+
+
+def test_cli_real_odds(v8_env, capsys):
+    """odds-targets の平場サンプルに合成の確定オッズを置いて、real-odds を最後まで通す。重賞のオッズは読まない。"""
+    from src import odds as odds_mod, realodds, v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "40"]) == 0
+    capsys.readouterr()
+    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    _write_synthetic_odds(v8_env, targets)
     assert v8.main(["--data", str(v8_env), "--rounds", "10", "real-odds"]) == 0
     out = capsys.readouterr().out
     assert "推定した配当 ÷ 本物の確定オッズ" in out and "平場で比べた案: 4 個" in out
@@ -929,3 +935,45 @@ def test_cli_growth_check(v8_env, capsys):
     assert bool(j["差し替える"].iloc[0]) == (j["差の下限"].iloc[0] > 0)
     s = pd.read_csv(v8_env.parent / "v8" / "growth_summary.csv", encoding="utf-8-sig")
     assert set(s["確率"]) == {n for n, _ in v8.GROWTH_SOURCES} and s["レース数"].nunique() == 1
+
+
+
+def test_paired_test_wider_with_larger_z():
+    from src import trifecta as tri
+    rng = np.random.default_rng(0)
+    x, y = rng.random(2000) < 0.1, rng.random(2000) < 0.08
+    a, b = tri.paired_proportion_test(x, y), tri.paired_proportion_test(x, y, z=2.394)
+    assert b["差下限"] < a["差下限"] < a["差"] < a["差上限"] < b["差上限"] and a["p値"] == b["p値"]
+
+
+def test_place_judgement_rule():
+    from src import v8
+    t = pd.DataFrame([{"確率": "P1", "差": 0.010, "差の下限": 0.001}, {"確率": "P2", "差": 0.020, "差の下限": -0.001},
+                      {"確率": "P3", "差": 0.005, "差の下限": 0.0005}])
+    assert v8.place_judgement(t)[0] == "P1"                   # 合格は P1・P3。差が大きい P1（P2 は下限が負で不合格）
+    assert v8.place_judgement(t.assign(差の下限=0.0))[0] is None
+    assert v8.PLACE_Z == pytest.approx(2.394, abs=0.001)
+
+
+def test_cli_place_check(v8_env, capsys):
+    from src import place, v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "120"]) == 0
+    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    _write_synthetic_odds(v8_env, targets)
+    capsys.readouterr()
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "place-check", "--sample", "40"]) == 0
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if l.startswith("■ 判定")]
+    assert len(lines) == 2 and out.index("■ 判定") < out.index("0 記述的な確認（平場")
+    assert "平場で比べた案: 3 個" in out and "98.3% 区間" in out and "並びの −log 尤度" in out
+    j = pd.read_csv(v8_env.parent / "v8" / "place_judgement.csv", encoding="utf-8-sig")
+    assert set(j["確率"]) == set(v8.PLACE_NAMES.values())              # P2 も計算された
+    assert (j["合格"] == (j["差の下限"] > 0)).all() and j["採用"].sum() <= 1
+    desc = pd.read_csv(v8_env.parent / "v8" / "place_descriptive.csv", encoding="utf-8-sig")
+    assert desc["区分"].str.contains("第5五分位").any() and (desc["頭数"] > 0).all()
+    summ = pd.read_csv(v8_env.parent / "v8" / "place_summary.csv", encoding="utf-8-sig")
+    for _, g in summ.groupby("比べたレース"):
+        assert g["レース数"].nunique() == 1                            # 同じレースで比べている
+    # 重賞のレースは使わない（判定の表・達成率の表のレースは平場だけ）
+    assert v8.F_NAME in set(summ["確率"])
