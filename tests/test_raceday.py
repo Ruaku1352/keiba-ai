@@ -447,3 +447,97 @@ def test_write_sheet_with_fake_worksheet(root):
     ws = WS()
     assert raceday.write_sheet(prep, ws=ws) == raceday.SHEET_TITLE
     assert ws.cleared and ws.values and len({len(r) for r in ws.values}) == 1     # 長方形にそろえて書く
+
+
+# ---------------------------------------------------------------------------
+# v10b：本物の fetch_rt_results の CSV（"_seq" の列が無い・同じ日に何回も追記）から当日の傾向まで
+# ---------------------------------------------------------------------------
+def _rt_scenario():
+    """合成データの1日から：対象の重賞（その場の最後のレース）と、それより前のレースの 0B12 のレコード。"""
+    raw = make_raw_v8(n_days=120, races=8)
+    ds = jvmap.build_dataset(raw=raw)
+    rr = ds.race_result
+    rr = rr.assign(_start=pd.to_numeric(rr["発走時刻"].astype(str).str[:2]) * 60 + pd.to_numeric(rr["発走時刻"].astype(str).str[2:]))
+    graded = rr.loc[rr["リステッド・重賞競走"].isin(["G1", "G2", "G3", "G"])].drop_duplicates("レースID")
+    for _, t in graded.sort_values("レース日付", ascending=False).iterrows():
+        same = rr.loc[(rr["レース日付"] == t["レース日付"]) & (rr["競馬場コード"] == t["競馬場コード"])
+                      & (rr["芝・ダート区分"] == t["芝・ダート区分"]) & (rr["_start"] <= t["_start"] - 40)]
+        if same["レースID"].nunique() >= 2:
+            return raw, ds, t, sorted(same["レースID"].unique())
+    raise AssertionError("合成データに使える日が無い")
+
+
+def test_live_results_from_real_csv_format(root, monkeypatch):
+    from src import jvlink
+    raw, ds, target, earlier = _rt_scenario()
+    date = f"{target['レース日付']:%Y%m%d}"
+    rid_of = {rt: jvmap.make_race_id(raw[rt]) for rt in ("RA", "SE")}
+    day = {rt: raw[rt].loc[(raw[rt]["id.Year"] + raw[rt]["id.MonthDay"]) == date] for rt in ("RA", "SE")}
+    # 対象の重賞はまだ走っていない。1つ前の早いレースは速報の途中（データ区分 4 まで）
+    partial = earlier[0]
+    recs = []
+    for kubun in ("3", "4", "5"):
+        for rt in ("RA", "SE"):
+            d = day[rt]
+            ids = rid_of[rt].loc[d.index]
+            for _, row in d.loc[(ids != str(target["レースID"])).to_numpy()].iterrows():
+                if kubun == "5" and rid_of[rt].loc[_] == partial:
+                    continue
+                recs.append((rt, {**row.drop(labels=["_seq"]).to_dict(), "head.DataKubun": kubun}))
+
+    class FakeCom:
+        def JVInit(self, sid):
+            return 0
+
+        def JVRTOpen(self, spec, key):
+            assert (spec, key) == ("0B12", date)
+            self.i = 0
+            return 0
+
+        def JVGets(self, buff, size, fname):
+            if self.i >= len(recs):
+                return 0, None, ""
+            b = str(self.i).encode()
+            self.i += 1
+            return len(b), b, ""
+
+        def JVClose(self):
+            pass
+
+    monkeypatch.setattr(jvlink, "parse_record", lambda b, m: recs[int(b.decode())])
+    cols = {rt: [c for c in raw[rt].columns if c != "_seq"] for rt in ("RA", "SE", "HR")}
+    monkeypatch.setattr(jvlink, "columns_for", lambda rt, m: cols[rt])
+    src = raceday.LiveSource(date, client_factory=lambda: jvlink.JVLinkClient(com=FakeCom()), struct_module=object())
+    for _ in range(3):                                            # 10分おきに同じ日の全レコードが追記される
+        got, ok, msg = src.fetch_results(datetime.strptime(date + "1200", "%Y%m%d%H%M"))
+    se = pd.read_csv(src.rt_dir / "SE.csv", dtype=str, encoding="utf-8-sig")
+    assert "_seq" not in se.columns and len(se) == 3 * len([r for r in recs if r[0] == "SE"])   # 本物と同じ形
+    assert ok and "失敗" not in msg, msg
+    done = set(got["レースID"])
+    assert partial not in done and str(target["レースID"]) not in done
+    assert set(earlier[1:]) <= done
+    assert not got.duplicated(["レースID", "血統登録番号"]).any()        # 着順が確定したレースが1回ずつ
+    assert (got["_SEデータ区分"] == "5").all()
+    times = pd.read_csv(raceday.day_dir(date) / "result_times.csv", dtype=str, encoding="utf-8-sig")
+    assert times["レースID"].is_unique and set(times["レースID"]) == done
+
+    # その結果で、対象の重賞の F（当日の傾向あり）
+    rr = ds.race_result
+    tg = predict.blank_results(rr.loc[rr["レースID"] == target["レースID"]]).copy()
+    tg["脚質スコア"] = np.linspace(0.1, 0.9, len(tg))
+    snap = _snap(n=len(tg))
+    snap["単勝"] = {int(p): v for p, v in zip(sorted(tg["馬番"].astype(int)), snap["単勝"].values())}
+    for k in ("3連単", "3連複", "馬単", "馬連"):
+        snap.pop(k)
+    plan = raceday.compute_plan(tg, snap, COEFS, got, results_ok=True)
+    assert plan["確率の出し方"] == "当日の傾向を使った"
+    expect = sorted((f"{int(x[-2:])}R" for x in earlier[1:]), key=lambda s: int(s[:-1]))
+    assert plan["使ったレース"] == expect                          # 速報の途中のレースは使わない
+
+    # 確認のコマンドの中身
+    prep = {"日付": date, "レース": [{"レースID": str(target["レースID"]), "発走時刻": str(target["発走時刻"]),
+                                    "競馬場名": "x", "競走名": "y", "芝ダ": target["芝・ダート区分"]}],
+            "対象": tg.to_dict("records")}
+    table, usable = raceday.check_results(date, prep, src.rt_dir)
+    assert set(table.loc[table["着順の確定"] == "済", "レースID"]) == done
+    assert usable[0]["使えるレース（今の時点）"] == "・".join(expect)

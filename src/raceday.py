@@ -396,6 +396,20 @@ def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.Da
 # ---------------------------------------------------------------------------
 # 1回の実行（当日・ドライラン共通）
 # ---------------------------------------------------------------------------
+def load_rt_results(rt_dir) -> dict:
+    """0B12 を追記した RA.csv・SE.csv を読む。
+
+    fetch_rt_results の CSV には、ふだんの fetch の CSV にある "_seq"（取得した順）の列が無い（v10 の最初の版）。
+    無ければ**ファイルの行の順**で振る（追記した順＝取得した順なので、同じ版が何回も追記されていても、後の行が新しい）。
+    これからの書き出しも今のまま（列を変えると、すでに書いた CSV に追記できなくなるため）。
+    """
+    raw = jvmap.load_raw(rt_dir, record_types=("RA", "SE"))
+    for df in raw.values():
+        if "_seq" not in df.columns:
+            df.insert(0, "_seq", np.arange(len(df)).astype(str))
+    return raw
+
+
 def day_results_from_raw(raw: dict, date: str) -> pd.DataFrame:
     """速報（0B12）の RA・SE から、その日の着順が確定したレース（データ区分 5〜7）の馬の行。払戻（HR）は使わない。"""
     races = jvmap.prepare_races(raw["RA"])
@@ -442,7 +456,7 @@ class LiveSource:
         day = None
         if ok and (self.rt_dir / "RA.csv").exists() and (self.rt_dir / "SE.csv").exists():
             try:
-                day = day_results_from_raw(jvmap.load_raw(self.rt_dir, record_types=("RA", "SE")), self.date)
+                day = day_results_from_raw(load_rt_results(self.rt_dir), self.date)
             except Exception as e:
                 ok, msg = False, msg + f" / 結果の変換に失敗: {type(e).__name__}: {e}"
         if day is not None and not day.empty:
@@ -906,9 +920,13 @@ def _cmd_update(args) -> int:
     now = clock.now
     source = LiveSource(date, args.data)
     logs = run_once(prep, source, now, clock)
+    if logs and logs[0].get("結果"):
+        print(f"  当日の結果: {logs[0]['結果']}（取得 {source.timing.get('結果の取得（秒）', '')}秒）")
+    if logs and logs[0].get("オッズ"):
+        print(f"  オッズ: {logs[0]['オッズ']}（取得 {source.timing.get('オッズの取得（秒）', '')}秒）")
     for row in logs:
         print(f"  {row['レースID']} 発走 {row['発走']}（{row['分前']:.0f}分前・{row['段階']}）: {row.get('結果の要約', '')}"
-              f"  [{row.get('確率の出し方', '')}]")
+              f"  [{row.get('確率の出し方', '')}]  当日の傾向に使ったレース: {row.get('使ったレース') or 'なし'}")
     if not args.no_sheet:
         try:
             print(f"  シート「{write_sheet(prep, clock=clock)}」に書きました")
@@ -916,6 +934,54 @@ def _cmd_update(args) -> int:
             print(f"  シートに書けませんでした: {e}")
         except Exception as e:
             print(f"  シートに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
+    return 0
+
+
+def check_results(date: str, prep: dict | None, rt_dir: Path, now: datetime | None = None) -> tuple[pd.DataFrame, list]:
+    """保存した 0B12 を読んで、レースごとの版と着順の確定、対象の重賞の当日の傾向に使えるレース（買い目は作らない）。"""
+    raw = load_rt_results(rt_dir)
+    ra = jvmap.central_only(jvmap.dedupe_records(raw["RA"]))
+    ra = ra.loc[(ra["id.Year"] + ra["id.MonthDay"]) == date]
+    races = jvmap.map_races(ra)
+    day = day_results_from_raw(raw, date)
+    done = set(day["レースID"]) if not day.empty else set()
+    rows = []
+    for _, r in races.sort_values(["競馬場コード", "レースID"]).iterrows():
+        rid = r["レースID"]
+        top = day.loc[day["レースID"] == rid].sort_values("着順").head(3) if rid in done else pd.DataFrame()
+        rows.append({"レースID": rid, "場": r["競馬場名"], "R": int(str(rid)[-2:]), "発走": f"{str(r['発走時刻'])[:2]}:{str(r['発走時刻'])[2:]}",
+                     "芝ダ": r["芝・ダート区分"], "データ区分（最新の版）": r["_RAデータ区分"],
+                     "着順の確定": "済" if rid in done else "まだ（速報の途中）",
+                     "1〜3着": "-".join(str(int(x)) for x in top["馬番"]) if len(top) else ""})
+    table = pd.DataFrame(rows)
+    usable = []
+    for t in (prep or {}).get("レース", []):
+        post = post_time(date, t["発走時刻"])
+        limit = post - timedelta(minutes=CUTOFF_MIN + DELAY_MIN)
+        tgt = pd.DataFrame(prep["対象"])
+        tgt = tgt.loc[tgt["レースID"].astype(str) == t["レースID"]]
+        _, used = day_terms(tgt, day) if not tgt.empty else (None, [])
+        usable.append({"対象": f"{t['競馬場名']}{int(t['レースID'][-2:])}R {t['競走名']}", "発走": f"{post:%H:%M}",
+                       "使える条件": f"同じ場・{t['芝ダ']}・{limit:%H:%M} までに発走し着順が確定",
+                       "使えるレース（今の時点）": "・".join(used) or "なし"})
+    return table, usable
+
+
+def _cmd_check_results(args) -> int:
+    date = args.date or datetime.now().strftime("%Y%m%d")
+    rt = day_dir(date) / "rt_results"
+    if not (rt / "RA.csv").exists() or not (rt / "SE.csv").exists():
+        print(f"その日の 0B12 の保存がありません: {rt}")
+        return 1
+    table, usable = check_results(date, read_json(day_dir(date) / "prep.json"), rt)
+    print(f"=== {date} の当日の結果（0B12 を保存したもの。{rt}） ===")
+    with pd.option_context("display.width", 200, "display.max_rows", 200):
+        print(table.to_string(index=False) if not table.empty else "（レースなし）")
+    print("\n=== 対象の重賞の当日の傾向に使えるレース ===")
+    for u in usable:
+        print(f"  {u['対象']}（発走 {u['発走']}）: {u['使えるレース（今の時点）']}   条件: {u['使える条件']}")
+    if not usable:
+        print("  （prep.json が無いか、対象の重賞なし）")
     return 0
 
 
@@ -1067,6 +1133,9 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--no-sheet", action="store_true", help="シートに書かない")
     q.add_argument("--log-file", default=None, help="出力をこのファイルに追記する（タスクスケジューラ用）")
     q.set_defaults(func=_cmd_update)
+    q = sub.add_parser("check-results", help="保存した当日の結果（0B12）の確認：着順の確定と、当日の傾向に使えるレース（買い目は作らない）")
+    q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
+    q.set_defaults(func=_cmd_check_results)
     q = sub.add_parser("schedule", help="タスクスケジューラへの登録（--remove で削除）")
     q.add_argument("--date", default=None)
     q.add_argument("--remove", action="store_true")
