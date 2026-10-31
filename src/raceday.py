@@ -322,9 +322,24 @@ def day_terms(race: pd.DataFrame, day_results: pd.DataFrame) -> tuple[pd.DataFra
     return out, used
 
 
+ORDERED_KINDS = ("馬単", "3連単")                     # 着順のある券種
+
+
 def _combo_text(kind: str, combo) -> str:
-    c = sorted(combo) if kind in ("3連複", "馬連") else list(combo)
-    return "-".join(str(int(x)) for x in c)
+    """スマッピー・即PAT と同じ形：馬連・3連複は小さい順に「-」（6-8、2-8-10）、馬単・3連単は着順の順に「→」（10→11、3→8→2）。"""
+    if kind in ORDERED_KINDS:
+        return "→".join(str(int(x)) for x in combo)
+    return "-".join(str(int(x)) for x in sorted(combo))
+
+
+def sheet_text(s: str) -> str:
+    """シートに文字のまま書く（先頭の ' は表示されない）。書き込みは USER_ENTERED なので、6-8 などが日付に化けないように。"""
+    return "'" + s
+
+
+def bet_text(b: dict) -> str:
+    """保存した買い目の組番を、券種と馬番から作り直す（前の版で保存した "3-8-2" 形式の組番も正しく表示するため）。"""
+    return _combo_text(b["券種"], b["馬番"]) if b.get("馬番") else str(b["組番"])
 
 
 def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.DataFrame | None,
@@ -626,7 +641,7 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
     date = prep["日付"]
     ddir = day_dir(date, replay)
     now = (clock.now if clock else datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
-    rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", f"{date[:4]}-{date[4:6]}-{date[6:]}",
+    rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", sheet_text(f"{date[:4]}-{date[4:6]}-{date[6:]}"),
                          f"最終更新 {now}", "", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
     if clock and clock.warnings:
         for w in clock.warnings:
@@ -653,7 +668,7 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
         rows.append(["券種", "組番", "金額", "推定配当（100円）", "本物のオッズ（倍）", "当たったときの払戻", "確認"])
         for b in cur["買い目"]:
             ok = "" if b["届く"] is None else ("OK" if b["届く"] else f"届かない → {b['届く金額']:,}円で届く（+{b['足りない額']:,}円）")
-            rows.append([b["券種"], b["組番"], b["金額"], _yen(b["推定配当"]),
+            rows.append([b["券種"], sheet_text(bet_text(b)), b["金額"], _yen(b["推定配当"]),
                          "" if b["本物のオッズ"] is None else f"{b['本物のオッズ']:.1f}", _yen(b["当たったときの払戻"]), ok])
         rows.append(["合計", f"{cur['点数']}点", cur["合計"]])
         if not cur["本物のオッズで確かめた"]:
@@ -668,7 +683,7 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
         if st["provisional"] and st["provisional"]["作成時刻"] != cur["作成時刻"]:
             pv = st["provisional"]
             rows.append([f"仮の買い目（{pv['作成時刻'][11:16]}）",
-                         " / ".join(f"{b['券種']} {b['組番']} {b['金額']:,}円" for b in pv["買い目"]),
+                         sheet_text(" / ".join(f"{b['券種']} {bet_text(b)} {b['金額']:,}円" for b in pv["買い目"])),
                          f"{pv['点数']}点 {pv['合計']:,}円 予測 {pv['予測の達成確率']:.1%}"])
     return rows
 
@@ -985,6 +1000,17 @@ def _cmd_check_results(args) -> int:
     return 0
 
 
+def _cmd_sheet(args) -> int:
+    """保存した買い目（latest / provisional / final の JSON）から、シートだけを書き直す。買い目は作り直さない。"""
+    date = args.date or datetime.now().strftime("%Y%m%d")
+    prep = read_json(day_dir(date, args.replay) / "prep.json")
+    if prep is None:
+        print(f"{date} の prep.json がありません（{day_dir(date, args.replay)}）")
+        return 1
+    print(f"シート「{write_sheet(prep, replay=args.replay)}」を、保存した買い目から書き直しました（買い目は作り直していません）")
+    return 0
+
+
 def _parse_now(date: str, hhmm: str) -> datetime:
     return post_time(date, hhmm.replace(":", ""))
 
@@ -1037,7 +1063,7 @@ def _cmd_replay(args) -> int:
                 print(f"  {x['実行時刻'][11:16]} {x['段階']:<3} {v['結果の要約']}{extra}")
         f = read_json(ddir / rid / "final.json")
         if f:
-            print("  最終の買い目: " + " / ".join(f"{b['券種']} {b['組番']} {b['金額']:,}円" for b in f["買い目"]))
+            print("  最終の買い目: " + " / ".join(f"{b['券種']} {bet_text(b)} {b['金額']:,}円" for b in f["買い目"]))
             print(f"  オッズ: {f['オッズの出どころ']}  届かない買い目 {f['届かない買い目']}")
     finals = [read_json(ddir / r["レースID"] / "final.json") for r in prep["レース"]]
     finals = [f for f in finals if f]
@@ -1090,8 +1116,12 @@ def _cmd_score(args) -> int:
     if args.sheet:
         from . import sheets
         ws = sheets.open_or_add_worksheet(sheets.load_settings(), SCORE_SHEET_TITLE)
+        shown = races[cols].astype(object).where(races[cols].notna(), "")
+        for c in ("着順", "日付"):                          # 7-6-4・2026-11-01 が日付に化けないように文字で
+            if c in shown.columns:
+                shown[c] = [sheet_text(str(v)) if v != "" else "" for v in shown[c]]
         values = [list(summ.columns)] + summ.astype(object).where(summ.notna(), "").values.tolist() + [[]] + \
-                 [cols] + races[cols].astype(object).where(races[cols].notna(), "").values.tolist()
+                 [cols] + shown.values.tolist()
         sheets.write_grid(ws, values)
         print(f"シート「{SCORE_SHEET_TITLE}」に書きました")
     return 0
@@ -1136,6 +1166,10 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("check-results", help="保存した当日の結果（0B12）の確認：着順の確定と、当日の傾向に使えるレース（買い目は作らない）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
     q.set_defaults(func=_cmd_check_results)
+    q = sub.add_parser("sheet", help="保存した買い目からシートだけを書き直す（買い目は作り直さない）")
+    q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
+    q.add_argument("--replay", action="store_true", help="ドライランの分（シート「当日の買い目（再現）」）")
+    q.set_defaults(func=_cmd_sheet)
     q = sub.add_parser("schedule", help="タスクスケジューラへの登録（--remove で削除）")
     q.add_argument("--date", default=None)
     q.add_argument("--remove", action="store_true")

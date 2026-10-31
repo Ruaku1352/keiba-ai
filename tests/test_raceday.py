@@ -541,3 +541,67 @@ def test_live_results_from_real_csv_format(root, monkeypatch):
     table, usable = raceday.check_results(date, prep, src.rt_dir)
     assert set(table.loc[table["着順の確定"] == "済", "レースID"]) == done
     assert usable[0]["使えるレース（今の時点）"] == "・".join(expect)
+
+
+# ---------------------------------------------------------------------------
+# v10c：シートの組番が日付に化けない（USER_ENTERED で書くので、6-8 や 2-8-10 は先頭に ' を付けて文字にする）
+# ---------------------------------------------------------------------------
+import re  # noqa: E402
+
+_DATE_LIKE = re.compile(r"^\s*\d{1,4}\s*[-/年]\s*\d{1,2}(\s*[-/月]\s*\d{1,4})?\s*日?\s*$")   # 日本の設定のシート。64.4 は数値
+
+
+def _parsed_as_date(v) -> bool:
+    """Google スプレッドシートが USER_ENTERED で日付と解釈しうる文字か（先頭が ' なら文字のまま）。"""
+    return isinstance(v, str) and not v.startswith("'") and bool(_DATE_LIKE.match(v))
+
+
+def test_combo_text_arrows_and_order():
+    assert raceday._combo_text("馬連", (8, 6)) == "6-8"
+    assert raceday._combo_text("3連複", (10, 2, 8)) == "2-8-10"
+    assert raceday._combo_text("馬単", (10, 11)) == "10→11"
+    assert raceday._combo_text("3連単", (3, 8, 2)) == "3→8→2"
+    # 前の版で保存した組番（"3-8-2"）も、馬番から作り直して表示する
+    assert raceday.bet_text({"券種": "3連単", "組番": "3-8-2", "馬番": [3, 8, 2]}) == "3→8→2"
+
+
+def test_sheet_cells_are_never_dates(root):
+    class WS:
+        def clear(self):
+            pass
+
+        def update(self, values, range_name, value_input_option):
+            self.values, self.option = values, value_input_option
+    prep = _prep()
+    src = FakeSource(_snap())
+    raceday.run_once(prep, src, datetime(2026, 11, 1, 14, 50))       # 仮
+    raceday.run_once(prep, FakeSource(_snap(seed=5)), datetime(2026, 11, 1, 15, 20))   # 最終（仮と違う買い目）
+    ws = WS()
+    raceday.write_sheet(prep, ws=ws)
+    cells = [v for r in ws.values for v in r]
+    assert not [v for v in cells if _parsed_as_date(v)]
+    final = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "final.json")
+    shown = {r[1] for r in ws.values if len(r) > 2 and r[0] in raceday.SMAPPY_ORDER}
+    assert shown == {"'" + raceday.bet_text(b) for b in final["買い目"]}
+    for b in final["買い目"]:
+        assert ("→" in raceday.bet_text(b)) == (b["券種"] in ("馬単", "3連単"))
+    # 金額は数値のまま（表示は変えない）
+    amounts = [r[2] for r in ws.values if len(r) > 2 and r[0] in raceday.SMAPPY_ORDER]
+    assert all(isinstance(a, int) for a in amounts)
+    prov = [r for r in ws.values if str(r[0]).startswith("仮の買い目")]
+    assert prov and prov[0][1].startswith("'")
+    assert ws.option == "USER_ENTERED"
+    # 日付と誤解される形が実際に出ていたこと（' を外すと日付に見える）も確かめておく
+    assert any(_parsed_as_date(v[1:]) for v in cells if isinstance(v, str) and v.startswith("'"))
+
+
+def test_sheet_command_rewrites_from_saved(root, monkeypatch):
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))
+    before = (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8")
+    got = {}
+    monkeypatch.setattr(raceday, "write_sheet", lambda p, replay=False, **k: got.setdefault("p", p) and raceday.SHEET_TITLE)
+    assert raceday.main(["sheet", "--date", DATE]) == 0
+    assert got["p"]["日付"] == DATE
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8") == before   # 作り直さない
