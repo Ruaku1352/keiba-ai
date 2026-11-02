@@ -88,3 +88,38 @@ def test_cli_confirm_and_rerun(v8_env, capsys):
     a = pd.read_csv(first / "judgement.csv", encoding="utf-8-sig")
     b2 = pd.read_csv(second / "judgement.csv", encoding="utf-8-sig")
     assert np.allclose(a["差"], b2["差"])                             # 同じデータなら同じ結果
+
+
+def test_cli_curse(v8_env, capsys):
+    """v11 2：点数ごと・確定÷推定ごと・集中度ごとの表（記述だけ）。"""
+    from src import v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    capsys.readouterr()
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "curse"]) == 0
+    out = capsys.readouterr().out
+    assert "記述だけ" in out and "最終の点数ごと" in out and "集中度" in out
+    d = v8_env.parent / "v9" / "curse"
+    races = pd.read_csv(d / "races.csv", encoding="utf-8-sig")
+    assert set(races["区分"]) == {"重賞", "平場"}
+    assert races["点数"].between(1, 15).all() and races["集中度"].between(0, 1.0001).all()
+    t1 = pd.read_csv(d / "by_points.csv", encoding="utf-8-sig")
+    assert t1.groupby("区分")["レース数"].sum().to_dict() == races.groupby("区分").size().to_dict()
+    bets_df = pd.read_csv(d / "bets.csv", encoding="utf-8-sig")
+    assert (bets_df["当たる確率（予測）"] > 0).all()
+
+
+def test_curse_matches_confirm(v8_env, capsys):
+    from src import v8
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "confirm"]) == 0
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "curse"]) == 0
+    capsys.readouterr()
+    d = v8_env.parent / "v9"
+    runs = pd.read_csv(d / "confirm_runs.csv", encoding="utf-8-sig")
+    conf = pd.read_csv(Path(runs["保存先"].iloc[-1]) / "races.csv", encoding="utf-8-sig", dtype={"レースID": str})
+    f = conf.loc[conf["案"] == v9.NAMES["F"]].set_index("レースID")
+    c = pd.read_csv(d / "curse" / "races.csv", encoding="utf-8-sig", dtype={"レースID": str})
+    c = c.loc[c["区分"] == "重賞"].set_index("レースID")
+    assert set(c.index) == set(f.index)
+    assert (c["点数"] == f.loc[c.index, "点数"]).all()
+    assert (c["熱い"] == (f.loc[c.index, "払戻"] >= v9.TARGET)).all()

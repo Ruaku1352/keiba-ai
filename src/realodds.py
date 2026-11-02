@@ -150,12 +150,14 @@ class RatioStats:
 SNAPSHOT_TYPES = {"単勝": "O1", **KIND_TYPES}
 
 
-def load_race_odds(directory, race_id: str, before: str | None = None, final_only: bool = False) -> dict | None:
+def load_race_odds(directory, race_id: str, before: str | None = None, final_only: bool = False,
+                   require_win: bool = True) -> dict | None:
     """directory に保存したオッズ（npz）から、1レースぶんの一番新しい版を読む。
 
     before（"YYYY-MM-DD HH:MM:SS"）を渡すと、その時刻までに取ったものだけ（ドライランで「その時点」を再現する）。
     戻り値: {"単勝": {馬番: オッズ}, "馬連"・"馬単"・"3連複"・"3連単": (組の馬番, 100円あたりの配当),
-             "発表": "MMDDhhmm", "取得時刻": ..., "データ区分": ...}。単勝が無ければ None。
+             "発表": "MMDDhhmm", "取得時刻": ..., "データ区分": ...}。単勝が無ければ None（require_win=False なら、
+    ほかの券種だけでも返す。何も無ければ None）。
     """
     from pathlib import Path
 
@@ -187,4 +189,6 @@ def load_race_odds(directory, race_id: str, before: str | None = None, final_onl
             horses = (np.column_stack([k // 10000, (k // 100) % 100, k % 100]) if rt in ("O5", "O6")
                       else np.column_stack([k // 100, k % 100]))
             out[kind] = (horses, o * 10)
-    return out if "単勝" in out else None
+    if require_win:
+        return out if "単勝" in out else None
+    return out or None

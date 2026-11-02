@@ -102,10 +102,24 @@ def read_json(path: Path):
 
 
 def append_csv(path: Path, rows: list[dict]) -> None:
+    """行を追記する。行ごとに列がそろっていなくても、見出しの名前で列を合わせる（新しい列があれば足して書き直す）。
+
+    v10 の最初の版は見出しを最初の1回しか書かず、列の少ない行（保存済み・発走後など）がずれて入っていた。
+    """
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(path, mode="a", header=not path.exists(), index=False, encoding="utf-8-sig")
+    new = pd.DataFrame(rows)
+    if not path.exists():
+        new.to_csv(path, index=False, encoding="utf-8-sig")
+        return
+    header = list(pd.read_csv(path, nrows=0, encoding="utf-8-sig").columns)
+    extra = [c for c in new.columns if c not in header]
+    if extra:
+        old = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        pd.concat([old, new.astype(object)], ignore_index=True)[header + extra].to_csv(path, index=False, encoding="utf-8-sig")
+    else:
+        new.reindex(columns=header).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -388,24 +402,64 @@ def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.Da
         if T is not None:
             real = T[b.kind][tuple(ix)] if b.kind in ("3連単", "3連複") else T[b.kind][ix[0], ix[1]]
         real = float(real) if np.isfinite(real) else np.nan
-        hit = real * b.stake / 100 if np.isfinite(real) else np.nan
-        need = int(math.ceil(TARGET / real) * 100) if np.isfinite(real) and real > 0 else None
         rows.append({"券種": b.kind, "組番": _combo_text(b.kind, b.combo), "馬番": list(b.combo), "金額": int(b.stake),
-                     "推定配当": est, "本物のオッズ": real / 100 if np.isfinite(real) else None,
-                     "当たったときの払戻": hit,
-                     "届く": None if not np.isfinite(hit) else bool(hit >= TARGET),
-                     "届く金額": need, "足りない額": (need - b.stake) if need and need > b.stake else 0})
+                     "推定配当": est, "本物のオッズ": real / 100 if np.isfinite(real) and real > 0 else None})
     rows.sort(key=lambda r: (SMAPPY_ORDER.index(r["券種"]), r["組番"]))
+    moved = rebalance(rows)
     short = [r for r in rows if r["届く"] is False]
     return {"レースID": str(race["レースID"].iloc[0]), "確率の出し方": mode, "当日の結果を使えた": bool(results_ok),
             "使ったレース": used, "使ったレース数": n_used, "予測の達成確率": plan.predicted,
             "熱さ": heat, "例外を考えてもいい場面": bool(plan.predicted < EXCEPTION_RATE),
             "買い目": rows, "点数": len(rows), "合計": int(sum(r["金額"] for r in rows)),
-            "本物のオッズで確かめた": T is not None,
+            "本物のオッズで確かめた": T is not None, "付け替え": moved,
             "届かない買い目": len(short), "足りない額の合計": int(sum(r["足りない額"] for r in short)),
             "オッズの発表": snap.get("発表", ""), "オッズの取得時刻": snap.get("取得時刻", ""),
             "オッズのデータ区分": snap.get("データ区分", ""), "オッズの出どころ": snap.get("出どころ", "速報"),
             "γ": g, "δ": d}
+
+
+def stake_to_reach(odds: float, target: float = TARGET) -> int:
+    """本物のオッズ（倍）で、当たったときに target に届く金額（100円単位で切り上げ）。"""
+    return int(math.ceil(round(target / odds / 100, 6)) * 100)
+
+
+def _check_row(r: dict) -> None:
+    odds = r.get("本物のオッズ")
+    if odds is None:
+        r.update({"当たったときの払戻": None, "届く": None, "届く金額": None, "足りない額": 0})
+        return
+    need = stake_to_reach(odds)
+    r.update({"当たったときの払戻": odds * r["金額"], "届く": bool(odds * r["金額"] >= TARGET - 1e-6),
+              "届く金額": need, "足りない額": max(need - r["金額"], 0)})
+
+
+def rebalance(rows: list[dict]) -> dict:
+    """本物のオッズで 5万円に届かない買い目を、予算の中で付け替える（v11 の当日の運用ルール。F の選び方は変えない）。
+
+    - 届かない買い目を、届く金額（100円単位で切り上げ）まで増やす。足りない額の小さい買い目から
+    - 増やす分は、ほかの買い目から 100円ずつ回す。回せるのは「減らしたあとも本物のオッズで 5万円以上」の買い目だけで、
+      余裕（本物のオッズでの払戻 − 5万円）が一番大きい買い目から。100円未満にはしない
+    - 合計・点数は変えない。回しきれなければ回せる分だけ（残りは警告）。本物のオッズが無い買い目は対象にしない
+    rows は書き換える（元の金額・付け替え の列を足す）。戻り値: {"点数": 金額が変わった買い目の数, "回した金額": 増やした額の合計}
+    """
+    for r in rows:
+        r["元の金額"] = r["金額"]
+    has = [r for r in rows if r.get("本物のオッズ")]
+    shorts = sorted([r for r in has if r["本物のオッズ"] * r["金額"] < TARGET - 1e-6],
+                    key=lambda r: stake_to_reach(r["本物のオッズ"]) - r["金額"])
+    for s in shorts:
+        need = stake_to_reach(s["本物のオッズ"])
+        while s["金額"] < need:
+            donors = [r for r in has if r is not s and r["金額"] - 100 >= max(100, stake_to_reach(r["本物のオッズ"]))]
+            if not donors:
+                break
+            d = max(donors, key=lambda r: r["本物のオッズ"] * r["金額"] - TARGET)
+            d["金額"] -= 100
+            s["金額"] += 100
+    for r in rows:
+        r["付け替え"] = r["金額"] - r["元の金額"]
+        _check_row(r)
+    return {"点数": sum(1 for r in rows if r["付け替え"]), "回した金額": int(sum(r["付け替え"] for r in rows if r["付け替え"] > 0))}
 
 
 # ---------------------------------------------------------------------------
@@ -492,20 +546,39 @@ class LiveSource:
         append_csv(path, rows)
 
     def fetch_odds(self, race_keys: list[str], now: datetime) -> str:
+        """0B30（全券種）。取れなかった（エラー・データなし・失敗）ときは 0B31（単複枠）で単勝だけでも取る。"""
         from . import jvlink
         t0 = time.perf_counter()
+        self.fallback = False
+        ok = False
         try:
             c = jvlink.fetch_rt_odds(race_keys, dataspec="0B30", out_dir=self.data_dir, date=self.date,
                                      client=self._client(), log=self.log)
             msg = f"0B30: {c['レース']} レース・{c['レコード']} レコード（データなし {c['データなし']}・エラー {c['エラー']}）"
+            ok = c["エラー"] == 0 and c["データなし"] == 0 and c["レース"] > 0
         except Exception as e:
             msg = f"0B30 の取り込みに失敗: {type(e).__name__}: {e}"
+        if not ok and race_keys:
+            try:
+                c = jvlink.fetch_rt_odds(race_keys, dataspec="0B31", out_dir=self.data_dir, date=self.date,
+                                         client=self._client(), log=self.log)
+                msg += f" / 予備 0B31（単勝）: {c['レース']} レース（データなし {c['データなし']}・エラー {c['エラー']}）"
+                self.fallback = c["レース"] > 0
+            except Exception as e:
+                msg += f" / 予備 0B31 も失敗: {type(e).__name__}: {e}"
         self.timing["オッズの取得（秒）"] = round(time.perf_counter() - t0, 1)
         return msg
 
     def odds(self, race_id: str, now: datetime) -> dict | None:
         snap = realodds.load_race_odds(self.odds_dir, race_id)
-        if snap:
+        if not snap:
+            return None
+        if getattr(self, "fallback", False):
+            # 0B30 が取れず 0B31 の単勝で作る。ほかの券種の古いオッズでは確かめない（古い値で「届く」と出さないため）
+            for k in realodds.KIND_TYPES:
+                snap.pop(k, None)
+            snap["出どころ"] = "速報（0B31・単勝だけ。0B30 が取れなかったので予備）"
+        else:
             snap["出どころ"] = "速報（0B30）"
         return snap
 
@@ -540,9 +613,18 @@ class ReplaySource:
         if snap:
             snap["出どころ"] = "保存した速報（rt-odds）"
             return snap
-        snap = realodds.load_race_odds(self.final_odds, race_id, final_only=True)
-        if snap:
+        snap = realodds.load_race_odds(self.final_odds, race_id, final_only=True, require_win=False)
+        if snap and "単勝" in snap:
             snap["出どころ"] = "確定オッズで代用（その時点の速報が無い）"
+            return snap
+        # 確定オッズの単勝（O1）も無い：成績の確定単勝オッズ（SE）で代用する（ほかの券種の確定オッズがあれば確かめに使う）
+        r = self.day.loc[self.day["レースID"].astype(str) == str(race_id)]
+        o = pd.to_numeric(r["単勝オッズ"], errors="coerce")
+        win = {int(p): float(v) for p, v in zip(pd.to_numeric(r["馬番"], errors="coerce"), o) if pd.notna(p) and v > 0}
+        if not win:
+            return None
+        snap = {**(snap or {}), "単勝": win, "発表": "", "取得時刻": "", "データ区分": "",
+                "出どころ": "成績の確定単勝オッズ（SE）で代用（O1 の保存が無い）"}
         return snap
 
 
@@ -588,7 +670,13 @@ def run_once(prep: dict, source, now: datetime, clock: Clock | None = None, repl
             logs.append(row)
             continue
         if stage == "発走後":
-            row["結果の要約"] = "発走後。最終の買い目を作れなかった（前回の買い目が残っています）"
+            last = read_json(rdir / "latest.json")
+            if last:
+                row["結果の要約"] = f"発走後。最終の買い目は作れなかった（{last['作成時刻'][11:16]} の買い目が残っています）"
+            elif (rdir / "backup.json").exists():
+                row["結果の要約"] = "発走後。当日の買い目は一度も作れなかった（予備の買い目を表示）"
+            else:
+                row["結果の要約"] = "発走後。買い目なし（一度も作れなかった）"
             logs.append(row)
             continue
         snap = source.odds(rid, now)
@@ -637,10 +725,55 @@ def _yen(v) -> str:
     return "" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:,.0f}"
 
 
+def _plan_rows(cur: dict) -> list[list]:
+    """1つの買い目（F の形）をシートの行に。付け替えた金額を正として並べ、元の金額も添える。"""
+    rows: list[list] = []
+    mark = "  ← 例外を考えてもいい場面（ふだんの半分の 6% 未満）" if cur["例外を考えてもいい場面"] else ""
+    rows.append(["予測の達成確率（5万円以上）", f"{cur['予測の達成確率']:.1%}{mark}"])
+    used = "・".join(cur["使ったレース"]) if cur["使ったレース"] else "なし"
+    rows.append(["当日の傾向", cur["確率の出し方"], f"使ったレース: {used}"])
+    ann = cur["オッズの発表"]
+    ann = f"{ann[4:6]}:{ann[6:]} 発表" if len(str(ann)) == 8 else "発表時刻なし"
+    got = f"{cur['オッズの取得時刻'][11:19]} 取得・" if cur["オッズの取得時刻"] else ""
+    rows.append(["オッズ", f"{ann}（{got}{cur['オッズの出どころ']}）"])
+    moved = cur.get("付け替え") or {}
+    if moved.get("点数"):
+        rows.append(["付け替え", f"本物のオッズで付け替えた（{moved['点数']}点・{moved['回した金額']:,}円）。合計・点数は変えていない"])
+    rows.append(["券種", "組番", "金額", "推定配当（100円）", "本物のオッズ（倍）", "当たったときの払戻", "確認", "付け替え"])
+    for b in cur["買い目"]:
+        ok = "" if b["届く"] is None else ("OK" if b["届く"] else f"届かない → {b['届く金額']:,}円で届く（+{b['足りない額']:,}円）")
+        orig = b.get("元の金額", b["金額"])
+        note = f"元 {orig:,}円 → {b['金額']:,}円" if orig != b["金額"] else ""
+        rows.append([b["券種"], sheet_text(bet_text(b)), b["金額"], _yen(b["推定配当"]),
+                     "" if b["本物のオッズ"] is None else f"{b['本物のオッズ']:.1f}", _yen(b["当たったときの払戻"]), ok, note])
+    rows.append(["合計", f"{cur['点数']}点", cur["合計"]])
+    if not cur["本物のオッズで確かめた"]:
+        rows.append(["確認", "本物のオッズ（馬連・馬単・3連複・3連単）が取れず、届くかを確かめられなかった"])
+    elif cur["届かない買い目"]:
+        rows.append(["警告", f"本物のオッズで5万円に届かない買い目が {cur['届かない買い目']} 点（予算の中で回しきれなかった）。"
+                             f"全部届かせるには あと +{cur['足りない額の合計']:,}円（予算 12,000円を超えるので、買い足すかは自分で判断）"])
+    heat = cur["熱さ"]
+    rows.append(["熱さ（参考）", " / ".join(f"{int(k) // 10000}万円 {v:.1%}" for k, v in heat.items())])
+    return rows
+
+
+def _backup_rows(bk: dict) -> list[list]:
+    rows = [["予備の買い目", f"予備（{bk['作り方']}・{bk['作成'][5:16]} 作成）。当日の買い目を一度も作れなかったので、これを表示しています"]]
+    if bk.get("買い目"):
+        rows += _plan_rows(bk["買い目"])
+    elif bk.get("BOX"):
+        box = "・".join(str(x) for x in bk["BOX"])
+        rows.append(["券種", "組番", "金額"])
+        rows.append(["3連単", sheet_text(f"BOX {box}"), 12_000])
+        rows.append(["合計", "120点（6頭BOX・1点100円）", 12_000])
+    return rows
+
+
 def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -> list[list]:
     date = prep["日付"]
     ddir = day_dir(date, replay)
-    now = (clock.now if clock else datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+    now_dt = clock.now if clock else datetime.now()
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", sheet_text(f"{date[:4]}-{date[4:6]}-{date[6:]}"),
                          f"最終更新 {now}", "", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
     if clock and clock.warnings:
@@ -649,37 +782,24 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
     for r in prep["レース"]:
         rid = r["レースID"]
         st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
+        backup = read_json(ddir / rid / "backup.json")
         cur = st["final"] or st["latest"]
+        post = post_time(date, r["発走時刻"])
         rows.append([])
         head = f"■ {r['競馬場名']}{int(rid[-2:])}R {r['競走名']}（{r['グレード']}）"
         if cur is None:
-            rows.append([head, f"発走 {post_time(date, r['発走時刻']):%H:%M}", "状態: まだ買い目なし（発売前・オッズ待ち）"])
+            if now_dt >= post - timedelta(minutes=FINAL_BEFORE) and backup:
+                rows.append([head, f"発走 {post:%H:%M}", "状態: 当日の買い目は一度も作れなかった → 予備を表示"])
+                rows += _backup_rows(backup)
+            else:
+                late = now_dt >= post
+                state = "買い目なし（発走後。一度も作れなかった）" if late else "まだ買い目なし（発売前・オッズ待ち）"
+                extra = "予備あり（最終の時刻までに作れなければ表示）" if backup else "予備なし"
+                rows.append([head, f"発走 {post:%H:%M}", f"状態: {state}", extra])
             continue
         state = "最終（これ以降は更新しない）" if st["final"] else f"{cur['段階']}（最終は発走{FINAL_BEFORE}分前）"
         rows.append([head, f"発走 {cur['発走']}", f"状態: {state}", f"作成 {cur['作成時刻'][11:16]}（発走 {cur['分前']:.0f} 分前）"])
-        mark = "  ← 例外を考えてもいい場面（ふだんの半分の 6% 未満）" if cur["例外を考えてもいい場面"] else ""
-        rows.append(["予測の達成確率（5万円以上）", f"{cur['予測の達成確率']:.1%}{mark}"])
-        used = "・".join(cur["使ったレース"]) if cur["使ったレース"] else "なし"
-        rows.append(["当日の傾向", cur["確率の出し方"], f"使ったレース: {used}"])
-        ann = cur["オッズの発表"]
-        ann = f"{ann[4:6]}:{ann[6:]} 発表" if len(str(ann)) == 8 else "発表時刻なし"
-        got = f"{cur['オッズの取得時刻'][11:19]} 取得・" if cur["オッズの取得時刻"] else ""
-        rows.append(["オッズ", f"{ann}（{got}{cur['オッズの出どころ']}）"])
-        rows.append(["券種", "組番", "金額", "推定配当（100円）", "本物のオッズ（倍）", "当たったときの払戻", "確認"])
-        for b in cur["買い目"]:
-            ok = "" if b["届く"] is None else ("OK" if b["届く"] else f"届かない → {b['届く金額']:,}円で届く（+{b['足りない額']:,}円）")
-            rows.append([b["券種"], sheet_text(bet_text(b)), b["金額"], _yen(b["推定配当"]),
-                         "" if b["本物のオッズ"] is None else f"{b['本物のオッズ']:.1f}", _yen(b["当たったときの払戻"]), ok])
-        rows.append(["合計", f"{cur['点数']}点", cur["合計"]])
-        if not cur["本物のオッズで確かめた"]:
-            rows.append(["確認", "本物のオッズ（馬連・馬単・3連複・3連単）が取れず、届くかを確かめられなかった"])
-        elif cur["届かない買い目"]:
-            total = cur["合計"] + cur["足りない額の合計"]
-            note = "（予算 12,000円を超える）" if total > BUDGET else ""
-            rows.append(["警告", f"本物のオッズで5万円に届かない買い目が {cur['届かない買い目']} 点。"
-                                 f"全部届かせるなら +{cur['足りない額の合計']:,}円 = {total:,}円{note}"])
-        heat = cur["熱さ"]
-        rows.append(["熱さ（参考）", " / ".join(f"{int(k) // 10000}万円 {v:.1%}" for k, v in heat.items())])
+        rows += _plan_rows(cur)
         if st["provisional"] and st["provisional"]["作成時刻"] != cur["作成時刻"]:
             pv = st["provisional"]
             rows.append([f"仮の買い目（{pv['作成時刻'][11:16]}）",
@@ -775,24 +895,53 @@ def remove_task(date: str, run=None):
 # ---------------------------------------------------------------------------
 # 答え合わせ
 # ---------------------------------------------------------------------------
-def score_plan(plan: dict, wins: dict, scratched: set[int]) -> dict:
-    """最終の買い目を実際の払戻で。取消・除外の馬を含む買い目は返還（払戻ではなく、戻ってくるお金として別に数える）。"""
+def score_plan(plan: dict, wins: dict, scratched: set[int], stake: str = "金額") -> dict:
+    """最終の買い目を実際の払戻で。取消・除外の馬を含む買い目は返還（払戻ではなく、戻ってくるお金として別に数える）。
+
+    stake="金額" は付け替えたあと（実際に買う方）、"元の金額" は付け替える前（参考）。
+    """
     pay, refund = 0.0, 0
     for b in plan["買い目"]:
+        amount = int(b.get(stake, b["金額"]))
         combo = tuple(int(x) for x in b["馬番"])
         if set(combo) & scratched:
-            refund += int(b["金額"])
+            refund += amount
             continue
         key = tuple(sorted(combo)) if b["券種"] in ("3連複", "馬連") else combo
         v = wins.get(b["券種"], {}).get(key)
         if v:
-            pay += v * b["金額"] / 100
-    invest = int(plan["合計"])
+            pay += v * amount / 100
+    invest = int(sum(int(b.get(stake, b["金額"])) for b in plan["買い目"]))
     return {"投資": invest, "払戻": pay, "返還": refund, "的中": pay > 0, "熱い": pay >= TARGET,
             "収支": pay + refund - invest}
 
 
-def score_finals(raw: dict, finals: list[dict]) -> pd.DataFrame:
+def odds_drift_rows(plan: dict, final_snap: dict | None) -> list[dict]:
+    """最終の買い目（20分前ごろのオッズで確かめたもの）を、確定オッズでも 5万円に届いていたか（付け替えたあとの金額で）。"""
+    out = []
+    if not final_snap:
+        return out
+    posts = sorted({int(x) for b in plan["買い目"] for x in b["馬番"]} | set(final_snap.get("単勝", {})))
+    T = realodds.payout_tables({k: final_snap[k] for k in realodds.KIND_TYPES if k in final_snap}, np.array(posts))
+    if T is None:
+        return out
+    index = {p: i for i, p in enumerate(posts)}
+    for b in plan["買い目"]:
+        ix = [index[int(x)] for x in b["馬番"]]
+        v = T[b["券種"]][tuple(ix)] if b["券種"] in ("3連単", "3連複") else T[b["券種"]][ix[0], ix[1]]
+        if not np.isfinite(v):
+            continue
+        conf = float(v) / 100
+        out.append({"レースID": plan["レースID"], "券種": b["券種"], "組番": bet_text(b), "金額": b["金額"],
+                    "元の金額": b.get("元の金額", b["金額"]), "付け替えた": bool(b.get("付け替え")),
+                    "20分前のオッズ": b.get("本物のオッズ"), "確定オッズ": conf,
+                    "確定÷20分前": conf / b["本物のオッズ"] if b.get("本物のオッズ") else None,
+                    "20分前で届く": b.get("届く"), "確定で届く": bool(conf * b["金額"] >= TARGET - 1e-6)})
+    return out
+
+
+def score_finals(raw: dict, finals: list[dict], data_dir=None, drift: list | None = None) -> pd.DataFrame:
+    """drift にリストを渡すと、確定オッズ（fetch-odds で保存したもの）とのずれの行を足していく。"""
     from . import results
     ids = [f["レースID"] for f in finals]
     res = results.race_results(raw, ids)
@@ -809,9 +958,17 @@ def score_finals(raw: dict, finals: list[dict]) -> pd.DataFrame:
             rows.append({**base, "照合": "結果待ち"})
             continue
         scratched = {int(x) for x in h.loc[h["異常区分"].isin(results.REFUND_IJYO), "馬番"].dropna()}
-        s = score_plan(f, bets.winning_combos(payout.loc[rid]), scratched)
+        wins = bets.winning_combos(payout.loc[rid])
+        s = score_plan(f, wins, scratched)
+        orig = score_plan(f, wins, scratched, stake="元の金額")
+        moved = f.get("付け替え") or {}
         top = h.loc[h["着順"].isin([1, 2, 3])].sort_values("着順")
-        rows.append({**base, **s, "着順": "-".join(str(int(x)) for x in top["馬番"]), "照合": "済"})
+        rows.append({**base, **s, "着順": "-".join(str(int(x)) for x in top["馬番"]),
+                     "付け替えた点数": moved.get("点数", 0), "元の金額での払戻": orig["払戻"], "元の金額での熱い": orig["熱い"],
+                     "照合": "済"})
+        if drift is not None:
+            drift += odds_drift_rows(f, realodds.load_race_odds(realodds.odds.odds_dir(data_dir), rid, final_only=True,
+                                                                 require_win=False))
     return pd.DataFrame(rows)
 
 
@@ -827,6 +984,11 @@ def score_summary(races: pd.DataFrame, box: pd.DataFrame | None = None) -> pd.Da
                     "投資": int(done["投資"].sum()), "払戻": float(done["払戻"].sum()), "返還": int(done["返還"].sum()),
                     "回収率": float((done["払戻"].sum() + done["返還"].sum()) / done["投資"].sum()),
                     "予測の達成確率（平均）": float(done["予測の達成確率"].mean())})
+        if "元の金額での熱い" in done.columns:
+            hot0 = int(done["元の金額での熱い"].fillna(False).astype(bool).sum())
+            lo0, hi0 = trifecta.wilson_interval(hot0, n)
+            out.append({"買い方": "（参考）F の付け替える前の金額", "レース数": n, "熱い当たり": hot0, "達成率": hot0 / n,
+                        "下限": lo0, "上限": hi0, "払戻": float(done["元の金額での払戻"].sum())})
     if box is not None and not box.empty:
         b = box.loc[box["照合"] == "済"]
         if not b.empty:
@@ -856,11 +1018,107 @@ def _tomorrow() -> str:
     return (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
 
 
+def record_box_prediction(date: str, data_dir=None, run=None) -> int:
+    """今の6頭BOX の予想を、ふだんの `py -m src.v6 predict --date … --sheet` と同じ形で記録する（predict の動きは変えずに呼ぶだけ）。"""
+    from . import v6
+    run = run or v6.main
+    argv = (["--data", str(data_dir)] if data_dir else []) + \
+        ["predict", "--date", f"{date[:4]}-{date[4:6]}-{date[6:]}", "--sheet"]
+    try:
+        return int(run(argv) or 0)
+    except SystemExit as e:                                # シートの設定が無いなど。CSV は保存済み
+        print(f"  predict --sheet の途中で止まりました（予想の CSV は保存されています）: {e}")
+        return 1
+    except Exception as e:
+        print(f"  predict に失敗しました: {type(e).__name__}: {e}")
+        return 1
+
+
+def latest_box(date: str) -> dict[str, list[int]]:
+    """その日の重賞の、いちばん新しい predict の予想（CSV）の上位6頭（レースID → 馬番）。"""
+    files = sorted(predict.prediction_dir().glob(f"predict_{date}_*.csv"))
+    if not files:
+        return {}
+    t = pd.read_csv(files[-1], dtype={"レースID": str}, encoding="utf-8-sig")
+    t = t.loc[pd.to_numeric(t["予測順位"], errors="coerce") <= predict.BOX_SIZE]
+    out = {}
+    for rid, g in t.groupby("レースID"):
+        posts = pd.to_numeric(g.sort_values("予測順位")["馬番"], errors="coerce").dropna().astype(int).tolist()
+        if len(posts) >= 3:
+            out[str(rid)] = posts
+    return out
+
+
+def make_backups(prep: dict, data_dir=None, source=None, now: datetime | None = None) -> dict[str, str]:
+    """前の晩に、予備の買い目を作って <レースID>/backup.json に保存する（当日の買い目を一度も作れなかったときに表示）。
+
+    前の晩に単勝の速報オッズ（前日発売）が取れれば、そのオッズで F（当日の傾向なし）。
+    取れなければ、今の6頭BOX の予想（predict の CSV）。どちらも無ければ予備なし。
+    """
+    date = prep["日付"]
+    now = now or datetime.now()
+    targets = pd.DataFrame(prep["対象"])
+    targets["レースID"] = targets["レースID"].astype(str)
+    src = source or LiveSource(date, data_dir, log=lambda *a, **k: None)
+    try:
+        src.fetch_odds([rt_key(date, r["レースID"]) for r in prep["レース"]], now)
+    except Exception:
+        pass
+    box = latest_box(date)
+    out = {}
+    for r in prep["レース"]:
+        rid = r["レースID"]
+        bk = None
+        try:
+            snap = src.odds(rid, now)
+        except Exception:
+            snap = None
+        if snap and snap.get("単勝"):
+            try:
+                plan = compute_plan(targets.loc[targets["レースID"] == rid], snap, prep["係数"], None, results_ok=False)
+                plan["確率の出し方"] = "前の晩のオッズ（当日の傾向なし・市場だけ）"
+                plan.update({"作成時刻": now.strftime("%Y-%m-%d %H:%M:%S"), "発走": post_time(date, r["発走時刻"]).strftime("%H:%M"),
+                             "段階": "予備", "レース": r})
+                when = snap.get("発表") or ""
+                when = f"{when[4:6]}:{when[6:]} 発表" if len(when) == 8 else (snap.get("取得時刻") or "")[5:16]
+                bk = {"作り方": f"前の晩のオッズ（{when}）で F", "買い目": plan}
+            except Exception:
+                bk = None
+        if bk is None and rid in box:
+            bk = {"作り方": "今のモデルの6頭BOX（前の晩にオッズが無かったため）", "BOX": box[rid]}
+        if bk:
+            bk["作成"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            write_json(day_dir(date) / rid / "backup.json", bk)
+            out[rid] = bk["作り方"]
+    return out
+
+
+def cleanup_old_tasks(today: str, run=None) -> list[str]:
+    """過去の日付のタスク（keiba_raceday_YYYYMMDD で、その日が過ぎたもの）を削除する。"""
+    import re
+    import subprocess
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True))
+    r = run(["schtasks", "/query", "/fo", "csv", "/nh"])
+    names = sorted(set(re.findall(r"(" + TASK_PREFIX + r"(\d{8}))", getattr(r, "stdout", "") or "")))
+    removed = []
+    for name, d in names:
+        if d < today and getattr(run(["schtasks", "/delete", "/tn", name, "/f"]), "returncode", 1) == 0:
+            removed.append(name)
+    return removed
+
+
 def _cmd_prep(args) -> int:
     date = args.date or _tomorrow()
     p = prep_live(date, args.data, refit=args.refit)
     if p is None:
         return 1
+    if args.schedule and not args.no_predict:
+        print(f"\n[raceday] 今の6頭BOX の予想を記録します（py -m src.v6 predict --date … --sheet と同じ）...")
+        record_box_prediction(date, args.data)
+    if not args.no_backup:
+        made = make_backups(p, args.data)
+        print(f"\n[raceday] 予備の買い目: " + (" / ".join(f"{rid[-2:]}R {how}" for rid, how in made.items()) if made
+                                         else "作れませんでした（前の晩のオッズも 6頭BOX の予想も無い）"))
     c = p["係数"]
     print(f"{date} の重賞 {len(p['レース'])} レースの準備を保存しました: {day_dir(date) / 'prep.json'}")
     for r in p["レース"]:
@@ -881,6 +1139,9 @@ def _schedule(date: str, prep: dict, args) -> int:
         path.write_text(xml, encoding="utf-16")
         print(f"Windows ではないので登録はしません（定義だけ保存: {path}）")
         return 0
+    removed = cleanup_old_tasks(datetime.now().strftime("%Y%m%d"))
+    if removed:
+        print(f"過去の日付のタスクを削除しました: {', '.join(removed)}")
     r = install_task(date, prep, start_hhmm=args.start)
     if r[2].returncode != 0:
         print(f"タスクの登録に失敗しました: {r[2].stderr or r[2].stdout}")
@@ -1095,7 +1356,8 @@ def _cmd_score(args) -> int:
         print("保存した最終の買い目がありません（data/raceday/<日付>/<レースID>/final.json）")
         return 1
     raw = jvmap.load_raw(args.data)
-    races = score_finals(raw, finals)
+    drift: list = []
+    races = score_finals(raw, finals, args.data, drift)
     box = _box_records(raw)
     if not box.empty:
         box = box.loc[box["レースID"].astype(str).isin(set(races["レースID"]))]
@@ -1104,11 +1366,27 @@ def _cmd_score(args) -> int:
     summ = score_summary(races, box)
     print("=== 答え合わせ：各重賞の最終の買い目（F）を実際の払戻で ===")
     cols = [c for c in ["日付", "レース", "グレード", "着順", "点数", "投資", "払戻", "返還", "熱い", "予測の達成確率",
-                        "確率の出し方", "6頭BOXの払戻", "6頭BOXの熱い", "照合"] if c in races.columns]
+                        "付け替えた点数", "元の金額での払戻", "確率の出し方", "6頭BOXの払戻", "6頭BOXの熱い", "照合"]
+            if c in races.columns]
     with pd.option_context("display.width", 250, "display.max_columns", 30):
         print(races[cols].to_string(index=False))
         print("\n=== 通算 ===")
         print(summ.to_string(index=False) if not summ.empty else "（照合済みのレースなし）")
+    dr = pd.DataFrame(drift)
+    print("\n=== 参考：20分前ごろのオッズ → 確定オッズ（最終の買い目。付け替えたあとの金額で、確定オッズでも 5万円に届いたか） ===")
+    if dr.empty:
+        print("（確定オッズの保存がありません。月曜の fetch のあと `py -m src.jvlink fetch-odds` を）")
+    else:
+        ratio = pd.to_numeric(dr["確定÷20分前"], errors="coerce")
+        print(f"買い目 {len(dr)} 点：確定÷20分前 の中央値 {ratio.median():.3f}（四分位 {ratio.quantile(0.25):.3f}〜{ratio.quantile(0.75):.3f}）"
+              f"／20分前で届く {int(dr['20分前で届く'].fillna(False).astype(bool).sum())} 点のうち 確定でも届く "
+              f"{int((dr['20分前で届く'].fillna(False).astype(bool) & dr['確定で届く']).sum())} 点")
+        moved = dr.loc[dr["付け替えた"]]
+        if len(moved):
+            print(f"付け替えた買い目 {len(moved)} 点のうち、確定オッズでも届いた {int(moved['確定で届く'].sum())} 点")
+        with pd.option_context("display.width", 250, "display.max_columns", 30):
+            print(dr.to_string(index=False))
+        dr.to_csv(raceday_dir() / "score_odds_drift.csv", index=False, encoding="utf-8-sig")
     out = raceday_dir() / "score_races.csv"
     races.to_csv(out, index=False, encoding="utf-8-sig")
     summ.to_csv(raceday_dir() / "score_summary.csv", index=False, encoding="utf-8-sig")
@@ -1156,6 +1434,8 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--refit", action="store_true", help="保存・固定した係数を使わず推定し直す")
     q.add_argument("--schedule", action="store_true", help="タスクスケジューラにも登録する")
     q.add_argument("--start", default="0900", help="当日の10分おきの開始時刻（既定 0900）")
+    q.add_argument("--no-predict", action="store_true", help="--schedule のときの 6頭BOX の予想の記録（predict --sheet）をしない")
+    q.add_argument("--no-backup", action="store_true", help="予備の買い目を作らない")
     q.set_defaults(func=_cmd_prep)
     q = sub.add_parser("update", help="当日：速報 → 当日の傾向 → 買い目 → シート（タスクスケジューラから）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")

@@ -605,3 +605,198 @@ def test_sheet_command_rewrites_from_saved(root, monkeypatch):
     assert raceday.main(["sheet", "--date", DATE]) == 0
     assert got["p"]["日付"] == DATE
     assert (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8") == before   # 作り直さない
+
+
+# ---------------------------------------------------------------------------
+# v11 1：本物のオッズで届かない買い目の、予算内での付け替え
+# ---------------------------------------------------------------------------
+def _rows(spec):
+    return [{"券種": k, "組番": c, "馬番": [int(x) for x in c.replace("→", "-").split("-")], "金額": a,
+             "推定配当": 0.0, "本物のオッズ": o} for k, c, a, o in spec]
+
+
+def test_rebalance_tenno_sho_example():
+    rows = _rows([("3連複", "1-11-16", 400, 130.0), ("3連複", "1-7-13", 3500, 25.4), ("3連複", "1-7-17", 7800, 6.3),
+                  ("3連単", "17→7→3", 300, 200.0)])
+    moved = raceday.rebalance(rows)
+    by = {r["組番"]: r for r in rows}
+    assert by["1-7-17"]["金額"] == 8000 and by["1-7-17"]["当たったときの払戻"] == pytest.approx(50_400)
+    assert by["1-7-13"]["金額"] == 3300 and by["1-7-13"]["当たったときの払戻"] == pytest.approx(83_820)
+    assert by["1-7-17"]["元の金額"] == 7800 and by["1-7-17"]["付け替え"] == 200 and by["1-7-13"]["付け替え"] == -200
+    assert by["1-11-16"]["金額"] == 400 and by["17→7→3"]["金額"] == 300          # 減らすと 5万円を割る買い目からは回さない
+    assert sum(r["金額"] for r in rows) == 12_000 and all(r["届く"] for r in rows)
+    assert moved == {"点数": 2, "回した金額": 200}
+
+
+def test_rebalance_partial_and_limits():
+    rows = _rows([("馬連", "1-2", 9000, 5.0), ("馬連", "3-4", 2600, 20.0), ("馬単", "5→6", 400, None)])
+    raceday.rebalance(rows)
+    by = {r["組番"]: r for r in rows}
+    # 3-4 は 2,500円 まで（20倍 × 2,500 = 50,000）しか下げられない → 100円だけ回せる。1-2 は 9,100円 でまだ届かない
+    assert by["3-4"]["金額"] == 2500 and by["1-2"]["金額"] == 9100
+    assert by["1-2"]["届く"] is False and by["1-2"]["足りない額"] == 900
+    assert by["5→6"]["金額"] == 400 and by["5→6"]["届く"] is None                 # 本物のオッズが無い買い目は対象外
+    assert sum(r["金額"] for r in rows) == 12_000
+    rows = _rows([("馬連", "1-2", 11_900, 4.0), ("馬連", "3-4", 100, 900.0)])
+    raceday.rebalance(rows)
+    assert min(r["金額"] for r in rows) >= 100                                   # 100円未満にはしない
+    assert raceday.stake_to_reach(12.5) == 4000 and raceday.stake_to_reach(6.3) == 8000
+
+
+def test_plan_sheet_and_score_use_rebalanced_stakes(root):
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap(scale=0.8)), datetime(2026, 11, 1, 15, 20))
+    f = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "final.json")
+    assert f["合計"] == sum(b["金額"] for b in f["買い目"]) == sum(b["元の金額"] for b in f["買い目"])
+    if f["付け替え"]["点数"]:
+        text = "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(prep))
+        assert "本物のオッズで付け替えた" in text and "元 " in text
+    # 答え合わせは付け替えたあと（実際に買う方）。元の金額は参考
+    b0 = f["買い目"][0]
+    b0["元の金額"], b0["金額"] = b0["金額"] + 100, b0["金額"]
+    wins = {k: {} for k in ("3連単", "3連複", "馬単", "馬連")}
+    key = tuple(sorted(b0["馬番"])) if b0["券種"] in ("3連複", "馬連") else tuple(b0["馬番"])
+    wins[b0["券種"]][key] = 1000.0
+    s = raceday.score_plan(f, wins, set())
+    s0 = raceday.score_plan(f, wins, set(), stake="元の金額")
+    assert s["払戻"] == pytest.approx(b0["金額"] * 10) and s0["払戻"] == pytest.approx((b0["金額"] + 100) * 10)
+
+
+def test_odds_drift_rows():
+    plan = {"レースID": "R", "買い目": [{"券種": "馬連", "組番": "1-2", "馬番": [1, 2], "金額": 8000, "元の金額": 7800, "付け替え": 200,
+                                       "本物のオッズ": 6.3, "届く": True}]}
+    snap = _snap(n=4)
+    horses, pay = snap["馬連"]
+    pay = pay.copy()
+    pay[(horses == np.array([1, 2])).all(axis=1)] = 600.0                          # 確定では 6.0倍
+    snap["馬連"] = (horses, pay)
+    d = raceday.odds_drift_rows(plan, snap)
+    assert d[0]["確定オッズ"] == pytest.approx(6.0) and d[0]["確定で届く"] is False and d[0]["付け替えた"]
+    assert d[0]["確定÷20分前"] == pytest.approx(6.0 / 6.3)
+
+
+# ---------------------------------------------------------------------------
+# v11 3：予備の買い目・表示・0B31・ドライランの代用・タスクの掃除・6頭BOX の記録
+# ---------------------------------------------------------------------------
+def test_backup_from_night_odds_and_box(root, monkeypatch):
+    prep = _prep()
+    made = raceday.make_backups(prep, source=FakeSource(_snap()), now=datetime(2026, 10, 31, 21, 0))
+    bk = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "backup.json")
+    assert "前の晩のオッズ" in made["202605040511"] and bk["買い目"]["点数"] <= 15
+    # オッズが無ければ 6頭BOX の予想（predict の CSV）
+    (raceday.day_dir(DATE) / "202605040511" / "backup.json").unlink()
+    pdir = predict.prediction_dir()
+    pdir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"レースID": "202605040511", "馬番": range(1, 13), "予測順位": range(1, 13)}).to_csv(
+        pdir / f"predict_{DATE}_210000.csv", index=False, encoding="utf-8-sig")
+    made = raceday.make_backups(prep, source=FakeSource(None), now=datetime(2026, 10, 31, 21, 0))
+    bk = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "backup.json")
+    assert bk["BOX"] == [1, 2, 3, 4, 5, 6] and "6頭BOX" in made["202605040511"]
+
+
+def test_sheet_shows_backup_only_when_no_plan(root):
+    prep = _prep()
+    raceday.make_backups(prep, source=FakeSource(_snap()), now=datetime(2026, 10, 31, 21, 0))
+
+    def text(hhmm):
+        c = raceday.Clock(datetime(2026, 11, 1), datetime(2026, 11, 1, int(hhmm[:2]), int(hhmm[2:])), None)
+        return "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(prep, clock=c))
+    assert "予備あり（最終の時刻までに作れなければ表示）" in text("1400") and "予備の買い目" not in text("1400")
+    assert "当日の買い目は一度も作れなかった → 予備を表示" in text("1521") and "予備（前の晩のオッズ" in text("1521")
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))     # 当日の買い目ができれば予備は出さない
+    assert "予備の買い目" not in text("1530")
+
+
+def test_post_time_messages_match_state(root):
+    prep = _prep()
+    logs = raceday.run_once(prep, FakeSource(None), datetime(2026, 11, 1, 15, 45))
+    assert logs[0]["結果の要約"] == "発走後。買い目なし（一度も作れなかった）"
+    raceday.make_backups(prep, source=FakeSource(_snap()), now=datetime(2026, 10, 31, 21, 0))
+    logs = raceday.run_once(prep, FakeSource(None), datetime(2026, 11, 1, 15, 45))
+    assert "予備の買い目を表示" in logs[0]["結果の要約"]
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 0))
+    logs = raceday.run_once(prep, FakeSource(None), datetime(2026, 11, 1, 15, 45))
+    assert "15:00 の買い目が残っています" in logs[0]["結果の要約"]
+    c = raceday.Clock(datetime(2026, 11, 1), datetime(2026, 11, 1, 15, 45), None)
+    t = "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(_prep(), clock=c))
+    assert "前回の買い目" not in t
+
+
+def test_log_csv_columns_stay_aligned(root):
+    p = raceday.day_dir(DATE) / "log.csv"
+    raceday.append_csv(p, [{"a": 1, "b": "x", "c": 0.5}])
+    raceday.append_csv(p, [{"a": 2, "c": 0.7}])                                   # 列が少ない行
+    raceday.append_csv(p, [{"a": 3, "d": "new"}])                                 # 新しい列
+    t = pd.read_csv(p, encoding="utf-8-sig")
+    assert list(t.columns) == ["a", "b", "c", "d"]
+    assert t["c"].tolist()[:2] == [0.5, 0.7] and pd.isna(t.loc[1, "b"]) and t.loc[2, "d"] == "new"
+
+
+def test_0b31_fallback_when_0b30_fails(root, monkeypatch):
+    from src import jvlink
+    calls = []
+
+    def fake(keys, dataspec, out_dir, date, client, log):
+        calls.append(dataspec)
+        if dataspec == "0B30":
+            raise RuntimeError("0B30 だめ")
+        return {"レース": 1, "データなし": 0, "エラー": 0, "レコード": 1, "保存ファイル": [], "取得時刻": ""}
+    monkeypatch.setattr(jvlink, "fetch_rt_odds", fake)
+    src = raceday.LiveSource(DATE)
+    msg = src.fetch_odds(["2026110105040511"], datetime(2026, 11, 1, 15, 0))
+    assert calls == ["0B30", "0B31"] and "予備 0B31" in msg
+    monkeypatch.setattr(raceday.realodds, "load_race_odds", lambda *a, **k: _snap())
+    snap = src.odds("202605040511", datetime(2026, 11, 1, 15, 0))
+    assert "0B31" in snap["出どころ"] and "3連単" not in snap and snap["単勝"]
+    plan = raceday.compute_plan(_race(), snap, COEFS, None, results_ok=False)
+    assert not plan["本物のオッズで確かめた"]
+
+
+def test_replay_uses_se_win_odds_when_o1_missing(root):
+    raw = make_raw_v8(n_days=60, races=8)
+    ds = jvmap.build_dataset(raw=raw)
+    rr = ds.race_result
+    day = pd.to_datetime(rr["レース日付"]).max()
+    src = raceday.ReplaySource(ds, f"{day:%Y%m%d}")
+    rid = str(rr.loc[pd.to_datetime(rr["レース日付"]) == day, "レースID"].iloc[0])
+    snap = src.odds(rid, datetime(day.year, day.month, day.day, 12, 0))
+    assert snap and "SE" in snap["出どころ"] and len(snap["単勝"]) >= 4
+
+
+def test_front_bias_ignores_races_without_corners():
+    """速報の版 5（着順だけ・通過順なし）のレースは、前残り傾向を NaN として除く（0 として数えない）。"""
+    race = _race(hhmm="1540")
+    with_c = _day_results(["1000"])
+    no_c = _day_results(["1100"]).assign(**{"_4コーナー順位": np.nan, "レースID": "202605040502"})
+    a, _ = raceday.day_terms(race, with_c)
+    b, used = raceday.day_terms(race, pd.concat([with_c, no_c], ignore_index=True))
+    assert used == ["1R", "2R"]
+    assert np.allclose(a["当日_前残り傾向"], b["当日_前残り傾向"])               # 通過順の無いレースは前残りに入らない
+    assert not np.allclose(a["当日_内枠傾向"], b["当日_内枠傾向"])               # 内枠（着順と馬番だけ）には入る
+
+
+def test_cleanup_old_tasks():
+    out = '"\\keiba_raceday_20261031","2026/10/31 9:00:00","準備完了"\n"\\keiba_raceday_20261101","N/A","準備完了"\n' \
+          '"\\keiba_raceday_20261108","2026/11/08 9:00:00","準備完了"\n"\\Other","N/A","準備完了"\n'
+    calls = []
+
+    class R:
+        def __init__(self, stdout=""):
+            self.stdout, self.returncode = stdout, 0
+
+    def run(cmd):
+        calls.append(cmd)
+        return R(out) if cmd[1] == "/query" else R()
+    removed = raceday.cleanup_old_tasks("20261107", run=run)
+    assert removed == ["keiba_raceday_20261031", "keiba_raceday_20261101"]
+    assert ["schtasks", "/delete", "/tn", "keiba_raceday_20261108", "/f"] not in calls
+
+
+def test_record_box_prediction_calls_predict_with_sheet():
+    got = []
+    assert raceday.record_box_prediction("20261101", run=lambda argv: got.append(argv) or 0) == 0
+    assert got[0] == ["predict", "--date", "2026-11-01", "--sheet"]
+
+    def boom(argv):
+        raise SystemExit("シートの設定がありません")
+    assert raceday.record_box_prediction("20261101", run=boom) == 1

@@ -257,6 +257,145 @@ def _cmd_confirm(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v11 2：点数の少ない買い目の「勝者の呪い」の確認（記述だけ。判定には使わない。案の数にも数えない）
+# ---------------------------------------------------------------------------
+POINT_BUCKETS = [(1, 1, "1点"), (2, 3, "2〜3点"), (4, 6, "4〜6点"), (7, 99, "7点以上")]
+CONC_BINS = [0, 0.3, 0.5, 0.7, 0.9, 1.0001]
+
+
+def _bucket(n: int) -> str:
+    return next(label for lo, hi, label in POINT_BUCKETS if lo <= n <= hi)
+
+
+def curse_rows(t: pd.DataFrame, payout: pd.DataFrame, disc_f: dict, kind: str, final_odds: dict | None = None):
+    """F の買い目を作り直し、レースごと（点数・予測・実際・集中度）と買い目ごと（推定配当・当たる確率・確定オッズ）の行。"""
+    from . import realodds
+    t, starts = market.race_slices(t)
+    pay = payout.set_index("レースID")
+    races, bet_rows = [], []
+    for a, b in zip(starts[:-1], starts[1:]):
+        r = t.iloc[a:b]
+        rid = r["レースID"].iloc[0]
+        fold = r["fold"].iloc[0]
+        q = r["市場確率"].to_numpy(dtype="float64")
+        pf = r["tilt3b"].to_numpy(dtype="float64")
+        posts = pd.to_numeric(r["馬番"], errors="coerce").to_numpy()
+        if rid not in pay.index or b - a < 4 or fold not in disc_f or not (np.isfinite(q).all() and (q > 0).all()
+                                                                            and np.isfinite(pf).all() and np.isfinite(posts).all()):
+            continue
+        wins = bets.winning_combos(pay.loc[rid])
+        if not wins["3連単"]:
+            continue
+        posts = posts.astype(int)
+        g, d, _ = disc_f[fold]
+        Q = market.combo_probabilities(market.trifecta_tensor(q, g, d))
+        P = market.trifecta_tensor(pf, g, d)
+        Pc = market.combo_probabilities(P)
+        plan = bets.mixed(P, Q, pf, posts, margin=MARGIN, max_points=MAX_POINTS)
+        if not plan.bets:
+            continue
+        index = {int(x): i for i, x in enumerate(posts)}
+        T = None
+        if final_odds is not None and str(rid) in final_odds:
+            T = realodds.payout_tables(final_odds[str(rid)], posts)
+        pb = []
+        for x in plan.bets:
+            ix = [index[h] for h in x.combo]
+            look = (lambda M: M[tuple(ix)]) if x.kind in ("3連単", "3連複") else (lambda M: M[ix[0], ix[1]])
+            p_b = float(look(Pc[x.kind]))
+            est = market.estimated_payout(float(look(Q[x.kind])), x.kind)
+            key = tuple(sorted(x.combo)) if x.kind in ("3連複", "馬連") else tuple(x.combo)
+            real = float(look(T[x.kind])) if T is not None else np.nan
+            pb.append(p_b)
+            bet_rows.append({"区分": kind, "レースID": rid, "券種": x.kind, "金額": x.stake, "当たる確率（予測）": p_b,
+                             "推定配当": est, "確定オッズの配当": real if np.isfinite(real) else np.nan,
+                             "確定÷推定": real / est if np.isfinite(real) and est > 0 else np.nan,
+                             "当たった": key in wins.get(x.kind, {})})
+        realized = bets.realized(plan, wins)
+        races.append({"区分": kind, "レースID": rid, "点数": len(plan.bets), "点数の区分": _bucket(len(plan.bets)),
+                      "予測の達成確率": plan.predicted, "熱い": realized >= TARGET,
+                      "集中度": max(pb) / sum(pb) if sum(pb) > 0 else np.nan})
+    return pd.DataFrame(races), pd.DataFrame(bet_rows)
+
+
+def _rate_table(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    out = []
+    for key, g in df.groupby(by, sort=False, observed=True):
+        key = key if isinstance(key, tuple) else (key,)
+        n, hot = len(g), int(g["熱い"].sum())
+        lo, hi = tri.wilson_interval(hot, n)
+        pred = float(g["予測の達成確率"].mean())
+        out.append({**dict(zip(by, key)), "レース数": n, "予測の達成確率（平均）": pred, "実際の達成率": hot / n,
+                    "下限": lo, "上限": hi, "実際 − 予測": hot / n - pred})
+    return pd.DataFrame(out)
+
+
+def _cmd_curse(args) -> int:
+    from . import realodds
+    clock = v8._Clock()
+    ds = v8._load(args, clock)
+    base = v8._oof(args, ds, "base")
+    merged, _, _ = v8.tilt_tables(args, ds, base)
+    folds = [f.name for f in v8._folds(args)][1:]
+    disc_f = v8.fold_discounts(merged, "市場確率", base.table)
+    graded = graded_rows(merged, folds, args.until)
+    flat = merged.loc[~merged["重賞"] & merged["fold"].isin(set(folds))]
+    path = v8.experiment.v8_dir() / "odds_targets.csv"
+    targets = pd.read_csv(path, dtype={"レースID": str}, encoding="utf-8-sig") if path.exists() else pd.DataFrame()
+    if not args.flat_all:
+        ids = set(targets.loc[targets["区分"] == "平場サンプル", "レースID"]) if not targets.empty else set()
+        if not ids:
+            rng = np.random.default_rng(0)
+            u = flat["レースID"].unique()
+            ids = set(rng.choice(u, size=min(5000, len(u)), replace=False))
+        flat = flat.loc[flat["レースID"].astype(str).isin(ids)]
+    odds_ids = set(targets["レースID"]) if not targets.empty else set()
+    clock.step(f"確定オッズを読み込み中（取り直した {len(odds_ids):,} レース）...")
+    final_odds = realodds.load_final_odds(odds_ids, base=args.data) if odds_ids else {}
+    clock.step(f"F の買い目を作り直し中（重賞 {graded['レースID'].nunique():,}・平場 {flat['レースID'].nunique():,} レース）...")
+    r1, b1 = curse_rows(graded, ds.payout_df, disc_f, "重賞", final_odds)
+    r2, b2 = curse_rows(flat, ds.payout_df, disc_f, "平場", final_odds)
+    clock.step("完了\n")
+    races = pd.concat([r1, r2], ignore_index=True)
+    bets_df = pd.concat([b1, b2], ignore_index=True)
+    print("※ 記述だけ（判定には使わない。案の数にも数えない）。F の定義は変えない")
+    print("\n=== 1 最終の点数ごとの、予測の達成確率と実際（Wilson 95% 区間） ===")
+    races["点数の区分"] = pd.Categorical(races["点数の区分"], [x[2] for x in POINT_BUCKETS], ordered=True)
+    t1 = _rate_table(races.sort_values("点数の区分"), ["区分", "点数の区分"])
+    v8._show(t1, pct=("率", "限", "確率（", "−"))
+    print("\n=== 2 買い目ごとの 確定オッズの配当 ÷ 推定配当（取り直した確定オッズがあるレースだけ）。比の5区間ごとに、"
+          "予測の当たる確率の合計と実際の的中数 ===")
+    bb = bets_df.loc[bets_df["確定÷推定"].notna()].copy()
+    t2 = pd.DataFrame()
+    if len(bb) >= 5:
+        bb["比の区間"] = pd.qcut(bb["確定÷推定"].rank(method="first"), 5, labels=[f"第{i}五分位" for i in range(1, 6)])
+        rows = []
+        for (k, band), g in bb.groupby(["区分", "比の区間"], observed=True):
+            rows.append({"区分": k, "比の区間": band, "買い目の数": len(g),
+                         "確定÷推定（範囲）": f"{g['確定÷推定'].min():.2f}〜{g['確定÷推定'].max():.2f}",
+                         "確定÷推定（中央値）": float(g["確定÷推定"].median()),
+                         "予測の的中数（当たる確率の合計）": float(g["当たる確率（予測）"].sum()),
+                         "実際の的中数": int(g["当たった"].sum()),
+                         "実際 ÷ 予測": float(g["当たった"].sum() / g["当たる確率（予測）"].sum())})
+        t2 = pd.DataFrame(rows)
+        v8._show(t2)
+        print("    確定÷推定 が小さい（推定配当を高く見すぎた）組ほど、実際の的中が予測より少なければ「勝者の呪い」に近い形")
+    else:
+        print("（確定オッズのある買い目がありません。v8 の odds-targets と fetch-odds --targets のあとに）")
+    print("\n=== 3 集中度（予測の当たる確率が一番大きい買い目 ÷ 買い目全体の当たる確率の合計）ごとの、予測と実際 ===")
+    races["集中度の区間"] = pd.cut(races["集中度"], CONC_BINS, right=False,
+                               labels=["〜0.3", "0.3〜0.5", "0.5〜0.7", "0.7〜0.9", "0.9〜"])
+    t3 = _rate_table(races.sort_values("集中度の区間"), ["区分", "集中度の区間"])
+    v8._show(t3, pct=("率", "限", "確率（", "−"))
+    out = v9_dir() / "curse"
+    out.mkdir(parents=True, exist_ok=True)
+    for name, df in [("by_points", t1), ("by_ratio", t2), ("by_concentration", t3), ("races", races), ("bets", bets_df)]:
+        df.to_csv(out / f"{name}.csv", index=False, encoding="utf-8-sig")
+    print(f"\n  保存: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="py -m src.v9")
     parser.add_argument("--data", default=None, help="JV-Data CSV の場所（既定: data/jvlink）")
@@ -268,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--until", default=UNTIL, help=f"対象の最後の日（既定 {UNTIL}）")
     q.add_argument("--rerun-reason", default=None, help="やり直すときだけ：直した実装のバグの説明")
     q.set_defaults(func=_cmd_confirm)
+    q = sub.add_parser("curse", help="v11 点数の少ない買い目の「勝者の呪い」の確認（記述だけ。重賞の F と平場の F）")
+    q.add_argument("--until", default=UNTIL, help=f"重賞の対象の最後の日（既定 {UNTIL}。v9 と同じ）")
+    q.add_argument("--flat-all", action="store_true", help="平場の全レース（既定は取り直したオッズのある平場サンプル 5,000）")
+    q.set_defaults(func=_cmd_curse)
     args = parser.parse_args(argv)
     return args.func(args)
 

@@ -444,7 +444,7 @@ def render_race(race: pd.DataFrame, model: SavedModel, actual: dict | None = Non
     box = box_horses(race)
     points = BOX_SIZE * (BOX_SIZE - 1) * (BOX_SIZE - 2)
     lines.append(f"  買い目: 3連単 {'・'.join(box)} の{BOX_SIZE}頭BOX {points}点 "
-                 f"{points * trifecta.BET_UNIT:,}円")
+                 f"{points * trifecta.BET_UNIT:,}円（比べるための記録。お金は F で）")
 
     if actual is not None:
         lines.append(f"  結果: 1着 {actual['1着']} / 2着 {actual['2着']} / 3着 {actual['3着']}"
