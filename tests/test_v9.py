@@ -123,3 +123,67 @@ def test_curse_matches_confirm(v8_env, capsys):
     assert set(c.index) == set(f.index)
     assert (c["点数"] == f.loc[c.index, "点数"]).all()
     assert (c["熱い"] == (f.loc[c.index, "払戻"] >= v9.TARGET)).all()
+
+
+# ---------------------------------------------------------------------------
+# v12 付け替えの効果の試算
+# ---------------------------------------------------------------------------
+def _random_races(n=300, seed=0):
+    rng = np.random.default_rng(seed)
+    races = []
+    for i in range(n):
+        k = int(rng.integers(1, 8))
+        stakes = rng.multinomial(120 - k, np.ones(k) / k) + 1                  # 合計 12,000円・各 100円以上
+        rows = []
+        for st in stakes:
+            odds = float(np.round(np.exp(rng.uniform(np.log(3), np.log(300))), 1))
+            win = rng.random() < 0.15
+            rows.append({"券種": str(rng.choice(["馬連", "馬単", "3連複", "3連単"])), "金額": int(st) * 100,
+                         "確定オッズ": odds if rng.random() < 0.95 else None, "実際の払戻": odds * 100 if win else 0.0})
+        races.append({"区分": "平場", "レースID": f"R{i}", "買い目": rows})
+    return races
+
+
+def test_rebalance_without_drift_is_never_worse():
+    """ずれなし（確定オッズ＝20分前）なら、付け替えで熱い当たりは減らない（増えることはある）。"""
+    races = _random_races()
+    for m in v9.REBALANCE_M:
+        for r in races:
+            base = v9.evaluate_f(r)
+            sim = v9.simulate_rebalance(r, m, None)
+            assert not (base["熱い"] and not sim["熱い"])
+            assert sum(b["金額"] for b in r["買い目"]) == 12_000                      # 元の買い目は書き換えない
+    table, _ = v9.rebalance_summary(races, "none", 1, 0, None)
+    assert (table["差"] >= 0).all() and (table["Fだけ熱い"] == 0).all()
+
+
+def test_drift_sampler_data_and_fallback():
+    samples = pd.DataFrame({"券種": "馬連", "帯": "10〜50倍", "r": np.full(50, 0.8)})
+    s = v9.DriftSampler("data", samples, seed=1)
+    assert s.draw("馬連", 20.0) == pytest.approx(0.8)                              # データのある組
+    r = [s.draw("3連単", 500.0) for _ in range(2000)]                              # データの無い組は仮の分布
+    assert abs(np.mean(np.log(r))) < 0.01 and np.std(np.log(r)) == pytest.approx(0.10, abs=0.01)
+    assert s.used == {"集めたデータ": 1, "仮の分布": 2000}
+    a = [v9.DriftSampler("assumed", None, seed=3).draw("馬連", 5.0) for _ in range(3)]
+    assert len(set(a)) == 1                                                        # 種を固定すれば同じ
+
+
+def test_cli_rebalance(v8_env, capsys):
+    from src import v8
+    from test_v8 import _write_synthetic_odds
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "60"]) == 0
+    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    _write_synthetic_odds(v8_env, targets)
+    capsys.readouterr()
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--draws", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "仮の分布（log r ~ 正規(0, 0.10)）" in out and "■ 決め方" in out and "記述だけ" in out
+    t = pd.read_csv(v8_env.parent / "v9" / "rebalance" / "rebalance_assumed.csv", encoding="utf-8-sig")
+    assert set(t["区分"]) == {"重賞", "平場"}
+    for kind, g in t.groupby("区分"):
+        assert len(g) == 1 + 2 * len(v9.REBALANCE_M)                              # F・m ごとに ずれなし／あり
+        none = g.loc[g["ずれ"].fillna("").str.startswith("なし")]
+        assert (none["差"] >= -1e-12).all()                                        # ずれなしは悪くならない
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--drift", "data", "--draws", "1"]) == 0
+    assert "仮の分布で引きます" in capsys.readouterr().out                           # 集めたデータがまだ無い

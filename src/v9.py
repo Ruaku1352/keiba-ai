@@ -396,6 +396,210 @@ def _cmd_curse(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# v12 1：付け替えの効果の試算（記述だけ・F の中身は変えない。当日の運用の確認として扱い、案の数に数えない）
+# ---------------------------------------------------------------------------
+REBALANCE_M = (1.00, 1.05, 1.10, 1.15, 1.20)
+ASSUMED_LOG_SD = 0.10            # 仮の分布：log r ~ 正規(0, 0.10)
+MIN_DRIFT_SAMPLES = 30           # 集めたデータで、券種 × オッズの帯の組がこれより少なければ仮の分布で引く
+
+
+def f_plan_races(t: pd.DataFrame, payout: pd.DataFrame, disc_f: dict, kind: str, final_odds: dict) -> list[dict]:
+    """curse と同じ F の買い目（1レース1つ）。買い目ごとに確定オッズ（倍。無ければ None）と、当たったときの実際の払戻（100円あたり）。"""
+    from . import realodds
+    t, starts = market.race_slices(t)
+    pay = payout.set_index("レースID")
+    out = []
+    for a, b in zip(starts[:-1], starts[1:]):
+        r = t.iloc[a:b]
+        rid, fold = r["レースID"].iloc[0], r["fold"].iloc[0]
+        q = r["市場確率"].to_numpy(dtype="float64")
+        pf = r["tilt3b"].to_numpy(dtype="float64")
+        posts = pd.to_numeric(r["馬番"], errors="coerce").to_numpy()
+        if rid not in pay.index or b - a < 4 or fold not in disc_f or not (np.isfinite(q).all() and (q > 0).all()
+                                                                            and np.isfinite(pf).all() and np.isfinite(posts).all()):
+            continue
+        wins = bets.winning_combos(pay.loc[rid])
+        if not wins["3連単"]:
+            continue
+        posts = posts.astype(int)
+        g, d, _ = disc_f[fold]
+        Q = market.combo_probabilities(market.trifecta_tensor(q, g, d))
+        plan = bets.mixed(market.trifecta_tensor(pf, g, d), Q, pf, posts, margin=MARGIN, max_points=MAX_POINTS)
+        if not plan.bets:
+            continue
+        T = realodds.payout_tables(final_odds[str(rid)], posts) if str(rid) in final_odds else None
+        index = {int(x): i for i, x in enumerate(posts)}
+        rows = []
+        for x in plan.bets:
+            ix = [index[h] for h in x.combo]
+            fin = None
+            if T is not None:
+                v = T[x.kind][tuple(ix)] if x.kind in ("3連単", "3連複") else T[x.kind][ix[0], ix[1]]
+                fin = float(v) / 100 if np.isfinite(v) and v > 0 else None
+            key = tuple(sorted(x.combo)) if x.kind in ("3連複", "馬連") else tuple(x.combo)
+            rows.append({"券種": x.kind, "金額": int(x.stake), "確定オッズ": fin, "実際の払戻": wins.get(x.kind, {}).get(key, 0.0)})
+        out.append({"区分": kind, "レースID": str(rid), "買い目": rows})
+    return out
+
+
+def _band(odds: float) -> str:
+    from . import realodds
+    i = int(np.searchsorted(realodds.ODDS_BINS[1:-1], odds, side="right"))
+    return realodds.ODDS_BIN_LABELS[i]
+
+
+class DriftSampler:
+    """r（確定 ÷ 20分前）を、券種 × オッズの帯ごとに引く。集めたデータが足りない組は仮の分布（log r ~ 正規(0, 0.10)）。"""
+
+    def __init__(self, mode: str, samples: pd.DataFrame | None, seed: int = 0):
+        self.mode = mode
+        self.rng = np.random.default_rng(seed)
+        self.groups: dict = {}
+        if mode == "data" and samples is not None and not samples.empty:
+            for (k, b), g in samples.groupby(["券種", "帯"]):
+                if len(g) >= MIN_DRIFT_SAMPLES:
+                    self.groups[(k, b)] = np.log(g["r"].to_numpy(dtype="float64"))
+        self.used = {"集めたデータ": 0, "仮の分布": 0}
+
+    def draw(self, kind: str, final_odds: float) -> float:
+        # 帯は本来 20分前のオッズで決めるが、試算では確定オッズの帯で代わりにする
+        lr = self.groups.get((kind, _band(final_odds)))
+        if lr is not None:
+            self.used["集めたデータ"] += 1
+            return float(np.exp(lr[self.rng.integers(len(lr))]))
+        self.used["仮の分布"] += 1
+        return float(np.exp(self.rng.normal(0.0, ASSUMED_LOG_SD)))
+
+
+def simulate_rebalance(race: dict, m: float, sampler: DriftSampler | None) -> dict:
+    """1レースを付け替えて（20分前のオッズ = 確定 ÷ r）、実際の払戻で評価する。sampler が None なら「ずれなし」。"""
+    from . import raceday
+    rows = []
+    for b in race["買い目"]:
+        pre = None
+        if b["確定オッズ"]:
+            pre = b["確定オッズ"] / (sampler.draw(b["券種"], b["確定オッズ"]) if sampler else 1.0)
+        rows.append({"金額": b["金額"], "本物のオッズ": pre})
+    moved = raceday.rebalance(rows, target=TARGET * m)
+    pay = sum(r["金額"] * b["実際の払戻"] / 100 for r, b in zip(rows, race["買い目"]))
+    return {"払戻": pay, "熱い": pay >= TARGET, "当たったのに届かず": 0 < pay < TARGET,
+            "付け替え": moved["点数"] > 0, "付け替えた点数": moved["点数"], "回した金額": moved["回した金額"]}
+
+
+def evaluate_f(race: dict) -> dict:
+    pay = sum(b["金額"] * b["実際の払戻"] / 100 for b in race["買い目"])
+    return {"払戻": pay, "熱い": pay >= TARGET, "当たったのに届かず": 0 < pay < TARGET,
+            "付け替え": False, "付け替えた点数": 0, "回した金額": 0}
+
+
+def rebalance_summary(races: list[dict], drift: str, draws: int, seed: int, samples: pd.DataFrame | None,
+                      ms=REBALANCE_M) -> tuple[pd.DataFrame, dict]:
+    """区分 × 条件ごとの表。ずれありは draws 回引いた平均（区間も各回の平均）。"""
+    out = []
+    used = {"集めたデータ": 0, "仮の分布": 0}
+    for kind in dict.fromkeys(r["区分"] for r in races):
+        rs = [r for r in races if r["区分"] == kind]
+        n = len(rs)
+        base = [evaluate_f(r) for r in rs]
+        hot0 = np.array([x["熱い"] for x in base])
+        miss0 = int(sum(x["当たったのに届かず"] for x in base))
+        lo, hi = tri.wilson_interval(int(hot0.sum()), n)
+        out.append({"区分": kind, "条件": "F（付け替えなし）", "ずれ": "", "レース数": n, "熱い当たりの割合": hot0.mean(),
+                    "下限": lo, "上限": hi, "こちらだけ熱い": 0, "Fだけ熱い": 0, "差": 0.0, "差の下限": 0.0, "差の上限": 0.0,
+                    "付け替えが起きたレースの割合": 0.0, "付け替えた点数（1レース平均）": 0.0, "回した金額（1レース平均）": 0.0,
+                    "当たったのに届かず": miss0, "届かずの増減（F比）": 0})
+        modes = [("なし（確定オッズ＝20分前）", None, 1)] + \
+            ([(f"あり（{'集めたデータ' if drift == 'data' else '仮の分布 log r ~ 正規(0, 0.10)'}・{draws}回の平均）", drift, draws)]
+             if drift != "none" else [])
+        for m in ms:
+            for label, dmode, k in modes:
+                stats = []
+                for j in range(k):
+                    sampler = DriftSampler(dmode, samples, seed=seed + 1000 * j + int(round(m * 100))) if dmode else None
+                    sim = [simulate_rebalance(r, m, sampler) for r in rs]
+                    if sampler:
+                        for u in used:
+                            used[u] += sampler.used[u]
+                    hot = np.array([x["熱い"] for x in sim])
+                    t = tri.paired_proportion_test(hot, hot0)
+                    stats.append({"rate": hot.mean(), "xだけ": t["xだけ"], "yだけ": t["yだけ"], "差": t["差"],
+                                  "差下限": t["差下限"], "差上限": t["差上限"],
+                                  "moved": np.mean([x["付け替え"] for x in sim]),
+                                  "pts": np.mean([x["付け替えた点数"] for x in sim]),
+                                  "yen": np.mean([x["回した金額"] for x in sim]),
+                                  "miss": sum(x["当たったのに届かず"] for x in sim), "hot": int(hot.sum())})
+                avg = {key: float(np.mean([s_[key] for s_ in stats])) for key in stats[0]}
+                lo, hi = tri.wilson_interval(int(round(avg["hot"])), n)
+                out.append({"区分": kind, "条件": f"F＋付け替え（目標 m = {m:.2f}）", "ずれ": label, "レース数": n,
+                            "熱い当たりの割合": avg["rate"], "下限": lo, "上限": hi,
+                            "こちらだけ熱い": avg["xだけ"], "Fだけ熱い": avg["yだけ"], "差": avg["差"],
+                            "差の下限": avg["差下限"], "差の上限": avg["差上限"],
+                            "付け替えが起きたレースの割合": avg["moved"], "付け替えた点数（1レース平均）": avg["pts"],
+                            "回した金額（1レース平均）": avg["yen"], "当たったのに届かず": avg["miss"],
+                            "届かずの増減（F比）": avg["miss"] - miss0})
+    return pd.DataFrame(out), used
+
+
+def _cmd_rebalance(args) -> int:
+    from . import raceday, realodds
+    clock = v8._Clock()
+    samples = None
+    if args.drift == "data":
+        path = raceday.drift_samples_path()
+        if not path.exists():
+            print(f"集めたずれのデータがありません（{path}）。先に `py -m src.raceday drift` を。今回は仮の分布で引きます")
+        else:
+            samples = pd.read_csv(path, encoding="utf-8-sig", compression="gzip")
+    ds = v8._load(args, clock)
+    base = v8._oof(args, ds, "base")
+    merged, _, _ = v8.tilt_tables(args, ds, base)
+    folds = [f.name for f in v8._folds(args)][1:]
+    disc_f = v8.fold_discounts(merged, "市場確率", base.table)
+    graded = graded_rows(merged, folds, args.until)
+    flat = merged.loc[~merged["重賞"] & merged["fold"].isin(set(folds))]
+    path = v8.experiment.v8_dir() / "odds_targets.csv"
+    targets = pd.read_csv(path, dtype={"レースID": str}, encoding="utf-8-sig") if path.exists() else pd.DataFrame()
+    if targets.empty:
+        print("odds_targets.csv がありません（v8 odds-targets と fetch-odds --targets のあとに）")
+        return 1
+    flat = flat.loc[flat["レースID"].astype(str).isin(set(targets.loc[targets["区分"] == "平場サンプル", "レースID"]))]
+    clock.step(f"確定オッズを読み込み中（取り直した {targets['レースID'].nunique():,} レース）...")
+    final_odds = realodds.load_final_odds(set(targets["レースID"]), base=args.data)
+    graded = graded.loc[graded["レースID"].astype(str).isin(set(final_odds))]
+    flat = flat.loc[flat["レースID"].astype(str).isin(set(final_odds))]
+    clock.step(f"F の買い目を作り直し中（重賞 {graded['レースID'].nunique():,}・平場 {flat['レースID'].nunique():,} レース）...")
+    races = f_plan_races(graded, ds.payout_df, disc_f, "重賞", final_odds) + \
+        f_plan_races(flat, ds.payout_df, disc_f, "平場", final_odds)
+    clock.step(f"付け替えを試算中（m {len(REBALANCE_M)} 通り × ずれ{'なし' if args.drift == 'none' else 'なし・あり ' + str(args.draws) + '回'}）...")
+    table, used = rebalance_summary(races, args.drift, args.draws, args.seed, samples)
+    clock.step("完了\n")
+    print("※ 当日の運用（付け替え）の確認。記述だけで、F の買い方・確率の案としては数えない。F の買い目の選び方は変えていない")
+    if args.drift != "none":
+        src = "集めたデータ（券種 × オッズの帯。足りない組は仮の分布）" if args.drift == "data" and samples is not None \
+            else "仮の分布（log r ~ 正規(0, 0.10)）"
+        print(f"ずれあり の r（確定 ÷ 20分前）の出どころ: {src}。引いた数: 集めたデータ {used['集めたデータ']:,} / 仮の分布 {used['仮の分布']:,}"
+              f"。乱数の種 {args.seed}（m・回ごとに決まった種）")
+    for kind, g in table.groupby("区分", sort=False):
+        print(f"\n=== {kind}（{int(g['レース数'].iloc[0]):,} レース）：熱い当たりの割合と F との対応のある比較（差の区間は 95%。ずれありは各回の平均） ===")
+        v8._show(g.drop(columns=["区分"]), pct=("割合", "限", "差"), money=("金額",))
+    rule = table.loc[(table["区分"] == "重賞") & (table["条件"] == "F＋付け替え（目標 m = 1.00）") & table["ずれ"].str.startswith("あり")]
+    if not rule.empty:
+        up = float(rule["差の上限"].iloc[0])
+        print(f"\n■ 決め方（重賞・m = 1.00・ずれあり）：差の 95% 区間の上限 {up:+.2%} → "
+              + ("付け替えをやめる（F より明らかに悪い）" if up < 0 else "付け替えを続ける（F より明らかに悪くはない）"))
+    flat_rows = table.loc[(table["区分"] == "平場") & table["ずれ"].str.startswith("あり")]
+    if not flat_rows.empty:
+        best = flat_rows.sort_values("熱い当たりの割合", ascending=False).iloc[0]
+        print(f"■ 参考（m は 12月中旬に集めたデータで回し直して決める）：平場・ずれありで熱い当たりの割合が一番高いのは {best['条件']}"
+              f"（{best['熱い当たりの割合']:.2%}）")
+    out = v9_dir() / "rebalance"
+    out.mkdir(parents=True, exist_ok=True)
+    table.to_csv(out / f"rebalance_{args.drift}.csv", index=False, encoding="utf-8-sig")
+    print(f"\n  保存: {out / f'rebalance_{args.drift}.csv'}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="py -m src.v9")
     parser.add_argument("--data", default=None, help="JV-Data CSV の場所（既定: data/jvlink）")
@@ -411,6 +615,13 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--until", default=UNTIL, help=f"重賞の対象の最後の日（既定 {UNTIL}。v9 と同じ）")
     q.add_argument("--flat-all", action="store_true", help="平場の全レース（既定は取り直したオッズのある平場サンプル 5,000）")
     q.set_defaults(func=_cmd_curse)
+    q = sub.add_parser("rebalance", help="v12 付け替えの効果の試算（curse と同じレース・F の買い目。記述だけ）")
+    q.add_argument("--until", default=UNTIL, help=f"重賞の対象の最後の日（既定 {UNTIL}）")
+    q.add_argument("--drift", default="assumed", choices=["assumed", "data", "none"],
+                   help="ずれあり の r：assumed=仮の分布（既定）/ data=raceday drift で集めたデータ / none=ずれなしだけ")
+    q.add_argument("--draws", type=int, default=10, help="ずれありで r を引く回数（平均を出す。既定 10）")
+    q.add_argument("--seed", type=int, default=0, help="乱数の種（既定 0）")
+    q.set_defaults(func=_cmd_rebalance)
     args = parser.parse_args(argv)
     return args.func(args)
 

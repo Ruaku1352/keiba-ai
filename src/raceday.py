@@ -433,7 +433,7 @@ def _check_row(r: dict) -> None:
               "届く金額": need, "足りない額": max(need - r["金額"], 0)})
 
 
-def rebalance(rows: list[dict]) -> dict:
+def rebalance(rows: list[dict], target: float = TARGET) -> dict:
     """本物のオッズで 5万円に届かない買い目を、予算の中で付け替える（v11 の当日の運用ルール。F の選び方は変えない）。
 
     - 届かない買い目を、届く金額（100円単位で切り上げ）まで増やす。足りない額の小さい買い目から
@@ -441,19 +441,20 @@ def rebalance(rows: list[dict]) -> dict:
       余裕（本物のオッズでの払戻 − 5万円）が一番大きい買い目から。100円未満にはしない
     - 合計・点数は変えない。回しきれなければ回せる分だけ（残りは警告）。本物のオッズが無い買い目は対象にしない
     rows は書き換える（元の金額・付け替え の列を足す）。戻り値: {"点数": 金額が変わった買い目の数, "回した金額": 増やした額の合計}
+    target：増やすときの目標と、回すときに保つ額（既定 5万円。v12 の試算で 5万円 × m に変える。「届く」の表示は 5万円のまま）
     """
     for r in rows:
         r["元の金額"] = r["金額"]
     has = [r for r in rows if r.get("本物のオッズ")]
-    shorts = sorted([r for r in has if r["本物のオッズ"] * r["金額"] < TARGET - 1e-6],
-                    key=lambda r: stake_to_reach(r["本物のオッズ"]) - r["金額"])
+    shorts = sorted([r for r in has if r["本物のオッズ"] * r["金額"] < target - 1e-6],
+                    key=lambda r: stake_to_reach(r["本物のオッズ"], target) - r["金額"])
     for s in shorts:
-        need = stake_to_reach(s["本物のオッズ"])
+        need = stake_to_reach(s["本物のオッズ"], target)
         while s["金額"] < need:
-            donors = [r for r in has if r is not s and r["金額"] - 100 >= max(100, stake_to_reach(r["本物のオッズ"]))]
+            donors = [r for r in has if r is not s and r["金額"] - 100 >= max(100, stake_to_reach(r["本物のオッズ"], target))]
             if not donors:
                 break
-            d = max(donors, key=lambda r: r["本物のオッズ"] * r["金額"] - TARGET)
+            d = max(donors, key=lambda r: r["本物のオッズ"] * r["金額"] - target)
             d["金額"] -= 100
             s["金額"] += 100
     for r in rows:
@@ -1112,6 +1113,10 @@ def _cmd_prep(args) -> int:
     p = prep_live(date, args.data, refit=args.refit)
     if p is None:
         return 1
+    try:
+        day_schedule(date, args.data)                     # v12：当日、全レースの20分前ごろのオッズを集めるための一覧
+    except Exception as e:
+        print(f"  （全レースの一覧を作れませんでした。当日に作り直します: {type(e).__name__}）")
     if args.schedule and not args.no_predict:
         print(f"\n[raceday] 今の6頭BOX の予想を記録します（py -m src.v6 predict --date … --sheet と同じ）...")
         record_box_prediction(date, args.data)
@@ -1210,6 +1215,153 @@ def _cmd_update(args) -> int:
             print(f"  シートに書けませんでした: {e}")
         except Exception as e:
             print(f"  シートに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
+    if not args.no_drift:
+        # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない）
+        try:
+            c = collect_drift_odds(date, now, args.data)
+            if c["レース"]:
+                print(f"  20分前ごろのオッズを集めました: {c['レース']} レース・{c.get('レコード', 0)} レコード（{c.get('秒', '')}秒）")
+        except Exception as e:
+            print(f"  20分前ごろのオッズを集められませんでした（買い目には影響なし）: {type(e).__name__}: {e}")
+            try:
+                append_csv(day_dir(date) / "drift_errors.csv", [{"実行時刻": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                                                 "エラー": f"{type(e).__name__}: {e}"}])
+            except Exception:
+                pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# v12 2：20分前ごろのオッズのデータ集め（全レース。本来の処理のあとに、失敗しても止めない）
+# ---------------------------------------------------------------------------
+DRIFT_WINDOW = (15, 25)          # 発走まで 15〜25 分のレース
+
+
+def drift_dir(data_dir, date: str) -> Path:
+    """集めた20分前ごろのオッズの保存先（重賞の買い目に使う rt とは別にする）。"""
+    return realodds.odds.odds_dir(data_dir) / "rt_drift" / date
+
+
+def day_schedule(date: str, data_dir=None) -> pd.DataFrame:
+    """その日の全レース（レースID・JVRTOpen のキー・発走）。初回だけ RA.csv から作って data/raceday/<日付>/all_races.csv に保存。"""
+    path = day_dir(date) / "all_races.csv"
+    if path.exists():
+        return pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+    from . import results
+    sch = results.race_schedule(jvmap.load_raw(data_dir, record_types=("RA",)))
+    sch = sch.loc[pd.to_datetime(sch["レース日付"]) == pd.Timestamp(date)]
+    t = pd.DataFrame({"レースID": sch["レースID"].astype(str), "キー": [rt_key(date, r) for r in sch["レースID"].astype(str)],
+                      "発走": pd.to_datetime(sch["発走日時"]).dt.strftime("%H%M")}).drop_duplicates("レースID")
+    t.to_csv(path, index=False, encoding="utf-8-sig")
+    return t
+
+
+def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, schedule: pd.DataFrame | None = None) -> dict:
+    """発走まで 15〜25 分のレース（まだ取っていないもの）の 0B30 を取って保存する。各レース1回。"""
+    from . import jvlink
+    fetch = fetch or (lambda keys: jvlink.fetch_rt_odds(keys, dataspec="0B30", out_dir=data_dir, date=date,
+                                                        log=lambda *a, **k: None))
+    sch = schedule if schedule is not None else day_schedule(date, data_dir)
+    done_path = day_dir(date) / "drift_collected.csv"
+    done = set(pd.read_csv(done_path, dtype=str, encoding="utf-8-sig")["レースID"]) if done_path.exists() else set()
+    rows = []
+    for _, r in sch.iterrows():
+        m = (post_time(date, r["発走"]) - now).total_seconds() / 60
+        if DRIFT_WINDOW[0] <= m <= DRIFT_WINDOW[1] and r["レースID"] not in done:
+            rows.append({"レースID": r["レースID"], "キー": r["キー"], "分前": round(m, 1)})
+    if not rows:
+        return {"レース": 0}
+    t0 = time.perf_counter()
+    c = fetch([x["キー"] for x in rows])
+    # fetch_rt_odds は rt/<日付> に書くので、集めた分は rt_drift/<日付> に移す（重賞の買い目の読み込みと混ぜない）
+    moved = []
+    dst = drift_dir(data_dir, date)
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in c.get("保存ファイル", []):
+        f = Path(f)
+        if f.exists():
+            target = dst / f.name.replace("_0B30_", "_drift_")
+            f.replace(target)
+            moved.append(str(target))
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    append_csv(done_path, [{**x, "取得時刻": stamp, "レコード": c.get("レコード", "")} for x in rows])
+    return {"レース": len(rows), "レコード": c.get("レコード", 0), "秒": round(time.perf_counter() - t0, 1), "保存": moved}
+
+
+def drift_pairs(data_dir=None, since: str | None = None) -> pd.DataFrame:
+    """集めた20分前ごろのオッズと確定オッズ（fetch-odds で保存）を、全部の組で比べる（1組1行）。"""
+    base = realodds.odds.odds_dir(data_dir) / "rt_drift"
+    parts = []
+    for d in sorted(base.glob("2*")) if base.exists() else []:
+        if since and d.name < since:
+            continue
+        ids = set()
+        for f in d.glob("O*_*.npz"):
+            with np.load(f, allow_pickle=False) as z:
+                ids |= set(map(str, z["race_id"]))
+        for rid in sorted(ids):
+            pre = realodds.load_race_odds(d, rid, require_win=False)
+            fin = realodds.load_race_odds(realodds.odds.odds_dir(data_dir), rid, final_only=True, require_win=False)
+            if not pre or not fin:
+                continue
+            for kind in realodds.KIND_TYPES:
+                if kind not in pre or kind not in fin:
+                    continue
+                a = pd.DataFrame({"k": [tuple(x) for x in pre[kind][0]], "pre": pre[kind][1] / 100})
+                b = pd.DataFrame({"k": [tuple(x) for x in fin[kind][0]], "fin": fin[kind][1] / 100})
+                m = a.merge(b, on="k")
+                m = m.loc[(m["pre"] > 0) & (m["fin"] > 0)]
+                if m.empty:
+                    continue
+                parts.append(pd.DataFrame({"日付": d.name, "レースID": rid, "券種": kind, "20分前のオッズ": m["pre"].to_numpy(),
+                                           "確定オッズ": m["fin"].to_numpy()}))
+    if not parts:
+        return pd.DataFrame(columns=["日付", "レースID", "券種", "20分前のオッズ", "確定オッズ"])
+    t = pd.concat(parts, ignore_index=True)
+    t["r"] = t["確定オッズ"] / t["20分前のオッズ"]           # 20分前のオッズ = 確定オッズ ÷ r
+    t["帯"] = pd.cut(t["20分前のオッズ"], realodds.ODDS_BINS, labels=realodds.ODDS_BIN_LABELS, right=False).astype(str)
+    stake = np.ceil(np.round(TARGET / t["20分前のオッズ"] / 100, 6)) * 100
+    t["確定でも届く"] = t["確定オッズ"] * stake >= TARGET - 1e-6
+    return t
+
+
+def drift_table(pairs: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (kind, band), g in pairs.groupby(["券種", "帯"], sort=False):
+        lr = np.log(g["r"])
+        rows.append({"券種": kind, "20分前のオッズの帯": band, "組の数": len(g), "レース数": g["レースID"].nunique(),
+                     "r の中央値（確定÷20分前）": float(g["r"].median()), "r の第1四分位": float(g["r"].quantile(0.25)),
+                     "r の第3四分位": float(g["r"].quantile(0.75)), "log r の平均": float(lr.mean()),
+                     "log r の標準偏差": float(lr.std()), "確定でも届く割合": float(g["確定でも届く"].mean())})
+    order = {k: i for i, k in enumerate(realodds.KIND_TYPES)}
+    band = {b: i for i, b in enumerate(realodds.ODDS_BIN_LABELS)}
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["券種", "20分前のオッズの帯"], key=lambda s: s.map(order) if s.name == "券種" else s.map(band)) \
+        .reset_index(drop=True)
+
+
+def drift_samples_path() -> Path:
+    return raceday_dir() / "drift_samples.csv.gz"
+
+
+def _cmd_drift(args) -> int:
+    pairs = drift_pairs(args.data, args.since)
+    if pairs.empty:
+        print("集めた20分前ごろのオッズと確定オッズの組がありません"
+              "（当日の自動実行で data\\jvlink\\odds\\rt_drift に集め、月曜の fetch-odds で確定オッズを保存してから）")
+        return 1
+    t = drift_table(pairs)
+    print(f"=== 20分前ごろのオッズ → 確定オッズ（{pairs['日付'].nunique()} 日・{pairs['レースID'].nunique()} レース・"
+          f"{len(pairs):,} 組。r = 確定 ÷ 20分前） ===")
+    with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_rows", 100):
+        print(t.to_string(index=False))
+    print("    確定でも届く割合 = 20分前のオッズで5万円に届く金額（100円単位で切り上げ）を買ったとき、確定オッズでも5万円以上になる割合")
+    t.to_csv(raceday_dir() / "drift_table.csv", index=False, encoding="utf-8-sig")
+    pairs[["日付", "レースID", "券種", "帯", "r"]].to_csv(drift_samples_path(), index=False, encoding="utf-8-sig",
+                                                     compression="gzip")
+    print(f"\n保存: {raceday_dir() / 'drift_table.csv'}・{drift_samples_path()}（py -m src.v9 rebalance --drift data で使う）")
     return 0
 
 
@@ -1442,6 +1594,7 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--now", default=None, help="時刻を指定して動かす（HHMM。確認用）")
     q.add_argument("--no-sheet", action="store_true", help="シートに書かない")
     q.add_argument("--log-file", default=None, help="出力をこのファイルに追記する（タスクスケジューラ用）")
+    q.add_argument("--no-drift", action="store_true", help="20分前ごろのオッズ（全レース）を集めない")
     q.set_defaults(func=_cmd_update)
     q = sub.add_parser("check-results", help="保存した当日の結果（0B12）の確認：着順の確定と、当日の傾向に使えるレース（買い目は作らない）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
@@ -1464,6 +1617,9 @@ def main(argv: list[str] | None = None) -> int:
     q = sub.add_parser("score", help="答え合わせ：最終の買い目を実際の払戻で（月曜の fetch のあと）")
     q.add_argument("--sheet", action="store_true", help="シート「当日の答え合わせ」にも書く")
     q.set_defaults(func=_cmd_score)
+    q = sub.add_parser("drift", help="集めた20分前ごろのオッズと確定オッズのずれの表（月曜の fetch-odds のあと）")
+    q.add_argument("--since", default=None, help="この日以降（YYYYMMDD）")
+    q.set_defaults(func=_cmd_drift)
     q = sub.add_parser("freeze", help="係数を固定する（12月中旬）")
     q.add_argument("--source", default=None, help="固定する係数のファイル（既定は最新の coefs_*.json）")
     q.set_defaults(func=_cmd_freeze)

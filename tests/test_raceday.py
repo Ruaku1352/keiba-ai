@@ -800,3 +800,94 @@ def test_record_box_prediction_calls_predict_with_sheet():
     def boom(argv):
         raise SystemExit("シートの設定がありません")
     assert raceday.record_box_prediction("20261101", run=boom) == 1
+
+
+# ---------------------------------------------------------------------------
+# v12：付け替えの目標 m・20分前ごろのオッズのデータ集め・ずれの表
+# ---------------------------------------------------------------------------
+def test_rebalance_target_multiplier():
+    spec = [("3連複", "1-7-13", 3500, 25.4), ("3連複", "1-7-17", 7800, 6.3), ("3連複", "1-11-16", 700, 130.0)]
+    a, b = _rows(spec), _rows(spec)
+    raceday.rebalance(a)
+    raceday.rebalance(b, target=55_000)
+    by_a, by_b = {r["組番"]: r for r in a}, {r["組番"]: r for r in b}
+    assert by_a["1-7-17"]["金額"] == 8000 and by_b["1-7-17"]["金額"] == 8800        # 55,000 ÷ 6.3 → 8,800円
+    assert by_b["1-11-16"]["金額"] * 130 >= 55_000 and sum(r["金額"] for r in b) == 12_000
+
+
+def _write_snapshot(directory: Path, rid: str, date: str, scale: float, label: str, fetched: str):
+    snap = _snap(n=6, scale=scale)
+    w = odds.OddsWriter(directory, label=label)
+    posts = np.array(sorted(snap["単勝"]))
+    w.add(odds.OddsRecord("O1", rid, date, "1", 20261101, "11011520", posts.astype(np.int32),
+                          np.round(np.array([snap["単勝"][p] for p in posts]) * 10).astype(np.int32),
+                          np.ones(len(posts), np.int16)), fetched_at=fetched)
+    for kind, rt in [("馬連", "O2"), ("馬単", "O4"), ("3連複", "O5"), ("3連単", "O6")]:
+        horses, pay = snap[kind]
+        r_ = horses.shape[1]
+        kumi = sum(horses[:, i] * 100 ** (r_ - 1 - i) for i in range(r_))
+        w.add(odds.OddsRecord(rt, rid, date, "1" if label != "final" else "5", 20261101, "", kumi.astype(np.int32),
+                              np.round(pay / 10).astype(np.int32), np.ones(len(kumi), np.int16)), fetched_at=fetched)
+    w.flush()
+
+
+def test_collect_drift_odds_once_per_race_in_window(root):
+    sch = pd.DataFrame({"レースID": ["202605040501", "202605040502", "202605040503"],
+                        "キー": ["2026110105040501", "2026110105040502", "2026110105040503"],
+                        "発走": ["1000", "1020", "1100"]})
+    calls = []
+
+    def fetch(keys):
+        calls.append(list(keys))
+        d = odds.odds_dir() / "rt" / DATE
+        for k in keys:
+            _write_snapshot(d, k[:4] + k[8:], DATE, 1.0, "0B30", "2026-11-01 09:40:00")
+        return {"レコード": 5 * len(keys), "保存ファイル": [str(p) for p in d.glob("*.npz")]}
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        c = raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 40), fetch=fetch, schedule=sch)   # 1R は 20分前・2R は 40分前
+        assert calls == [["2026110105040501"]] and c["レース"] == 1
+        c = raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 42), fetch=fetch, schedule=sch)   # 1R は取った後
+        assert c["レース"] == 0 and len(calls) == 1
+        raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 58), fetch=fetch, schedule=sch)      # 2R が 22分前
+        assert calls[-1] == ["2026110105040502"]
+        assert not list((odds.odds_dir() / "rt" / DATE).glob("*.npz"))                               # 重賞用の rt には残さない
+        assert list(raceday.drift_dir(None, DATE).glob("O6_drift_*.npz"))
+    finally:
+        cfg.JV_DATA_DIR = old
+
+
+def test_update_continues_when_drift_collection_fails(root, monkeypatch, capsys):
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    monkeypatch.setattr(raceday, "LiveSource", lambda d, data=None: FakeSource(_snap()))
+
+    def boom(*a, **k):
+        raise RuntimeError("JV-Link だめ")
+    monkeypatch.setattr(raceday, "collect_drift_odds", boom)
+    assert raceday.main(["update", "--date", DATE, "--now", "1520", "--no-sheet"]) == 0
+    out = capsys.readouterr().out
+    assert "集められませんでした（買い目には影響なし）" in out
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").exists()
+    assert (raceday.day_dir(DATE) / "drift_errors.csv").exists()
+
+
+def test_drift_pairs_and_table(root):
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        rid = "202605040511"
+        _write_snapshot(raceday.drift_dir(None, DATE), rid, DATE, 1.0, "drift", "2026-11-01 15:20:00")
+        _write_snapshot(odds.odds_dir(), rid, DATE, 0.9, "final", "")                 # 確定は 20分前の 0.9倍
+        pairs = raceday.drift_pairs()
+        assert set(pairs["券種"]) == {"馬連", "馬単", "3連複", "3連単"}
+        assert np.allclose(pairs["r"], 0.9, atol=0.02)
+        assert not pairs["確定でも届く"].all()
+        t = raceday.drift_table(pairs)
+        assert (t["組の数"] > 0).all() and t["r の中央値（確定÷20分前）"].between(0.85, 0.95).all()
+        assert raceday.main(["drift"]) == 0 and raceday.drift_samples_path().exists()
+    finally:
+        cfg.JV_DATA_DIR = old
