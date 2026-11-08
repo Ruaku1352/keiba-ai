@@ -891,3 +891,52 @@ def test_drift_pairs_and_table(root):
         assert raceday.main(["drift"]) == 0 and raceday.drift_samples_path().exists()
     finally:
         cfg.JV_DATA_DIR = old
+
+
+# ---------------------------------------------------------------------------
+# v13：熱さの参考表示（今の買い目で数える）・k と m の設定
+# ---------------------------------------------------------------------------
+def test_heat_is_monotone_and_from_current_bets():
+    for seed in range(6):
+        for scale in (0.5, 0.8, 1.0):
+            plan = raceday.compute_plan(_race(), _snap(seed=seed, scale=scale), COEFS, None, results_ok=False)
+            h = plan["熱さ"]
+            assert h[50_000] <= h[40_000] + 1e-12 <= h[30_000] + 2e-12                 # 5万 ≤ 4万 ≤ 3万
+            r = plan["熱さ（目標を下げて選び直した場合）"]
+            assert r[50_000] <= r[40_000] + 1e-12 <= r[30_000] + 2e-12
+            assert r[50_000] == pytest.approx(plan["予測の達成確率"])
+            assert plan["例外を考えてもいい場面"] == (h[50_000] < raceday.EXCEPTION_RATE)
+
+
+def test_heat_counts_rebalanced_stakes_with_real_odds():
+    """本物のオッズが推定どおりで付け替えも無ければ、5万円の熱さは F の予測の達成確率と同じ。"""
+    plan = raceday.compute_plan(_race(), _snap(seed=1, scale=1.4), COEFS, None, results_ok=False)
+    assert plan["付け替え"]["点数"] == 0
+    # 本物のオッズが推定の 1.4倍 → 推定配当 × 金額 ≥ 7万円 の買い目は本物で ≥ 9.8万円。5万円の熱さは推定のときより下がらない
+    assert plan["熱さ"][50_000] >= plan["予測の達成確率"] - 1e-9
+
+
+def test_k_and_m_settings():
+    default = raceday.compute_plan(_race(), _snap(seed=2), COEFS, None, results_ok=False)
+    assert (default["k"], default["m"]) == (1.4, 1.0)
+    low = raceday.compute_plan(_race(), _snap(seed=2), {**COEFS, "k": 1.0}, None, results_ok=False)
+    assert low["k"] == 1.0 and low["予測の達成確率"] >= default["予測の達成確率"] - 1e-9   # 余裕が小さいほど天井が上がる
+    hi_m = raceday.compute_plan(_race(), _snap(seed=2, scale=0.75), {**COEFS, "m": 1.2}, None, results_ok=False)
+    for b in hi_m["買い目"]:
+        if b["付け替え"] > 0:
+            assert b["本物のオッズ"] * b["金額"] >= 60_000 - 1e-6                       # 目標は 5万円 × 1.2
+
+
+def test_freeze_stores_k_m_and_sheet_header(root):
+    raceday.write_json(raceday.raceday_dir() / "coefs" / "coefs_20261101.json", dict(COEFS))
+    assert raceday.main(["freeze", "--k", "1.2", "--m", "1.05"]) == 0
+    fr = raceday.read_json(raceday.frozen_path())
+    assert (fr["k"], fr["m"]) == (1.2, 1.05)
+    c = raceday.load_or_fit_coefs(None, "20261108")
+    assert raceday.plan_settings(c) == (1.2, 1.05)
+    prep = _prep()
+    prep["係数"] = c
+    text = "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(prep))
+    assert "k = 1.2・m = 1.05" in text
+    assert raceday.main(["unfreeze"]) == 0
+    assert "k = 1.4・m = 1.00" in "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(_prep()))

@@ -387,10 +387,16 @@ def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.Da
     g, d = coefs["γ"], coefs["δ"]
     P = market.trifecta_tensor(p, g, d)
     Q = market.combo_probabilities(market.trifecta_tensor(q, g, d))
-    plan = bets.mixed(P, Q, p, posts, margin=MARGIN, max_points=MAX_POINTS)
-    heat = {int(TARGET): plan.predicted}
+    k, m = plan_settings(coefs)
+    plan = bets.mixed(P, Q, p, posts, margin=k, max_points=MAX_POINTS)
+    # 目標を下げて選び直した場合（参考）。5万円の買い目より悪ければ、5万円の買い目でその目標に届く確率を使う（低い目標ほど低くならないように）
+    reselect = {int(TARGET): plan.predicted}
+    prev = plan.predicted
     for tg in HEAT_TARGETS[1:]:
-        heat[int(tg)] = bets.mixed(P, Q, p, posts, target=tg, margin=MARGIN, max_points=MAX_POINTS).predicted
+        v = max(bets.mixed(P, Q, p, posts, target=tg, margin=k, max_points=MAX_POINTS).predicted,
+                bets.predicted_success(plan, P, Q, posts, tg), prev)
+        reselect[int(tg)] = v
+        prev = v
     T = realodds.payout_tables({k: snap[k] for k in realodds.KIND_TYPES if k in snap}, posts)
     index = {int(x): i for i, x in enumerate(posts)}
     rows = []
@@ -405,17 +411,40 @@ def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.Da
         rows.append({"券種": b.kind, "組番": _combo_text(b.kind, b.combo), "馬番": list(b.combo), "金額": int(b.stake),
                      "推定配当": est, "本物のオッズ": real / 100 if np.isfinite(real) and real > 0 else None})
     rows.sort(key=lambda r: (SMAPPY_ORDER.index(r["券種"]), r["組番"]))
-    moved = rebalance(rows)
+    moved = rebalance(rows, target=TARGET * m)
     short = [r for r in rows if r["届く"] is False]
+    heat = current_heat(rows, P, Q, posts, T)
     return {"レースID": str(race["レースID"].iloc[0]), "確率の出し方": mode, "当日の結果を使えた": bool(results_ok),
             "使ったレース": used, "使ったレース数": n_used, "予測の達成確率": plan.predicted,
-            "熱さ": heat, "例外を考えてもいい場面": bool(plan.predicted < EXCEPTION_RATE),
+            "熱さ": heat, "熱さ（目標を下げて選び直した場合）": reselect,
+            "例外を考えてもいい場面": bool(heat[int(TARGET)] < EXCEPTION_RATE), "k": k, "m": m,
             "買い目": rows, "点数": len(rows), "合計": int(sum(r["金額"] for r in rows)),
             "本物のオッズで確かめた": T is not None, "付け替え": moved,
             "届かない買い目": len(short), "足りない額の合計": int(sum(r["足りない額"] for r in short)),
             "オッズの発表": snap.get("発表", ""), "オッズの取得時刻": snap.get("取得時刻", ""),
             "オッズのデータ区分": snap.get("データ区分", ""), "オッズの出どころ": snap.get("出どころ", "速報"),
             "γ": g, "δ": d}
+
+
+def plan_settings(coefs: dict) -> tuple[float, float]:
+    """最初の金額の余裕 k と付け替えの目標 m（係数の設定から。無ければ今の既定 k = 1.4・m = 1.00）。"""
+    return float(coefs.get("k", MARGIN)), float(coefs.get("m", 1.0))
+
+
+def current_heat(rows: list[dict], P: np.ndarray, Q: dict, posts: np.ndarray, T: dict | None) -> dict[int, float]:
+    """今の買い目（付け替えたあとの金額）で、払戻が 5万・4万・3万円以上になる確率。
+
+    当たったときの払戻は、本物のオッズがある組は本物のオッズで、無い組は推定配当で数える。
+    同じ買い目で数えるので、必ず 5万 ≤ 4万 ≤ 3万 の順になる（v13 の直し。前は目標ごとに買い目を選び直していた）。
+    """
+    table = {}
+    for kind in bets.KINDS:
+        q = Q[kind]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            est = np.where(q > 0, 100.0 * market.PAYOUT_RATE[kind] / q, np.nan)
+        table[kind] = np.where(np.isfinite(T[kind]), T[kind], est) if T is not None else est
+    plan = bets.Plan("今の買い目", [bets.Bet(r["券種"], tuple(int(x) for x in r["馬番"]), int(r["金額"])) for r in rows])
+    return {int(tg): bets.predicted_success(plan, P, Q, posts, tg, odds=table) for tg in HEAT_TARGETS}
 
 
 def stake_to_reach(odds: float, target: float = TARGET) -> int:
@@ -730,7 +759,9 @@ def _plan_rows(cur: dict) -> list[list]:
     """1つの買い目（F の形）をシートの行に。付け替えた金額を正として並べ、元の金額も添える。"""
     rows: list[list] = []
     mark = "  ← 例外を考えてもいい場面（ふだんの半分の 6% 未満）" if cur["例外を考えてもいい場面"] else ""
-    rows.append(["予測の達成確率（5万円以上）", f"{cur['予測の達成確率']:.1%}{mark}"])
+    now50 = (cur.get("熱さ") or {}).get(int(TARGET), (cur.get("熱さ") or {}).get(str(int(TARGET))))
+    now_txt = f"／今の買い目（付け替えたあと）{now50:.1%}" if now50 is not None else ""
+    rows.append(["予測の達成確率（5万円以上）", f"選んだとき {cur['予測の達成確率']:.1%}{now_txt}{mark}"])
     used = "・".join(cur["使ったレース"]) if cur["使ったレース"] else "なし"
     rows.append(["当日の傾向", cur["確率の出し方"], f"使ったレース: {used}"])
     ann = cur["オッズの発表"]
@@ -754,7 +785,10 @@ def _plan_rows(cur: dict) -> list[list]:
         rows.append(["警告", f"本物のオッズで5万円に届かない買い目が {cur['届かない買い目']} 点（予算の中で回しきれなかった）。"
                              f"全部届かせるには あと +{cur['足りない額の合計']:,}円（予算 12,000円を超えるので、買い足すかは自分で判断）"])
     heat = cur["熱さ"]
-    rows.append(["熱さ（参考）", " / ".join(f"{int(k) // 10000}万円 {v:.1%}" for k, v in heat.items())])
+    rows.append(["熱さ（参考）", "今の買い目で払戻が " + " / ".join(f"{int(k) // 10000}万円以上 {v:.1%}" for k, v in heat.items())])
+    re = cur.get("熱さ（目標を下げて選び直した場合）")
+    if re:
+        rows.append(["", "目標を下げて選び直した場合 " + " / ".join(f"{int(k) // 10000}万円 {v:.1%}" for k, v in re.items())])
     return rows
 
 
@@ -775,8 +809,9 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
     ddir = day_dir(date, replay)
     now_dt = clock.now if clock else datetime.now()
     now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    k, m = plan_settings(prep.get("係数", {}))
     rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", sheet_text(f"{date[:4]}-{date[4:6]}-{date[6:]}"),
-                         f"最終更新 {now}", "", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
+                         f"最終更新 {now}", f"k = {k:.1f}・m = {m:.2f}", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
     if clock and clock.warnings:
         for w in clock.warnings:
             rows.append(["!!!!! 時計の警告 !!!!!", w])
@@ -1113,6 +1148,14 @@ def _cmd_prep(args) -> int:
     p = prep_live(date, args.data, refit=args.refit)
     if p is None:
         return 1
+    if args.k is not None or args.m is not None:          # 練習用に、固定せずに k・m を変える
+        if args.k is not None:
+            p["係数"]["k"] = args.k
+        if args.m is not None:
+            p["係数"]["m"] = args.m
+        write_json(day_dir(date) / "prep.json", p)
+    k, m = plan_settings(p["係数"])
+    print(f"最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}{'（今の既定）' if (k, m) == (MARGIN, 1.0) else ''}")
     try:
         day_schedule(date, args.data)                     # v12：当日、全レースの20分前ごろのオッズを集めるための一覧
     except Exception as e:
@@ -1566,8 +1609,11 @@ def _cmd_freeze(args) -> int:
             return 1
         src = files[-1]
     c = read_json(src)
-    write_json(frozen_path(), {**c, "固定した日": datetime.now().strftime("%Y-%m-%d"), "元": src.name})
-    print(f"係数を固定しました（{src.name} → {frozen_path().name}）。これ以降の prep はこの係数を使います")
+    k = args.k if args.k is not None else float(c.get("k", MARGIN))
+    m = args.m if args.m is not None else float(c.get("m", 1.0))
+    write_json(frozen_path(), {**c, "k": k, "m": m, "固定した日": datetime.now().strftime("%Y-%m-%d"), "元": src.name})
+    print(f"係数を固定しました（{src.name} → {frozen_path().name}。最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}）。"
+          "これ以降の prep はこの係数を使います")
     return 0
 
 
@@ -1588,6 +1634,8 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--start", default="0900", help="当日の10分おきの開始時刻（既定 0900）")
     q.add_argument("--no-predict", action="store_true", help="--schedule のときの 6頭BOX の予想の記録（predict --sheet）をしない")
     q.add_argument("--no-backup", action="store_true", help="予備の買い目を作らない")
+    q.add_argument("--k", type=float, default=None, help="この日だけ最初の金額の余裕 k を変える（既定は固定した値か 1.4）")
+    q.add_argument("--m", type=float, default=None, help="この日だけ付け替えの目標 m を変える（既定は固定した値か 1.00）")
     q.set_defaults(func=_cmd_prep)
     q = sub.add_parser("update", help="当日：速報 → 当日の傾向 → 買い目 → シート（タスクスケジューラから）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
@@ -1622,6 +1670,8 @@ def main(argv: list[str] | None = None) -> int:
     q.set_defaults(func=_cmd_drift)
     q = sub.add_parser("freeze", help="係数を固定する（12月中旬）")
     q.add_argument("--source", default=None, help="固定する係数のファイル（既定は最新の coefs_*.json）")
+    q.add_argument("--k", type=float, default=None, help="最初の金額の余裕 k（既定 1.4）")
+    q.add_argument("--m", type=float, default=None, help="付け替えの目標 m（5万円 × m。既定 1.00）")
     q.set_defaults(func=_cmd_freeze)
     sub.add_parser("unfreeze", help="係数の固定をやめる").set_defaults(func=_cmd_unfreeze)
     args = parser.parse_args(argv)

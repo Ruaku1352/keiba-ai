@@ -140,7 +140,8 @@ def _random_races(n=300, seed=0):
             win = rng.random() < 0.15
             rows.append({"券種": str(rng.choice(["馬連", "馬単", "3連複", "3連単"])), "金額": int(st) * 100,
                          "確定オッズ": odds if rng.random() < 0.95 else None, "実際の払戻": odds * 100 if win else 0.0})
-        races.append({"区分": "平場", "レースID": f"R{i}", "買い目": rows})
+        races.append({"区分": "平場", "レースID": f"R{i}", "買い目": rows,
+                      "プラン": {1.4: {"買い目": rows, "予測": 0.12, "点数": len(rows), "投資": 12_000}}})
     return races
 
 
@@ -154,7 +155,7 @@ def test_rebalance_without_drift_is_never_worse():
             assert not (base["熱い"] and not sim["熱い"])
             assert sum(b["金額"] for b in r["買い目"]) == 12_000                      # 元の買い目は書き換えない
     table, _ = v9.rebalance_summary(races, "none", 1, 0, None)
-    assert (table["差"] >= 0).all() and (table["Fだけ熱い"] == 0).all()
+    assert (table["差（同じ k の付け替えなしとの）"] >= 0).all()
 
 
 def test_drift_sampler_data_and_fallback():
@@ -184,6 +185,92 @@ def test_cli_rebalance(v8_env, capsys):
     for kind, g in t.groupby("区分"):
         assert len(g) == 1 + 2 * len(v9.REBALANCE_M)                              # F・m ごとに ずれなし／あり
         none = g.loc[g["ずれ"].fillna("").str.startswith("なし")]
-        assert (none["差"] >= -1e-12).all()                                        # ずれなしは悪くならない
+        assert (none["差（同じ k の付け替えなしとの）"] >= -1e-12).all()             # ずれなしは悪くならない
     assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--drift", "data", "--draws", "1"]) == 0
     assert "仮の分布で引きます" in capsys.readouterr().out                           # 集めたデータがまだ無い
+
+
+
+# ---------------------------------------------------------------------------
+# v13：最初の金額の余裕 k × 付け替えの目標 m
+# ---------------------------------------------------------------------------
+def _races_k(n=200, seed=0, ks=(1.0, 1.4)):
+    base = _random_races(n, seed)
+    rng = np.random.default_rng(seed + 1)
+    for r in base:
+        for k in ks:
+            rows = [dict(b, 組=(i,)) for i, b in enumerate(r["買い目"])]
+            if k != 1.4:                                                           # 余裕が小さいほど1点の金額は小さい（同じ組で）
+                rows = [dict(b, 金額=max(100, int(b["金額"] * k / 1.4) // 100 * 100)) for b in rows]
+            r["プラン"][float(k)] = {"買い目": rows, "予測": 0.12 * 1.4 / k, "点数": len(rows),
+                                    "投資": sum(b["金額"] for b in rows)}
+        r["買い目"] = r["プラン"][1.4]["買い目"]
+    return base
+
+
+def test_common_random_numbers_same_bet_same_r():
+    s = v9.DriftSampler("assumed", None, seed=7)
+    a = s.draw("馬連", 12.0, key=("R1", 0, "馬連", (1, 2)))
+    assert s.draw("馬連", 12.0, key=("R1", 0, "馬連", (1, 2))) == a                  # 同じ買い目・同じ回は同じ r
+    assert v9.DriftSampler("assumed", None, seed=7).draw("馬連", 12.0, key=("R1", 0, "馬連", (1, 2))) == a
+    assert s.draw("馬連", 12.0, key=("R1", 1, "馬連", (1, 2))) != a                  # 回が違えば別
+
+
+def test_kxm_summary_shapes_and_baseline():
+    races = _races_k()
+    table, pivots, used = v9.kxm_summary(races, "assumed", 3, 0, None, ks=(1.0, 1.4))
+    g = table.loc[table["区分"] == "平場"]
+    assert len(g) == 2 * (1 + 2 * len(v9.REBALANCE_M))
+    base = g.loc[(g["k"] == 1.4) & (g["付け替え"] == "m = 1.00") & g["ずれ"].str.startswith("あり")].iloc[0]
+    assert base["差（今の形との）"] == pytest.approx(0.0) and base["今の形だけ熱い"] == 0     # 今の形どうしは差 0
+    piv = pivots["平場"]
+    assert list(piv.index) == ["k = 1.0", "k = 1.4"] and list(piv.columns) == ["付け替えなし"] + [f"m = {m:.2f}" for m in v9.REBALANCE_M]
+    assert piv.loc["k = 1.4", "m = 1.00"] == pytest.approx(base["熱い当たりの割合"])
+    for col in ("15点の上限に当たった割合", "予算を使い切れなかった割合", "補いきれなかった組があった割合"):
+        assert g[col].between(0, 1).all()
+    assert used["仮の分布"] > 0
+
+
+def test_decide_k_m_rules():
+    def table(best_k, best_m, m14):
+        rows = []
+        for k in (1.0, 1.2, 1.4):
+            for m in (1.0, 1.1):
+                rate = 0.10
+                if (k, m) == (best_k, best_m):
+                    rate = 0.13
+                elif k == 1.4 and m == m14:
+                    rate = 0.12
+                rows.append({"区分": "平場", "k": k, "付け替え": f"m = {m:.2f}", "ずれ": "あり（集めたデータ）", "熱い当たりの割合": rate})
+            rows.append({"区分": "平場", "k": k, "付け替え": "付け替えなし", "ずれ": "", "熱い当たりの割合": 0.2})
+        return pd.DataFrame(rows)
+    c = v9.decide_k_m(table(1.2, 1.1, 1.0))
+    assert (c["k*"], c["m*"], c["m1.4"], c["重賞で確かめる"]) == (1.2, 1.1, 1.0, True)    # 付け替えなしの行は選ばない
+    c = v9.decide_k_m(table(1.4, 1.1, 1.1))
+    assert (c["k*"], c["m*"], c["重賞で確かめる"]) == (1.4, 1.1, False)
+
+
+def test_cli_rebalance_k_and_decide(v8_env, capsys):
+    from src import v8, raceday
+    from test_v8 import _write_synthetic_odds
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "tilt", "--sample", "5"]) == 0
+    assert v8.main(["--data", str(v8_env), "--rounds", "10", "odds-targets", "--n-flat", "60"]) == 0
+    targets = pd.read_csv(v8_env.parent / "v8" / "odds_targets.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    _write_synthetic_odds(v8_env, targets)
+    capsys.readouterr()
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--k", "1.0,1.2", "--draws", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "k を行・m を列" in out and "何も決めない" in out
+    t = pd.read_csv(v8_env.parent / "v9" / "rebalance" / "rebalance_assumed.csv", encoding="utf-8-sig")
+    assert set(t["k"]) == {1.0, 1.2, 1.4}                                           # 1.4 は必ず入る
+    plan_pts = t.groupby("k")["点数（平均）"].first()
+    assert (t["点数（平均）"] <= 15).all() and plan_pts.notna().all()
+    # 決定：集めたデータが無ければ実行しない
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 1
+    samples = pd.DataFrame({"日付": "20261101", "レースID": "x", "券種": "馬連", "帯": "10〜50倍", "r": np.full(40, 0.95)})
+    samples.to_csv(raceday.drift_samples_path(), index=False, encoding="utf-8-sig", compression="gzip")
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "■ 決定：k = " in out and "freeze --k" in out
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 1   # 1回だけ
+    assert "すでに行われています" in capsys.readouterr().out
