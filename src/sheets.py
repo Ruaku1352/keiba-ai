@@ -247,3 +247,26 @@ def write_grid(ws, values: list[list]) -> None:
     ws.clear()
     if grid:
         ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
+
+
+def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
+    """条件付き書式「formula が真なら赤」を、まだ無ければ1つだけ足す（毎回足して増えないように）。戻り値: 足したか。"""
+    meta = ws.spreadsheet.fetch_sheet_metadata()
+    for sh in meta.get("sheets", []):
+        if sh.get("properties", {}).get("sheetId") != ws.id:
+            continue
+        for rule in sh.get("conditionalFormats", []):
+            values = rule.get("booleanRule", {}).get("condition", {}).get("values", [])
+            if any(v.get("userEnteredValue") == formula for v in values):
+                return False
+    import re
+    m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", cell_range)
+    col = lambda c: sum((ord(ch) - 64) * 26 ** i for i, ch in enumerate(reversed(c)))  # noqa: E731
+    grid = {"sheetId": ws.id, "startRowIndex": int(m[2]) - 1, "endRowIndex": int(m[4]),
+            "startColumnIndex": col(m[1]) - 1, "endColumnIndex": col(m[3])}
+    ws.spreadsheet.batch_update({"requests": [{"addConditionalFormatRule": {"index": 0, "rule": {
+        "ranges": [grid],
+        "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+                        "format": {"backgroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1},
+                                   "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}}}}]})
+    return True

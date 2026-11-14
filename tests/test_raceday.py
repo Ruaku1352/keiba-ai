@@ -736,7 +736,7 @@ def test_0b31_fallback_when_0b30_fails(root, monkeypatch):
     from src import jvlink
     calls = []
 
-    def fake(keys, dataspec, out_dir, date, client, log):
+    def fake(keys, dataspec, out_dir, date, client, log, **kw):
         calls.append(dataspec)
         if dataspec == "0B30":
             raise RuntimeError("0B30 だめ")
@@ -940,3 +940,232 @@ def test_freeze_stores_k_m_and_sheet_header(root):
     assert "k = 1.2・m = 1.05" in text
     assert raceday.main(["unfreeze"]) == 0
     assert "k = 1.4・m = 1.00" in "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(_prep()))
+
+
+# ---------------------------------------------------------------------------
+# v14：止まらない・眠らない・止まったら分かる
+# ---------------------------------------------------------------------------
+import time as _time  # noqa: E402
+
+
+class StuckCom:
+    """JVRTOpen が -413 を返し続ける／1回ごとに長く待たされる偽の JV-Link。"""
+
+    def __init__(self, code=-413, delay=0.0):
+        self.code, self.delay, self.opened = code, delay, []
+
+    def JVInit(self, sid):
+        return 0
+
+    def JVRTOpen(self, spec, key):
+        self.opened.append((spec, key))
+        _time.sleep(self.delay)
+        return self.code
+
+    def JVGets(self, buff, size, fname):
+        return 0, None, ""
+
+    def JVClose(self):
+        pass
+
+
+@pytest.fixture()
+def fast_limits(monkeypatch):
+    monkeypatch.setattr(raceday, "RESULTS_TIMEOUT", 1.0)
+    monkeypatch.setattr(raceday, "ODDS_TIMEOUT", 1.0)
+    monkeypatch.setattr(raceday, "ODDS31_TIMEOUT", 1.0)
+    monkeypatch.setattr(raceday, "JOIN_MARGIN", 0.3)
+
+
+def _live(com, monkeypatch, fail_keys=True):
+    from src import jvlink
+    called = {"keys": 0}
+
+    def keys_for_date(*a, **k):
+        called["keys"] += 1
+        return [(f"2026110105040{i:03d}", f"202605040{i:03d}") for i in range(36)]
+    monkeypatch.setattr(jvlink, "race_keys_for_date", keys_for_date)
+    monkeypatch.setattr(jvlink, "columns_for", lambda rt, m: ["a"])
+    src = raceday.LiveSource(DATE, client_factory=lambda: jvlink.JVLinkClient(com=com), struct_module=object())
+    return src, called
+
+
+def test_0b12_413_stops_fast_and_falls_back_to_market(root, monkeypatch, fast_limits):
+    com = StuckCom(-413)
+    src, called = _live(com, monkeypatch)
+    t0 = _time.time()
+    day, ok, msg = src.fetch_results(datetime(2026, 11, 1, 14, 28))
+    assert _time.time() - t0 < 3 and not ok and "-413" in msg
+    assert called["keys"] == 0 and len(com.opened) == 1                       # 通信のエラーではレース単位の予備を試さない
+    keys = [f"2026110105040{i:03d}" for i in range(36)]
+    t0 = _time.time()
+    msg = src.fetch_odds(keys, datetime(2026, 11, 1, 14, 28))
+    assert _time.time() - t0 < 4 and "打ち切り" in msg
+    assert len([o for o in com.opened if o[0] == "0B30"]) == raceday.MAX_SAME_ERRORS   # 同じエラーが続いたら残りは試さない
+    assert not src.got_odds
+
+
+def test_slow_jvlink_is_cut_at_the_limit(root, monkeypatch, fast_limits):
+    com = StuckCom(0, delay=5.0)                                             # 1回の JVRTOpen が 5 秒戻らない
+    src, _ = _live(com, monkeypatch)
+    t0 = _time.time()
+    day, ok, msg = src.fetch_results(datetime(2026, 11, 1, 14, 28))
+    assert _time.time() - t0 < 2.5 and not ok and "打ち切り" in msg
+    t0 = _time.time()
+    src.fetch_odds(["2026110105040511"], datetime(2026, 11, 1, 14, 28))
+    assert _time.time() - t0 < 4.5 and not src.got_odds
+
+
+def test_final_is_made_even_when_jvlink_hangs(root, monkeypatch, fast_limits):
+    """取り込みが戻らなくても、その回は先に進み、20分前の回で最終の買い目ができる（保存してある新しいオッズで・市場だけ）。"""
+    prep = _prep()
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        _write_snapshot(odds.odds_dir() / "rt" / DATE, "202605040511", DATE, 1.0, "0B30", "2026-11-01 15:12:00")
+        com = StuckCom(0, delay=5.0)
+        src, _ = _live(com, monkeypatch)
+        t0 = _time.time()
+        logs = raceday.run_once(prep, src, datetime(2026, 11, 1, 15, 20))
+        assert _time.time() - t0 < 6
+        f = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "final.json")
+        assert f and f["確率の出し方"].startswith("市場だけ") and "保存済み" not in logs[0]["結果の要約"]
+    finally:
+        cfg.JV_DATA_DIR = old
+
+
+def test_stale_odds_are_not_used_when_fetch_failed(root, monkeypatch, fast_limits):
+    prep = _prep()
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        _write_snapshot(odds.odds_dir() / "rt" / DATE, "202605040511", DATE, 1.0, "0B30", "2026-11-01 13:09:00")
+        src, _ = _live(StuckCom(-413), monkeypatch)
+        logs = raceday.run_once(prep, src, datetime(2026, 11, 1, 15, 20))
+        assert "古い" in logs[0]["結果の要約"]
+        assert not (raceday.day_dir(DATE) / "202605040511" / "final.json").exists()
+    finally:
+        cfg.JV_DATA_DIR = old
+
+
+def test_network_down_skips_jvlink(root, monkeypatch):
+    src, _ = _live(StuckCom(0), monkeypatch)
+    src.network_ok = False
+    day, ok, msg = src.fetch_results(datetime(2026, 11, 1, 14, 0))
+    assert not ok and "ネットにつながっていない" in msg
+    assert "ネットにつながっていない" in src.fetch_odds(["k"], datetime(2026, 11, 1, 14, 0))
+    assert raceday.wait_for_network(probe=lambda: False, max_wait=20, step=10, sleep=lambda s: None) is False
+    seq = iter([False, False, True])
+    assert raceday.wait_for_network(probe=lambda: next(seq), max_wait=60, step=10, sleep=lambda s: None) is True
+
+
+def test_jvlink_fetch_deadline_and_same_errors(tmp_path, monkeypatch):
+    from src import jvlink
+    monkeypatch.setattr(jvlink, "columns_for", lambda rt, m: ["a"])
+    com = StuckCom(-413)
+    c = jvlink.fetch_rt_results("20261101", tmp_path, client=jvlink.JVLinkClient(com=com), struct_module=object(),
+                                keys=[f"k{i}" for i in range(36)], max_same_errors=3)
+    assert len(com.opened) == 3 and "3 回続いた" in c["打ち切り"]
+    com = StuckCom(-413)
+    c = jvlink.fetch_rt_results("20261101", tmp_path, client=jvlink.JVLinkClient(com=com), struct_module=object(),
+                                keys=[f"k{i}" for i in range(36)], deadline=_time.time() - 1)
+    assert com.opened == [] and c["打ち切り"] == "時間の上限"
+    com = StuckCom(-413)                                                     # 既定（rt-odds のコマンド）は今までどおり全部試す
+    jvlink.fetch_rt_results("20261101", tmp_path, client=jvlink.JVLinkClient(com=com), struct_module=object(),
+                            keys=[f"k{i}" for i in range(5)])
+    assert len(com.opened) == 5
+
+
+def test_watchdog_exits_on_wall_clock_jump():
+    exited = []
+    t = [1000.0]
+    stop = raceday.start_watchdog(limit=300, clock=lambda: t[0], exit_fn=exited.append, interval=0.05, log=lambda *a: None)
+    _time.sleep(0.15)
+    assert not exited
+    t[0] += 7240                                                             # スリープ明け：壁の時計が2時間進んだ
+    _time.sleep(0.3)
+    assert exited == [3]
+    stop.set()
+    exited2 = []
+    stop2 = raceday.start_watchdog(limit=300, clock=lambda: 0.0, exit_fn=exited2.append, interval=0.05)
+    stop2.set()                                                              # 正常に終わった回は止める
+    _time.sleep(0.15)
+    assert not exited2
+
+
+def test_gap_is_noted_and_shown(root):
+    assert raceday.note_gap(DATE, datetime(2026, 11, 1, 13, 10)) is None
+    assert raceday.note_gap(DATE, datetime(2026, 11, 1, 13, 20)) is None
+    msg = raceday.note_gap(DATE, datetime(2026, 11, 1, 14, 28))
+    assert "13:20〜14:28" in msg and "止まっていた可能性" in msg
+    text = "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(_prep()))
+    assert "PC が止まっていた可能性 13:20〜14:28" in text
+
+
+def test_sheet_has_minutes_since_update_formula_and_red_rule(root):
+    rows = raceday.render_sheet(_prep(), clock=raceday.Clock(datetime(2026, 11, 1), datetime(2026, 11, 1, 14, 28, 32), None))
+    assert rows[1][0].startswith('=IF(B2>15,"!!!!! 最終更新から "&B2&" 分') and "PC が止まっている可能性" in rows[1][0]
+    assert rows[1][1] == "=ROUND((NOW()-DATE(2026,11,1)-TIME(14,28,32))*1440)"
+    from src import sheets
+
+    class Book:
+        def __init__(self):
+            self.rules, self.calls = [], 0
+
+        def fetch_sheet_metadata(self):
+            return {"sheets": [{"properties": {"sheetId": 7}, "conditionalFormats": self.rules}]}
+
+        def batch_update(self, body):
+            self.calls += 1
+            self.rules.append(body["requests"][0]["addConditionalFormatRule"]["rule"])
+
+    class WS:
+        id = 7
+        spreadsheet = Book()
+    ws = WS()
+    assert sheets.ensure_red_rule(ws, "A2:E2", "=$B$2>15") is True
+    assert sheets.ensure_red_rule(ws, "A2:E2", "=$B$2>15") is False and ws.spreadsheet.calls == 1   # 毎回足さない
+    rng = ws.spreadsheet.rules[0]["ranges"][0]
+    assert (rng["startRowIndex"], rng["endRowIndex"], rng["startColumnIndex"], rng["endColumnIndex"]) == (1, 2, 0, 5)
+
+
+def test_state_says_final_missing_after_t_minus_20(root):
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 14, 0))
+    c = raceday.Clock(datetime(2026, 11, 1), datetime(2026, 11, 1, 15, 30), None)
+    text = "\n".join(" ".join(map(str, r)) for r in raceday.render_sheet(prep, clock=c))
+    assert "最終の買い目を作れていない。14:00 の買い目のまま" in text
+
+
+def test_keepawake_spawned_once_until_last_post(root):
+    prep = _prep()
+    spawned = []
+    assert raceday.ensure_keepawake(DATE, prep, datetime(2026, 11, 1, 9, 0), spawn=spawned.append) is True
+    assert spawned[0][:3] == ["-m", "src.raceday", "keepawake"] and spawned[0][-1] == "1550"   # 最後の発走 15:40 の10分あと
+    assert raceday.ensure_keepawake(DATE, prep, datetime(2026, 11, 1, 9, 10), spawn=spawned.append) is False   # 動いている
+    raceday.keepawake_path(DATE).unlink()
+    assert raceday.ensure_keepawake(DATE, prep, datetime(2026, 11, 1, 16, 0), spawn=spawned.append) is False   # 最後の発走のあと
+    assert len(spawned) == 1
+
+
+def test_score_counts_replay_separately(env, capsys):
+    raw = {rt: pd.read_csv(env / f"{rt}.csv", dtype=str, keep_default_na=False, encoding="utf-8-sig") for rt in ("RA", "SE", "HR")}
+    ds = jvmap.build_dataset(env)
+    rr = ds.race_result
+    graded = rr.loc[rr["リステッド・重賞競走"].isin(["G1", "G2", "G3", "G"])]
+    day = pd.to_datetime(graded["レース日付"]).sort_values().iloc[-1]
+    date = f"{day:%Y%m%d}"
+    ids = graded.loc[pd.to_datetime(graded["レース日付"]) == day, "レースID"].unique()
+    _write_odds(env, ds, ids, date)
+    assert raceday.main(["--data", str(env), "replay", "--date", date]) == 0
+    capsys.readouterr()
+    assert raceday.main(["--data", str(env), "score"]) == 1                    # 本番の分が無く、ドライランも指定していない
+    assert raceday.main(["--data", str(env), "score", "--replay-dates", date]) == 0
+    out = capsys.readouterr().out
+    assert raceday.REPLAY_LABEL in out and "本番の通算には入れない" in out
+    sc = pd.read_csv(raceday.raceday_dir() / "score_races.csv", encoding="utf-8-sig", dtype={"レースID": str})
+    assert set(sc["区分"]) == {raceday.REPLAY_LABEL}
+    summ = pd.read_csv(raceday.raceday_dir() / "score_summary.csv", encoding="utf-8-sig")
+    assert summ["買い方"].str.contains(raceday.REPLAY_LABEL).all()

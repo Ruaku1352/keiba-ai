@@ -509,6 +509,46 @@ def load_rt_results(rt_dir) -> dict:
     return raw
 
 
+RESULTS_TIMEOUT = 60             # 0B12 の取り込みの時間の上限（秒）
+ODDS_TIMEOUT = 30                # 0B30
+ODDS31_TIMEOUT = 20              # 予備の 0B31
+MAX_SAME_ERRORS = 3              # 同じエラーがこの回数続いたら、残りのレースは試さない
+STALE_ODDS_MIN = 15              # この回にオッズが取れなかったとき、これより古いオッズでは買い目を作らない（分）
+RUN_LIMIT_SEC = 300              # 1回の実行の上限（秒）。スリープ明けで止まった回も、これを過ぎたらすぐ終わる
+NET_WAIT_SEC = 60                # ネットにつながっていないとき、つながるまで待つ上限（秒）
+GAP_WARN_MIN = 15                # 前回の実行からこれ以上空いていたら「止まっていた可能性」
+STALE_SHEET_MIN = 15             # シートの「最終更新から ○分」がこれを超えたら赤
+JOIN_MARGIN = 5                  # 時間の上限のあと、スレッドの終わりを待つ余白（秒）
+
+
+def call_with_timeout(fn, timeout: float):
+    """fn を別のスレッドで動かし、timeout 秒で待つのをやめる（JV-Link の呼び出しが戻らなくても、この回は先に進む）。
+
+    戻り値: (終わったか, 戻り値)。終わらなかったスレッドは捨てる（daemon なので、実行の終わりに一緒に終わる）。
+    """
+    import threading
+    box: dict = {}
+
+    def run():
+        try:
+            try:
+                import pythoncom                            # Windows：このスレッドで COM を使えるように
+                pythoncom.CoInitialize()
+            except ImportError:
+                pass
+            box["r"] = fn()
+        except BaseException as e:                         # noqa: BLE001  呼び出し元でそのまま投げ直す
+            box["e"] = e
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return False, None
+    if "e" in box:
+        raise box["e"]
+    return True, box.get("r")
+
+
 def day_results_from_raw(raw: dict, date: str) -> pd.DataFrame:
     """速報（0B12）の RA・SE から、その日の着順が確定したレース（データ区分 5〜7）の馬の行。払戻（HR）は使わない。"""
     races = jvmap.prepare_races(raw["RA"])
@@ -535,20 +575,37 @@ class LiveSource:
         return self.client_factory() if self.client_factory else None
 
     def fetch_results(self, now: datetime) -> tuple[pd.DataFrame | None, bool, str]:
+        """0B12（その日の結果）。時間の上限（RESULTS_TIMEOUT 秒）で打ち切り、取れた分だけで進める。取れなければ市場だけ。"""
         from . import jvlink
         t0 = time.perf_counter()
+        if not getattr(self, "network_ok", True):
+            self.timing["結果の取得（秒）"] = 0.0
+            return None, False, "ネットにつながっていないので 0B12 を取らなかった（市場だけ）"
+        deadline = time.time() + RESULTS_TIMEOUT
+
+        def get(keys=None):
+            return jvlink.fetch_rt_results(self.date, self.rt_dir, client=self._client(), struct_module=self.struct_module,
+                                           keys=keys, log=self.log, deadline=deadline, max_same_errors=MAX_SAME_ERRORS)
         try:
-            counts = jvlink.fetch_rt_results(self.date, self.rt_dir, client=self._client(),
-                                             struct_module=self.struct_module, log=self.log)
-            if any("JVRTOpen" in e for e in counts["エラー"]):
+            done, counts = call_with_timeout(get, RESULTS_TIMEOUT + JOIN_MARGIN)
+            if not done:
+                raise TimeoutError(f"0B12 が {RESULTS_TIMEOUT} 秒で終わらなかった（打ち切り）")
+            codes = counts.get("エラーコード", [])
+            comm = any(-499 <= c <= -400 for c in codes)
+            if any("JVRTOpen" in e for e in counts["エラー"]) and not comm and not counts.get("打ち切り") \
+                    and time.time() < deadline:
                 # 開催日単位のキーで読めなかったときの予備：その日の全レースをレース単位のキーで
+                # （通信のエラー -4xx のときはしない。v14：11/14 はここで全36レースが -413 になり長く止まった）
                 keys = [k for k, _ in jvlink.race_keys_for_date(self.date, self.data_dir, graded_only=False)]
                 if keys:
-                    counts = jvlink.fetch_rt_results(self.date, self.rt_dir, client=self._client(),
-                                                     struct_module=self.struct_module, keys=keys, log=self.log)
-            ok = not counts["エラー"]
-            msg = (f"0B12: {sum(counts['レコード'].values())} レコード" + (f"、エラー {counts['エラー']}" if counts["エラー"] else "")
-                   + (f"、データなし {counts['データなし']}" if counts["データなし"] else ""))
+                    done, counts = call_with_timeout(lambda: get(keys), max(deadline - time.time(), 1) + JOIN_MARGIN)
+                    if not done:
+                        raise TimeoutError(f"0B12 が {RESULTS_TIMEOUT} 秒で終わらなかった（打ち切り）")
+            ok = not counts["エラー"] and not counts.get("打ち切り")
+            msg = (f"0B12: {sum(counts['レコード'].values())} レコード" + (f"、エラー {counts['エラー'][:3]}" if counts["エラー"] else "")
+                   + (f"（ほか {len(counts['エラー']) - 3} 件）" if len(counts["エラー"]) > 3 else "")
+                   + (f"、データなし {counts['データなし']}" if counts["データなし"] else "")
+                   + (f"、打ち切り（{counts['打ち切り']}）" if counts.get("打ち切り") else ""))
         except Exception as e:                                 # 取り込みが失敗しても止めない（市場だけに切り替える）
             ok, msg = False, f"0B12 の取り込みに失敗: {type(e).__name__}: {e}"
         self.timing["結果の取得（秒）"] = round(time.perf_counter() - t0, 1)
@@ -576,24 +633,39 @@ class LiveSource:
         append_csv(path, rows)
 
     def fetch_odds(self, race_keys: list[str], now: datetime) -> str:
-        """0B30（全券種）。取れなかった（エラー・データなし・失敗）ときは 0B31（単複枠）で単勝だけでも取る。"""
+        """0B30（全券種）。取れなかった（エラー・データなし・失敗・時間の上限）ときは 0B31（単複枠）で単勝だけでも取る。"""
         from . import jvlink
         t0 = time.perf_counter()
         self.fallback = False
+        self.got_odds = False
+        if not getattr(self, "network_ok", True):
+            self.timing["オッズの取得（秒）"] = 0.0
+            return "ネットにつながっていないので 0B30 を取らなかった"
         ok = False
+
+        def get(spec, limit):
+            deadline = time.time() + limit
+            return call_with_timeout(lambda: jvlink.fetch_rt_odds(race_keys, dataspec=spec, out_dir=self.data_dir, date=self.date,
+                                                                  client=self._client(), log=self.log, deadline=deadline,
+                                                                  max_same_errors=MAX_SAME_ERRORS), limit + JOIN_MARGIN)
         try:
-            c = jvlink.fetch_rt_odds(race_keys, dataspec="0B30", out_dir=self.data_dir, date=self.date,
-                                     client=self._client(), log=self.log)
-            msg = f"0B30: {c['レース']} レース・{c['レコード']} レコード（データなし {c['データなし']}・エラー {c['エラー']}）"
+            done, c = get("0B30", ODDS_TIMEOUT)
+            if not done:
+                raise TimeoutError(f"0B30 が {ODDS_TIMEOUT} 秒で終わらなかった（打ち切り）")
+            msg = f"0B30: {c['レース']} レース・{c['レコード']} レコード（データなし {c['データなし']}・エラー {c['エラー']}）" + \
+                (f"、打ち切り（{c['打ち切り']}）" if c.get("打ち切り") else "")
             ok = c["エラー"] == 0 and c["データなし"] == 0 and c["レース"] > 0
+            self.got_odds = c["レース"] > 0 and c["レコード"] > 0
         except Exception as e:
             msg = f"0B30 の取り込みに失敗: {type(e).__name__}: {e}"
         if not ok and race_keys:
             try:
-                c = jvlink.fetch_rt_odds(race_keys, dataspec="0B31", out_dir=self.data_dir, date=self.date,
-                                         client=self._client(), log=self.log)
+                done, c = get("0B31", ODDS31_TIMEOUT)
+                if not done:
+                    raise TimeoutError(f"0B31 が {ODDS31_TIMEOUT} 秒で終わらなかった（打ち切り）")
                 msg += f" / 予備 0B31（単勝）: {c['レース']} レース（データなし {c['データなし']}・エラー {c['エラー']}）"
-                self.fallback = c["レース"] > 0
+                self.fallback = c["レース"] > 0 and c["レコード"] > 0
+                self.got_odds = self.got_odds or self.fallback
             except Exception as e:
                 msg += f" / 予備 0B31 も失敗: {type(e).__name__}: {e}"
         self.timing["オッズの取得（秒）"] = round(time.perf_counter() - t0, 1)
@@ -603,6 +675,15 @@ class LiveSource:
         snap = realodds.load_race_odds(self.odds_dir, race_id)
         if not snap:
             return None
+        if not getattr(self, "got_odds", True):
+            # この回はオッズが取れなかった。保存してある古いオッズ（STALE_ODDS_MIN 分より前）では買い目を作らない（v14）
+            try:
+                age = (now - datetime.strptime(snap.get("取得時刻", ""), "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+            except ValueError:
+                age = None
+            if age is None or age > STALE_ODDS_MIN:
+                self.stale = f"この回はオッズが取れず、保存してあるオッズが古い（{snap.get('取得時刻', '')[11:16]} 取得）"
+                return None
         if getattr(self, "fallback", False):
             # 0B30 が取れず 0B31 の単勝で作る。ほかの券種の古いオッズでは確かめない（古い値で「届く」と出さないため）
             for k in realodds.KIND_TYPES:
@@ -714,7 +795,8 @@ def run_once(prep: dict, source, now: datetime, clock: Clock | None = None, repl
         if warn:
             clock.warnings.append(warn)
         if not snap:
-            row["結果の要約"] = "単勝オッズが無い（発売前・取得の失敗）。前回の買い目のまま"
+            why = getattr(source, "stale", "") or "発売前・取得の失敗"
+            row["結果の要約"] = f"単勝オッズが無い（{why}）。前回の買い目のまま"
             logs.append(row)
             continue
         try:
@@ -812,9 +894,17 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
     k, m = plan_settings(prep.get("係数", {}))
     rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", sheet_text(f"{date[:4]}-{date[4:6]}-{date[6:]}"),
                          f"最終更新 {now}", f"k = {k:.1f}・m = {m:.2f}", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
+    # v14：シートを開いたときにシートの側で計算する「最終更新から ○分」（PC が止まっていても分かる）。B2 の分が 15 を超えたら赤
+    rows.append([f'=IF(B2>{STALE_SHEET_MIN},"!!!!! 最終更新から "&B2&" 分（{STALE_SHEET_MIN}分を超えた：PC が止まっている可能性） !!!!!",'
+                 f'"最終更新から "&B2&" 分")',
+                 f"=ROUND((NOW()-DATE({now_dt.year},{now_dt.month},{now_dt.day})-TIME({now_dt.hour},{now_dt.minute},{now_dt.second}))*1440)",
+                 "分（シートを開いた時刻で計算）"])
     if clock and clock.warnings:
         for w in clock.warnings:
-            rows.append(["!!!!! 時計の警告 !!!!!", w])
+            rows.append(["!!!!! 時計の警告など !!!!!", w])
+    gaps = read_json(ddir / "gaps.json") or []
+    if gaps:
+        rows.append(["PC が止まっていた可能性", " / ".join(f"{g['から']}〜{g['まで']}" for g in gaps)])
     for r in prep["レース"]:
         rid = r["レースID"]
         st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
@@ -833,7 +923,12 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
                 extra = "予備あり（最終の時刻までに作れなければ表示）" if backup else "予備なし"
                 rows.append([head, f"発走 {post:%H:%M}", f"状態: {state}", extra])
             continue
-        state = "最終（これ以降は更新しない）" if st["final"] else f"{cur['段階']}（最終は発走{FINAL_BEFORE}分前）"
+        if st["final"]:
+            state = "最終（これ以降は更新しない）"
+        elif now_dt >= post - timedelta(minutes=FINAL_BEFORE):
+            state = f"{cur['段階']}（最終の買い目を作れていない。{cur['作成時刻'][11:16]} の買い目のまま）"
+        else:
+            state = f"{cur['段階']}（最終は発走{FINAL_BEFORE}分前）"
         rows.append([head, f"発走 {cur['発走']}", f"状態: {state}", f"作成 {cur['作成時刻'][11:16]}（発走 {cur['分前']:.0f} 分前）"])
         rows += _plan_rows(cur)
         if st["provisional"] and st["provisional"]["作成時刻"] != cur["作成時刻"]:
@@ -852,6 +947,10 @@ def write_sheet(prep: dict, replay: bool = False, clock: Clock | None = None, se
         settings = settings or sheets.load_settings()
         ws = sheets.open_or_add_worksheet(settings, title)
     sheets.write_grid(ws, values)
+    try:
+        sheets.ensure_red_rule(ws, "A2:E2", f"=$B$2>{STALE_SHEET_MIN}")
+    except Exception:
+        pass                                              # 色付けに失敗しても、文字の警告は出ている
     return title
 
 
@@ -891,7 +990,7 @@ def task_xml(date: str, prep: dict, python: str, workdir: str, start_hhmm: str =
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
     <WakeToRun>true</WakeToRun>
-    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT6M</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author">
@@ -1037,10 +1136,16 @@ def score_summary(races: pd.DataFrame, box: pd.DataFrame | None = None) -> pd.Da
     return pd.DataFrame(out)
 
 
-def collect_finals(replay: bool = False) -> list[dict]:
+REPLAY_LABEL = "ドライラン（本番の自動実行ではない）"
+
+
+def collect_finals(replay: bool = False, dates=None) -> list[dict]:
+    """保存した最終の買い目。replay=True ならドライランの分（dates で日付を絞る）。"""
     base = raceday_dir() / "replay" if replay else raceday_dir()
     out = []
     for p in sorted(base.glob("2*/*/final.json")):
+        if dates is not None and p.parent.parent.name not in set(dates):
+            continue
         f = read_json(p)
         if f:
             out.append(f)
@@ -1229,6 +1334,129 @@ class _Tee:
         self.f.flush()
 
 
+# ---------------------------------------------------------------------------
+# v14：止まらない・眠らない・止まったら分かる
+# ---------------------------------------------------------------------------
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+KEEPAWAKE_AFTER_MIN = 10          # 最後の発走のこの分あとまで、待機中のスリープを防ぐ
+
+
+def start_watchdog(limit: float = RUN_LIMIT_SEC, clock=time.time, exit_fn=None, interval: float = 2.0, log=print):
+    """壁の時計（スリープ中も進む）で、実行が limit 秒を超えたらプロセスを終える。スリープ明けに止まっていた回もすぐ終わるので、
+    待たされていた次の回（発走60分前・20分前など）がすぐ動く。"""
+    import os
+    import threading
+    exit_fn = exit_fn or (lambda code: os._exit(code))
+    t0 = clock()
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(interval):
+            if clock() - t0 > limit:
+                try:
+                    log(f"!!!!! 1回の実行の上限（{limit:.0f} 秒）を超えたので打ち切ります"
+                        f"（スリープ明けか、取り込みが止まった。保存した買い目はそのまま）")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                exit_fn(3)
+                return
+    th = threading.Thread(target=watch, daemon=True)
+    th.start()
+    return stop
+
+
+def keep_system_awake(on: bool = True) -> bool:
+    """Windows に「システムを起こしておく」を求める（このプロセスが終わるか、on=False で戻す）。画面は消えてよい。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+        return True
+    except Exception:
+        return False
+
+
+def keepawake_path(date: str) -> Path:
+    return day_dir(date) / "keepawake.json"
+
+
+def ensure_keepawake(date: str, prep: dict, now: datetime, spawn=None) -> bool:
+    """重賞のある日、最後の発走の 10 分あとまで待機中のスリープを防ぐ小さなプロセスを、動いていなければ起こす。"""
+    posts = [post_time(date, r["発走時刻"]) for r in prep.get("レース", [])]
+    if not posts:
+        return False
+    until = max(posts) + timedelta(minutes=KEEPAWAKE_AFTER_MIN)
+    if now >= until:
+        return False
+    hb = read_json(keepawake_path(date))
+    if hb:
+        try:
+            if (datetime.now() - datetime.strptime(hb["heartbeat"], "%Y-%m-%d %H:%M:%S")).total_seconds() < 120:
+                return False                                    # もう動いている
+        except (KeyError, ValueError):
+            pass
+    if spawn is None:
+        if sys.platform != "win32":
+            return False
+        import subprocess
+        DETACHED, NEW_GROUP = 0x00000008, 0x00000200
+
+        def spawn(argv):
+            subprocess.Popen([_pythonw()] + argv, cwd=str(REPO), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=DETACHED | NEW_GROUP, close_fds=True)
+    spawn(["-m", "src.raceday", "keepawake", "--date", date, "--until", until.strftime("%H%M")])
+    write_json(keepawake_path(date), {"heartbeat": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "起こした": "update",
+                                      "まで": until.strftime("%H:%M")})
+    return True
+
+
+def _cmd_keepawake(args) -> int:
+    """待機中のスリープを防ぐ（最後の発走の 10 分あとまで）。update が起こす。ふたを閉じたときのスリープは防げない。"""
+    until = post_time(args.date, args.until)
+    keep_system_awake(True)
+    while datetime.now() < until:
+        write_json(keepawake_path(args.date), {"heartbeat": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                               "まで": until.strftime("%H:%M")})
+        time.sleep(30)
+    keep_system_awake(False)
+    return 0
+
+
+def wait_for_network(probe=None, max_wait: float = NET_WAIT_SEC, step: float = 10, sleep=time.sleep) -> bool:
+    """インターネットにつながるまで、最大 max_wait 秒待つ（スリープ明けの Wi-Fi がまだつながっていないとき）。"""
+    probe = probe or (lambda: net_time_utc() is not None or net_time_utc("https://www.jra.go.jp") is not None)
+    waited = 0.0
+    while True:
+        if probe():
+            return True
+        if waited >= max_wait:
+            return False
+        sleep(step)
+        waited += step
+
+
+def note_gap(date: str, now: datetime) -> str | None:
+    """前回の実行から GAP_WARN_MIN 分以上空いていたら、止まっていた可能性として記録して返す。"""
+    path = day_dir(date) / "last_run.json"
+    last = read_json(path)
+    write_json(path, {"実行時刻": now.strftime("%Y-%m-%d %H:%M:%S")})
+    if not last:
+        return None
+    try:
+        t = datetime.strptime(last["実行時刻"], "%Y-%m-%d %H:%M:%S")
+    except (KeyError, ValueError):
+        return None
+    if (now - t).total_seconds() < GAP_WARN_MIN * 60:
+        return None
+    msg = f"PC が眠っていた／止まっていた可能性（{t:%H:%M}〜{now:%H:%M}。{(now - t).total_seconds() / 60:.0f} 分あいた）"
+    gaps = read_json(day_dir(date) / "gaps.json") or []
+    write_json(day_dir(date) / "gaps.json", gaps + [{"から": t.strftime("%H:%M"), "まで": now.strftime("%H:%M")}])
+    return msg
+
+
 def _cmd_update(args) -> int:
     if args.log_file:
         sys.stdout = sys.stderr = _Tee(Path(args.log_file))
@@ -1238,11 +1466,38 @@ def _cmd_update(args) -> int:
     if prep is None:
         print(f"前の晩の準備がありません（py -m src.raceday prep --date {date}）")
         return 1
+    watchdog = start_watchdog()                           # v14：1回の実行は RUN_LIMIT_SEC 秒まで（スリープ明けで止まった回もすぐ終わる）
+    keep_system_awake(True)                               # v14：この回の実行中は PC を眠らせない
+    try:
+        return _update_body(args, date, prep)
+    finally:
+        watchdog.set()
+        keep_system_awake(False)
+
+
+def _update_body(args, date: str, prep: dict) -> int:
     clock = check_clock() if not args.now else Clock(datetime.now(), _parse_now(date, args.now), None)
+    network_ok = True
+    if not args.now and clock.offset_min is None:
+        print("  インターネットの時刻が取れません。ネットにつながるのを待ちます（最大 60 秒）...")
+        network_ok = wait_for_network()
+        if network_ok:
+            clock = check_clock()
+        else:
+            clock.warnings.append("ネットにつながっていない（60 秒待ってもつながらなかった）。この回は速報を取らずに、前の買い目のままにしています")
+    gap = note_gap(date, clock.now)
+    if gap:
+        clock.warnings.append(gap)
     for w in clock.warnings:
-        print(f"!!!!! 時計の警告: {w}")
+        print(f"!!!!! 警告: {w}")
     now = clock.now
+    if not args.now:
+        try:
+            ensure_keepawake(date, prep, now)
+        except Exception as e:
+            print(f"  （待機中のスリープを防ぐ仕組みを動かせませんでした: {type(e).__name__}: {e}）")
     source = LiveSource(date, args.data)
+    source.network_ok = network_ok
     logs = run_once(prep, source, now, clock)
     if logs and logs[0].get("結果"):
         print(f"  当日の結果: {logs[0]['結果']}（取得 {source.timing.get('結果の取得（秒）', '')}秒）")
@@ -1258,10 +1513,12 @@ def _cmd_update(args) -> int:
             print(f"  シートに書けませんでした: {e}")
         except Exception as e:
             print(f"  シートに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
-    if not args.no_drift:
-        # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない）
+    if not args.no_drift and network_ok:
+        # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない。v14：30 秒まで）
         try:
-            c = collect_drift_odds(date, now, args.data)
+            done, c = call_with_timeout(lambda: collect_drift_odds(date, now, args.data), 30)
+            if not done:
+                raise TimeoutError("30 秒で終わらなかった")
             if c["レース"]:
                 print(f"  20分前ごろのオッズを集めました: {c['レース']} レース・{c.get('レコード', 0)} レコード（{c.get('秒', '')}秒）")
         except Exception as e:
@@ -1303,7 +1560,8 @@ def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, sche
     """発走まで 15〜25 分のレース（まだ取っていないもの）の 0B30 を取って保存する。各レース1回。"""
     from . import jvlink
     fetch = fetch or (lambda keys: jvlink.fetch_rt_odds(keys, dataspec="0B30", out_dir=data_dir, date=date,
-                                                        log=lambda *a, **k: None))
+                                                        log=lambda *a, **k: None, deadline=time.time() + 20,
+                                                        max_same_errors=MAX_SAME_ERRORS))
     sch = schedule if schedule is not None else day_schedule(date, data_dir)
     done_path = day_dir(date) / "drift_collected.csv"
     done = set(pd.read_csv(done_path, dtype=str, encoding="utf-8-sig")["レースID"]) if done_path.exists() else set()
@@ -1547,20 +1805,36 @@ def _box_records(raw) -> pd.DataFrame:
 
 def _cmd_score(args) -> int:
     finals = collect_finals()
-    if not finals:
+    rdates = [d for d in (args.replay_dates or "").split(",") if d.strip()]
+    replays = collect_finals(replay=True, dates=rdates) if rdates else []
+    live_ids = {f["レースID"] for f in finals}
+    replays = [f for f in replays if f["レースID"] not in live_ids]      # 本番の買い目があるレースは本番を使う
+    if not finals and not replays:
         print("保存した最終の買い目がありません（data/raceday/<日付>/<レースID>/final.json）")
         return 1
     raw = jvmap.load_raw(args.data)
     drift: list = []
-    races = score_finals(raw, finals, args.data, drift)
+    races = score_finals(raw, finals, args.data, drift) if finals else pd.DataFrame()
+    if not races.empty:
+        races.insert(0, "区分", "本番（自動実行）")
+    rep_races = score_finals(raw, replays, args.data) if replays else pd.DataFrame()
+    if not rep_races.empty:
+        rep_races.insert(0, "区分", REPLAY_LABEL)
+        races = pd.concat([races, rep_races], ignore_index=True)
     box = _box_records(raw)
     if not box.empty:
         box = box.loc[box["レースID"].astype(str).isin(set(races["レースID"]))]
         races = races.merge(box[["レースID", "払戻", "熱い"]].rename(columns={"払戻": "6頭BOXの払戻", "熱い": "6頭BOXの熱い"}),
                             on="レースID", how="left")
-    summ = score_summary(races, box)
+    summ = score_summary(races.loc[races["区分"] != REPLAY_LABEL], box)
+    if not rep_races.empty:
+        rs = score_summary(races.loc[races["区分"] == REPLAY_LABEL])
+        rs["買い方"] = f"【{REPLAY_LABEL}】" + rs["買い方"].astype(str)
+        summ = pd.concat([summ, rs], ignore_index=True)
     print("=== 答え合わせ：各重賞の最終の買い目（F）を実際の払戻で ===")
-    cols = [c for c in ["日付", "レース", "グレード", "着順", "点数", "投資", "払戻", "返還", "熱い", "予測の達成確率",
+    if rdates:
+        print(f"    ドライランの分（{', '.join(rdates)}）は「{REPLAY_LABEL}」として分けて数える（本番の通算には入れない）")
+    cols = [c for c in ["区分", "日付", "レース", "グレード", "着順", "点数", "投資", "払戻", "返還", "熱い", "予測の達成確率",
                         "付け替えた点数", "元の金額での払戻", "確率の出し方", "6頭BOXの払戻", "6頭BOXの熱い", "照合"]
             if c in races.columns]
     with pd.option_context("display.width", 250, "display.max_columns", 30):
@@ -1651,6 +1925,10 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
     q.add_argument("--replay", action="store_true", help="ドライランの分（シート「当日の買い目（再現）」）")
     q.set_defaults(func=_cmd_sheet)
+    q = sub.add_parser("keepawake", help="（update が起こす）最後の発走のあとまで待機中のスリープを防ぐ")
+    q.add_argument("--date", required=True)
+    q.add_argument("--until", required=True, help="HHMM")
+    q.set_defaults(func=_cmd_keepawake)
     q = sub.add_parser("schedule", help="タスクスケジューラへの登録（--remove で削除）")
     q.add_argument("--date", default=None)
     q.add_argument("--remove", action="store_true")
@@ -1664,6 +1942,8 @@ def main(argv: list[str] | None = None) -> int:
     q.set_defaults(func=_cmd_replay)
     q = sub.add_parser("score", help="答え合わせ：最終の買い目を実際の払戻で（月曜の fetch のあと）")
     q.add_argument("--sheet", action="store_true", help="シート「当日の答え合わせ」にも書く")
+    q.add_argument("--replay-dates", default=None,
+                   help="ドライランの最終の買い目も、本番とは分けて数える日付（カンマ区切り。例 20261114）")
     q.set_defaults(func=_cmd_score)
     q = sub.add_parser("drift", help="集めた20分前ごろのオッズと確定オッズのずれの表（月曜の fetch-odds のあと）")
     q.add_argument("--since", default=None, help="この日以降（YYYYMMDD）")

@@ -1130,8 +1130,12 @@ def race_keys_for_date(date: str, out_dir: str | os.PathLike | None = None, grad
 
 def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.PathLike | None = None,
                   date: str = "", client: JVLinkClient | None = None, sid: str = "UNKNOWN",
-                  sleep=time.sleep, log=print, max_wait_sec: float = 60) -> dict:
+                  sleep=time.sleep, log=print, max_wait_sec: float = 60, deadline: float | None = None,
+                  max_same_errors: int | None = None) -> dict:
     """速報オッズ（JVRTOpen）をレースごとに取り、data/jvlink/odds/rt/<日付>/ に保存する。
+
+    deadline（time.time() の値）を過ぎたら、残りのレースは試さずに打ち切る（取れた分は保存する）。
+    max_same_errors：同じエラー（-413 など）がこの回数続いたら打ち切る（v14。当日の仕組みが長く止まらないように）。
 
     何回実行してもよい（実行するたびに、その時点のオッズが「取得時刻」つきで別のファイルに残る）。
     データ区分は 1:中間 / 2:前日売最終 / 3:最終 / 4:確定。発表月日時分は中間オッズのときだけ入る。
@@ -1144,9 +1148,13 @@ def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.Pat
     writer = odds.OddsWriter(odds.odds_dir(out_dir) / "rt" / (date or datetime.now().strftime("%Y%m%d")),
                              label=dataspec, kubun_filter=None)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    counts = {"レース": 0, "データなし": 0, "エラー": 0, "レコード": 0}
+    counts = {"レース": 0, "データなし": 0, "エラー": 0, "レコード": 0, "打ち切り": "", "エラーコード": []}
     client.init(sid)
+    same, last_code = 0, None
     for key in keys:
+        if deadline is not None and time.time() > deadline:
+            counts["打ち切り"] = "時間の上限"
+            break
         code = client.rt_open(dataspec, key)
         if code == -1:
             counts["データなし"] += 1
@@ -1155,11 +1163,21 @@ def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.Pat
             continue
         if code < 0:
             counts["エラー"] += 1
+            counts["エラーコード"].append(code)
             log(f"  {key}: JVRTOpen エラー {code} {ERROR_ADVICE.get(code, '')}")
             client.close()
+            same = same + 1 if code == last_code else 1
+            last_code = code
+            if max_same_errors and same >= max_same_errors:
+                counts["打ち切り"] = f"同じエラー {code} が {same} 回続いた"
+                break
             continue
+        same, last_code = 0, None
         n, waited = 0, 0.0
         while True:
+            if deadline is not None and time.time() > deadline:
+                counts["打ち切り"] = "時間の上限"
+                break
             c, raw, _ = client.gets()
             if c > 0:
                 rec = odds.parse_odds(raw)
@@ -1188,20 +1206,26 @@ def fetch_rt_odds(keys: list[str], dataspec: str = "0B30", out_dir: str | os.Pat
 
 def fetch_rt_results(date: str, out_dir: str | os.PathLike, client: JVLinkClient | None = None,
                      sid: str = "UNKNOWN", struct_module: ModuleType | None = None, keys: list[str] | None = None,
-                     dataspec: str = "0B12", sleep=time.sleep, log=print, max_wait_sec: float = 60) -> dict:
+                     dataspec: str = "0B12", sleep=time.sleep, log=print, max_wait_sec: float = 60,
+                     deadline: float | None = None, max_same_errors: int | None = None) -> dict:
     """その日の速報成績（JVRTOpen 0B12。RA・SE・HR）を取り、out_dir/RA.csv・SE.csv・HR.csv に追記する（v10 当日の仕組み）。
 
     キーは開催日単位の "YYYYMMDD"。keys（"YYYYMMDDJJKKHHRR" のレース単位）を渡すとレースごとに取る
     （開催日単位のキーが使えないときの予備）。何回実行してもよい（同じレースの版は読むときに jvmap.dedupe_records で1つにする）。
-    戻り値: {"レコード": {種別: 件数}, "エラー": [..], "データなし": 件数}
+    戻り値: {"レコード": {種別: 件数}, "エラー": [..], "データなし": 件数, "打ち切り": 理由, "エラーコード": [..]}
+    deadline・max_same_errors は fetch_rt_odds と同じ（v14）。
     """
     out_dir = Path(out_dir)
     module = struct_module or load_struct_module()
     client = client or JVLinkClient()                 # RA・SE・HR は最大 1,272 バイトなので既定の 2,048 で足りる（速い）
     writers = {rt: CsvAppender(out_dir / f"{rt}.csv", columns_for(rt, module)) for rt in RECORD_STRUCTS}
-    counts = {"レコード": {rt: 0 for rt in RECORD_STRUCTS}, "エラー": [], "データなし": 0}
+    counts = {"レコード": {rt: 0 for rt in RECORD_STRUCTS}, "エラー": [], "データなし": 0, "打ち切り": "", "エラーコード": []}
     client.init(sid)
+    same, last_code = 0, None
     for key in keys or [date]:
+        if deadline is not None and time.time() > deadline:
+            counts["打ち切り"] = "時間の上限"
+            break
         code = client.rt_open(dataspec, key)
         if code == -1:
             counts["データなし"] += 1
@@ -1209,10 +1233,21 @@ def fetch_rt_results(date: str, out_dir: str | os.PathLike, client: JVLinkClient
             continue
         if code < 0:
             counts["エラー"].append(f"{key}: JVRTOpen {code} {ERROR_ADVICE.get(code, '')}")
+            counts["エラーコード"].append(code)
             client.close()
+            same = same + 1 if code == last_code else 1
+            last_code = code
+            if max_same_errors and same >= max_same_errors:
+                counts["打ち切り"] = f"同じエラー {code} が {same} 回続いた"
+                break
             continue
+        same, last_code = 0, None
         waited = 0.0
         while True:
+            if deadline is not None and time.time() > deadline:
+                counts["打ち切り"] = "時間の上限"
+                counts["エラー"].append(f"{key}: 時間の上限で打ち切り")
+                break
             c, raw, _ = client.gets()
             if c > 0:
                 parsed = parse_record(raw, module)
