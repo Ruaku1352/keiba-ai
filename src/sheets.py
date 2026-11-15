@@ -270,3 +270,16 @@ def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
                         "format": {"backgroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1},
                                    "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}}}}]})
     return True
+
+
+def ensure_timezone(ws, tz: str = "Asia/Tokyo") -> bool:
+    """スプレッドシート（ファイル全体）のタイムゾーンを tz にする（違うときだけ）。戻り値: 変えたか。
+
+    NOW() などの式はファイルのタイムゾーンで計算されるので、東京でないと「最終更新から ○分」が 9時間ずれる。
+    """
+    book = ws.spreadsheet
+    current = book.fetch_sheet_metadata().get("properties", {}).get("timeZone")
+    if current == tz:
+        return False
+    book.batch_update({"requests": [{"updateSpreadsheetProperties": {"properties": {"timeZone": tz}, "fields": "timeZone"}}]})
+    return True

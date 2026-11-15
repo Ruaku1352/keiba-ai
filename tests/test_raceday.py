@@ -1107,7 +1107,7 @@ def test_gap_is_noted_and_shown(root):
 def test_sheet_has_minutes_since_update_formula_and_red_rule(root):
     rows = raceday.render_sheet(_prep(), clock=raceday.Clock(datetime(2026, 11, 1), datetime(2026, 11, 1, 14, 28, 32), None))
     assert rows[1][0].startswith('=IF(B2>15,"!!!!! 最終更新から "&B2&" 分') and "PC が止まっている可能性" in rows[1][0]
-    assert rows[1][1] == "=ROUND((NOW()-DATE(2026,11,1)-TIME(14,28,32))*1440)"
+    assert rows[1][1] == "=ROUND(TO_PURE_NUMBER(NOW()-DATE(2026,11,1)-TIME(14,28,32))*1440)"   # 時刻の表示にならない数
     from src import sheets
 
     class Book:
@@ -1169,3 +1169,99 @@ def test_score_counts_replay_separately(env, capsys):
     assert set(sc["区分"]) == {raceday.REPLAY_LABEL}
     summ = pd.read_csv(raceday.raceday_dir() / "score_summary.csv", encoding="utf-8-sig")
     assert summ["買い方"].str.contains(raceday.REPLAY_LABEL).all()
+
+
+
+# ---------------------------------------------------------------------------
+# v15：シートの直し・ずれの表の区分・全レースの練習の記録
+# ---------------------------------------------------------------------------
+def test_gap_ignores_runs_before_the_day_starts(root):
+    assert raceday.note_gap(DATE, datetime(2026, 10, 31, 17, 19)) is None     # 前の晩の試し
+    assert raceday.note_gap(DATE, datetime(2026, 11, 1, 9, 0)) is None        # 当日の朝：前の晩からの間隔は数えない
+    assert raceday.note_gap(DATE, datetime(2026, 11, 1, 9, 10)) is None
+    assert raceday.note_gap(DATE, datetime(2026, 11, 1, 9, 40)) is not None   # 当日 9:00 以降の 30 分は数える
+    assert not (raceday.read_json(raceday.day_dir(DATE) / "gaps.json")[0]["から"] == "17:19")
+
+
+def test_ensure_timezone_sets_tokyo_once():
+    from src import sheets
+
+    class Book:
+        def __init__(self, tz):
+            self.tz, self.calls = tz, []
+
+        def fetch_sheet_metadata(self):
+            return {"properties": {"timeZone": self.tz}}
+
+        def batch_update(self, body):
+            self.calls.append(body)
+            self.tz = body["requests"][0]["updateSpreadsheetProperties"]["properties"]["timeZone"]
+
+    class WS:
+        spreadsheet = Book("Etc/GMT")
+    assert sheets.ensure_timezone(WS(), "Asia/Tokyo") is True and WS.spreadsheet.tz == "Asia/Tokyo"
+    assert sheets.ensure_timezone(WS(), "Asia/Tokyo") is False and len(WS.spreadsheet.calls) == 1
+
+
+def test_drift_table_split_by_grade():
+    rng = np.random.default_rng(0)
+    n = 400
+    pairs = pd.DataFrame({"レースID": rng.choice(["A", "B", "C"], n), "券種": "馬連", "帯": "10〜50倍",
+                          "r": np.exp(rng.normal(0, 0.1, n)), "確定でも届く": rng.random(n) < 0.6})
+    pairs["グレード"] = pairs["レースID"].map({"A": "G1", "B": "G3", "C": ""})
+    pairs["区分"] = np.where(pairs["グレード"] != "", "重賞", "平場")
+    t = raceday.drift_table(pairs)
+    assert list(dict.fromkeys(t["区分"])) == ["全部", "重賞", "平場", "G1"]
+    by = t.set_index("区分")["組の数"]
+    assert by["全部"] == n and by["重賞"] + by["平場"] == n and by["G1"] == (pairs["グレード"] == "G1").sum()
+
+
+def _practice_env(env):
+    import shutil
+    ds = jvmap.build_dataset(env)
+    rr = ds.race_result
+    day = pd.to_datetime(rr["レース日付"]).sort_values().iloc[-1]
+    date = f"{day:%Y%m%d}"
+    ids = rr.loc[pd.to_datetime(rr["レース日付"]) == day, "レースID"].astype(str).unique()
+    have = ids[:-2]                                                          # 2 レースは 20分前のオッズが無い
+    tmp = env.parent / "tmp_odds"
+    _write_odds(tmp, ds, have, date)
+    dst = raceday.drift_dir(env, date)
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in odds.odds_dir(tmp).glob("*.npz"):
+        shutil.move(str(f), dst / f.name.replace("_test_", "_drift_"))
+    return ds, date, ids, have
+
+
+def test_practice_records_all_races_without_double_counting(env, capsys):
+    ds, date, ids, have = _practice_env(env)
+    assert raceday.main(["--data", str(env), "practice", "--date", date]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("※ 記述だけ。F は変えない") and "目安の線" in out and "9%" in out
+    assert "オッズが無くて飛ばしたレース: 2" in out
+    rec = pd.read_csv(raceday.practice_dir() / "records.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    assert set(rec["レースID"]) <= set(have) and len(rec) > 0 and rec["レースID"].is_unique
+    assert (rec["点数"] <= raceday.MAX_POINTS).all() and (rec["投資"] <= raceday.BUDGET).all()
+    assert set(rec["区分"]) <= {"平場", "重賞（参考）"}
+    assert (rec["当たったのに届かず"] == (rec["的中"] & ~rec["熱い"])).all()
+    n = len(rec)
+    assert raceday.main(["--data", str(env), "practice", "--date", f"{date},{date}"]) == 0       # 2回回しても二重に数えない
+    rec2 = pd.read_csv(raceday.practice_dir() / "records.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    assert len(rec2) == n
+    summ = pd.read_csv(raceday.practice_dir() / "summary.csv", encoding="utf-8-sig")
+    flat = summ.loc[summ["区分"] == "平場"].iloc[0]
+    assert flat["レース数"] == (rec2["区分"] == "平場").sum() and flat["検証（F）"] == pytest.approx(0.1191)
+
+
+def test_practice_uses_prep_coefficients_when_present(env, capsys):
+    ds, date, ids, have = _practice_env(env)
+    coefs = dict(COEFS, 期間=["2011-01-01", "x"], 推定レース数=1, k=1.2)
+    raceday.write_json(raceday.day_dir(date) / "prep.json", {"日付": date, "係数": coefs, "対象": [], "レース": []})
+    assert raceday.main(["--data", str(env), "practice", "--date", date]) == 0
+    assert "係数: その日の prep.json・k = 1.2・m = 1.00" in capsys.readouterr().out
+    rec = pd.read_csv(raceday.practice_dir() / "records.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    assert (rec["k"] == 1.2).all()
+
+
+def test_parse_dates():
+    assert raceday.parse_dates("20261107-20261109,20261115") == ["20261107", "20261108", "20261109", "20261115"]
