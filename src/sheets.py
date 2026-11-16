@@ -249,8 +249,8 @@ def write_grid(ws, values: list[list]) -> None:
         ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
 
 
-def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
-    """条件付き書式「formula が真なら赤」を、まだ無ければ1つだけ足す（毎回足して増えないように）。戻り値: 足したか。"""
+def has_rule(ws, formula: str) -> bool:
+    """このタブに、式が formula の条件付き書式がもうあるか（メタデータを1回読む）。"""
     meta = ws.spreadsheet.fetch_sheet_metadata()
     for sh in meta.get("sheets", []):
         if sh.get("properties", {}).get("sheetId") != ws.id:
@@ -258,17 +258,29 @@ def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
         for rule in sh.get("conditionalFormats", []):
             values = rule.get("booleanRule", {}).get("condition", {}).get("values", [])
             if any(v.get("userEnteredValue") == formula for v in values):
-                return False
+                return True
+    return False
+
+
+def red_rule_request(ws, cell_range: str, formula: str) -> dict:
+    """条件付き書式「formula が真なら赤」を足す要求（batch_update の requests の1つ）。"""
     import re
     m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", cell_range)
     col = lambda c: sum((ord(ch) - 64) * 26 ** i for i, ch in enumerate(reversed(c)))  # noqa: E731
-    grid = {"sheetId": ws.id, "startRowIndex": int(m[2]) - 1, "endRowIndex": int(m[4]),
-            "startColumnIndex": col(m[1]) - 1, "endColumnIndex": col(m[3])}
-    ws.spreadsheet.batch_update({"requests": [{"addConditionalFormatRule": {"index": 0, "rule": {
-        "ranges": [grid],
+    grid_ = {"sheetId": ws.id, "startRowIndex": int(m[2]) - 1, "endRowIndex": int(m[4]),
+             "startColumnIndex": col(m[1]) - 1, "endColumnIndex": col(m[3])}
+    return {"addConditionalFormatRule": {"index": 0, "rule": {
+        "ranges": [grid_],
         "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
                         "format": {"backgroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1},
-                                   "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}}}}]})
+                                   "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}}}}
+
+
+def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
+    """条件付き書式「formula が真なら赤」を、まだ無ければ1つだけ足す（毎回足して増えないように）。戻り値: 足したか。"""
+    if has_rule(ws, formula):
+        return False
+    ws.spreadsheet.batch_update({"requests": [red_rule_request(ws, cell_range, formula)]})
     return True
 
 
@@ -283,3 +295,24 @@ def ensure_timezone(ws, tz: str = "Asia/Tokyo") -> bool:
         return False
     book.batch_update({"requests": [{"updateSpreadsheetProperties": {"properties": {"timeZone": tz}, "fields": "timeZone"}}]})
     return True
+
+
+# ---------------------------------------------------------------------------
+# v16 スマホ用タブ：値の書き込みと書式を、それぞれ1回の API 呼び出しにまとめる
+# ---------------------------------------------------------------------------
+def write_ranges(ws, data: list[dict]) -> None:
+    """[{"range": "A1:C3", "values": [[...]]}, ...] を1回で書く（USER_ENTERED）。clear はしない（他の行は触らない）。"""
+    data = [{"range": d["range"], "values": [[_cell(v, "") for v in row] for row in d["values"]]} for d in data]
+    if data:
+        ws.batch_update(data, value_input_option="USER_ENTERED")
+
+
+def apply_format(ws, requests: list[dict]) -> None:
+    """書式の変更（列の幅・文字の大きさ・色・チェックボックス・行を隠す など）を1回で。"""
+    if requests:
+        ws.spreadsheet.batch_update({"requests": requests})
+
+
+def grid(ws_id: int, r0: int, r1: int, c0: int = 0, c1: int = 3) -> dict:
+    """0始まり・終わりは含まない範囲。"""
+    return {"sheetId": ws_id, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}

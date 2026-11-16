@@ -962,6 +962,420 @@ def write_sheet(prep: dict, replay: bool = False, clock: Clock | None = None, se
 
 
 # ---------------------------------------------------------------------------
+# v16 スマホ用タブ「スマホ」：発走20分前に開くのはこのタブだけ。3列（✓・券種と組番・金額）
+#
+# - 重賞ごとに決まった行の枠（MOBILE_BLOCK 行）を発走順に並べる。行の位置がずれないので、チェックが他のレースに移らない
+# - 最終を一度書いた枠には、その後は値も書式も書かない（チェックを消さない）。発走後は行を隠して1行にたたむ（書式だけ）
+# - 値の書き込み1回・書式1回にまとめる（日付が変わった最初の回だけ、赤の条件付き書式の確認が1回増える）
+# - 当日の計算・保存する JSON には触らない。シートに書けなくても買い目の保存は終わっている（update の作りのまま）
+# ---------------------------------------------------------------------------
+MOBILE_SHEET_TITLE = "スマホ"
+MOBILE_REPLAY_SHEET_TITLE = "スマホ（再現）"
+MOBILE_SAMPLE_SHEET_TITLE = "スマホ（見本）"
+RESULTS_SHEET_TITLE = "成績"
+MOBILE_COLS = 3
+MOBILE_TOP = 3                      # 上の3行：日付 / 最終更新から○分 / 使い方の一言
+MOBILE_BLOCK = 24                   # 1レースの枠（題・状態・警告3・買い目15・合計・確率・空き）
+MOBILE_WARN_MAX = 3
+MOBILE_WIDTHS = (34, 214, 86)       # 列の幅（ピクセル）。合計 334：スマホの縦の画面に収まる
+MOBILE_FONT = {"title": 13, "state": 18, "warn": 13, "bet": 16, "total": 15, "prob": 11, "top": 14, "help": 10}
+MOBILE_COLORS = {"最終": (0.20, 0.66, 0.33), "仮": (1.00, 0.85, 0.20), "途中": (0.75, 0.75, 0.75),
+                 "待ち": (0.75, 0.75, 0.75), "予備": (1.00, 0.55, 0.10), "なし": (0.86, 0.15, 0.15)}
+_WHITE_TEXT = {"最終", "なし"}
+_WEEKDAYS = "月火水木金土日"
+
+
+def _rgb(c) -> dict:
+    return {"red": c[0], "green": c[1], "blue": c[2]}
+
+
+def mobile_view(race: dict, date: str, st: dict, backup: dict | None, now: datetime,
+                warnings: list[str] | tuple = ()) -> dict:
+    """1レース分の表示の中身（状態・警告・買い目）。保存した JSON を読むだけ（作り直さない）。"""
+    rid = race["レースID"]
+    post = post_time(date, race["発走時刻"])
+    final_at = post - timedelta(minutes=FINAL_BEFORE)
+    head = f"{race['競馬場名']}{int(rid[-2:])}R {race['競走名']}（{race['グレード']}）発走 {post:%H:%M}"
+    cur = st.get("final") or st.get("latest")
+    plan, box = None, None
+    if st.get("final"):
+        plan, kind, state = cur, "最終", f"最終 {cur['作成時刻'][11:16]} 作成。この通りに買う"
+    elif cur is not None:
+        plan = cur
+        if now >= final_at:
+            kind, state = "なし", f"最終を作れていない（{cur['作成時刻'][11:16]} の{cur['段階']}の買い目のまま）"
+        elif cur.get("段階") == STAGE_LABELS["provisional"]:
+            kind, state = "仮", f"仮。最終は {final_at:%H:%M}"
+        else:
+            kind, state = "途中", f"途中（{cur['作成時刻'][11:16]} 作成）。最終は {final_at:%H:%M}"
+    elif backup and now >= final_at:
+        kind, state = "予備", "予備。当日のオッズが取れていない"
+        plan, box = backup.get("買い目"), backup.get("BOX")
+    elif now >= post:
+        kind, state = "なし", "買い目なし（一度も作れなかった）"
+    elif now >= post - timedelta(minutes=PROVISIONAL_BEFORE):
+        kind, state = "なし", "まだ買い目なし（オッズが取れていない）" + ("。予備あり" if backup else "")
+    else:
+        kind, state = "待ち", "まだ買い目なし（発売前・オッズ待ち）"
+    warns = []
+    if warnings:
+        warns.append("時計・ネット: " + " / ".join(warnings))
+    if plan:
+        if not plan.get("本物のオッズで確かめた", True):
+            warns.append("本物のオッズが取れず、5万円に届くか確かめていない")
+        elif plan.get("届かない買い目"):
+            warns.append(f"5万円に届かない買い目 {plan['届かない買い目']}点。全部届かせるには あと +{plan.get('足りない額の合計', 0):,}円"
+                         "（予算を超えるので、買い足すかは自分で判断）")
+    bets, total, prob = [], None, None
+    if plan:
+        bets = [(f"{b['券種']} {bet_text(b)}", int(b["金額"])) for b in plan["買い目"]]
+        total = (f"合計 {plan['点数']}点", int(plan["合計"]))
+        heat = (plan.get("熱さ") or {})
+        now50 = heat.get(int(TARGET), heat.get(str(int(TARGET))))
+        prob = f"予測の達成確率（5万円以上）{plan['予測の達成確率']:.1%}"
+        if now50 is not None and abs(now50 - plan["予測の達成確率"]) >= 0.0005:
+            prob += f"・付け替え後 {now50:.1%}"
+    elif box:
+        bets = [("3連単 BOX " + "・".join(str(x) for x in box), 12_000)]
+        total = ("合計 120点（6頭BOX・1点100円）", 12_000)
+    return {"レースID": rid, "題": head, "発走": post, "種類": kind, "状態": state, "警告": warns[:MOBILE_WARN_MAX],
+            "買い目": bets[:MOBILE_BLOCK - MOBILE_WARN_MAX - 5], "合計": total, "確率": prob, "最終": bool(st.get("final")),
+            "済": now >= post}
+
+
+def mobile_views(prep: dict, replay: bool, now: datetime, warnings=()) -> list[dict]:
+    date = prep["日付"]
+    ddir = day_dir(date, replay)
+    out = []
+    for r in prep["レース"]:
+        rid = r["レースID"]
+        st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
+        out.append(mobile_view(r, date, st, read_json(ddir / rid / "backup.json"), now, warnings))
+    return sorted(out, key=lambda v: (v["発走"], v["レースID"]))
+
+
+def _block_lines(v: dict) -> list[tuple[str, list]]:
+    """枠の中の行：(種類, [A, B, C])。merge する行は A に文字を置く。"""
+    lines = [("title", [v["題"], "", ""]), ("state", [v["状態"], "", ""])]
+    lines += [("warn", ["!! " + w, "", ""]) for w in v["警告"]]
+    lines += [("bet", [False, sheet_text(t), a]) for t, a in v["買い目"]]
+    if v["合計"]:
+        lines.append(("total", [v["合計"][0], "", v["合計"][1]]))
+    if v["確率"]:
+        lines.append(("prob", [v["確率"], "", ""]))
+    return lines
+
+
+def _collapsed_title(v: dict) -> str:
+    tail = f"{v['種類'] if v['種類'] != '待ち' else '買い目なし'}"
+    if v["合計"]:
+        tail += f"・{v['合計'][0].replace('合計 ', '')} {v['合計'][1]:,}円"
+    return f"済 {v['題']}（{tail}）"
+
+
+def _text_height(text: str, font: int, width: int) -> int:
+    """折り返したときの行の高さ（ピクセル）の目安。全角は1文字、半角は0.55文字として数える。"""
+    px = font * 4 / 3
+    units = sum(1.0 if ord(ch) > 0x2000 else 0.55 for ch in str(text))
+    lines = max(1, -(-int(units * px) // max(width - 10, 1)))
+    return int(lines * px * 1.3 + 10)
+
+
+def mobile_layout(views: list[dict], ws_id: int, date: str, now: datetime, written: set[str], reset: bool,
+                  collapse: bool = True, tag: str = "") -> tuple[list[dict], list[dict], set[str]]:
+    """スマホ用タブに書く値（範囲ごと）と書式の要求。written は最終をもう書いたレース（その枠は触らない）。
+
+    戻り値: (値, 書式, この回で最終を書いたレース)。
+    """
+    from . import sheets
+    values: list[dict] = []
+    req: list[dict] = []
+    rows_total = MOBILE_TOP + MOBILE_BLOCK * max(len(views), 1)
+    width = sum(MOBILE_WIDTHS)
+
+    def fmt(r0, r1, c0, c1, f, fields):
+        req.append({"repeatCell": {"range": sheets.grid(ws_id, r0, r1, c0, c1), "cell": {"userEnteredFormat": f},
+                                   "fields": fields}})
+
+    def merge(r, c0=0, c1=MOBILE_COLS):
+        req.append({"mergeCells": {"range": sheets.grid(ws_id, r, r + 1, c0, c1), "mergeType": "MERGE_ALL"}})
+
+    def height(r0, r1, px):
+        req.append({"updateDimensionProperties": {"range": {"sheetId": ws_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r1},
+                                                  "properties": {"pixelSize": int(px)}, "fields": "pixelSize"}})
+
+    def hide(r0, r1, hidden):
+        if r1 > r0:
+            req.append({"updateDimensionProperties": {"range": {"sheetId": ws_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r1},
+                                                      "properties": {"hiddenByUser": hidden}, "fields": "hiddenByUser"}})
+
+    def text_fmt(size, bold=False, color=(0, 0, 0)):
+        return {"textFormat": {"fontSize": size, "bold": bold, "foregroundColor": _rgb(color)},
+                "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}
+
+    base_fields = "userEnteredFormat"
+    if reset:
+        req += [{"updateSheetProperties": {"properties": {"sheetId": ws_id, "gridProperties": {
+                    "rowCount": rows_total, "columnCount": MOBILE_COLS, "frozenRowCount": 2}},
+                 "fields": "gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount"}},
+                {"unmergeCells": {"range": sheets.grid(ws_id, 0, rows_total)}},
+                {"updateCells": {"range": sheets.grid(ws_id, 0, rows_total), "fields": "userEnteredValue,userEnteredFormat,dataValidation"}}]
+        hide(0, rows_total, False)
+        for i, w in enumerate(MOBILE_WIDTHS):
+            req.append({"updateDimensionProperties": {"range": {"sheetId": ws_id, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                                                      "properties": {"pixelSize": w}, "fields": "pixelSize"}})
+        merge(0)
+        merge(1, 0, 2)
+        merge(2)
+        fmt(0, 1, 0, 3, {**text_fmt(MOBILE_FONT["top"], True), "backgroundColor": _rgb((0.93, 0.93, 0.93))}, base_fields)
+        fmt(1, 2, 0, 2, text_fmt(MOBILE_FONT["top"], True), base_fields)
+        fmt(1, 2, 2, 3, {**text_fmt(MOBILE_FONT["help"], False, (0.4, 0.4, 0.4)),
+                         "numberFormat": {"type": "NUMBER", "pattern": '0"分"'}}, base_fields)
+        fmt(2, 3, 0, 3, text_fmt(MOBILE_FONT["help"], False, (0.4, 0.4, 0.4)), base_fields)
+        height(0, 1, 32)
+        height(1, 2, 32)
+        height(2, 3, _text_height("x" * 60, MOBILE_FONT["help"], width))
+    d = datetime.strptime(date, "%Y%m%d")
+    values.append({"range": "A1:C3", "values": [
+        [f"{d.month}/{d.day}（{_WEEKDAYS[d.weekday()]}）重賞の買い目{tag}", "", ""],
+        [f'=IF(C2>{STALE_SHEET_MIN},"!!! 最終更新から "&C2&" 分（{STALE_SHEET_MIN}分を超えた：PC が止まっている？）",'
+         f'"最終更新から "&C2&" 分（{now:%H:%M} 更新）")', "",
+         f"=ROUND(TO_PURE_NUMBER(NOW()-DATE({now.year},{now.month},{now.day})-TIME({now.hour},{now.minute},{now.second}))*1440)"],
+        ["✓ はスマッピーに入れたら付ける。最終を書いたあとは、プログラムはその枠を書き換えない（チェックは消えない）", "", ""]]})
+    new_final: set[str] = set()
+    for i, v in enumerate(views):
+        r0 = MOBILE_TOP + MOBILE_BLOCK * i
+        r_end = r0 + MOBILE_BLOCK
+        done = collapse and v["済"]
+        if v["レースID"] in written and not reset:
+            if done:                                         # 発走後：行を隠すだけ（書式）。題の行の文字だけ変える
+                hide(r0 + 1, r_end, True)
+                values.append({"range": f"A{r0 + 1}", "values": [[_collapsed_title(v)]]})
+            continue
+        lines = _block_lines(v)
+        grid_vals = [row for _, row in lines] + [["", "", ""]] * (MOBILE_BLOCK - len(lines))
+        if done:
+            grid_vals[0] = [_collapsed_title(v), "", ""]
+        values.append({"range": f"A{r0 + 1}:C{r_end}", "values": grid_vals})
+        req.append({"unmergeCells": {"range": sheets.grid(ws_id, r0, r_end)}})
+        req.append({"setDataValidation": {"range": sheets.grid(ws_id, r0, r_end, 0, 1)}})     # チェックボックスを外す
+        fmt(r0, r_end, 0, 3, text_fmt(MOBILE_FONT["bet"]), base_fields)
+        hide(r0, r_end, False)
+        bet_rows = []
+        for j, (kind, row) in enumerate(lines):
+            r = r0 + j
+            if kind == "title":
+                merge(r)
+                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["title"], True), "backgroundColor": _rgb((0.85, 0.90, 0.98))}, base_fields)
+                height(r, r + 1, _text_height(grid_vals[0][0], MOBILE_FONT["title"], width))
+            elif kind == "state":
+                c = MOBILE_COLORS[v["種類"]]
+                merge(r)
+                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["state"], True, (1, 1, 1) if v["種類"] in _WHITE_TEXT else (0, 0, 0)),
+                                     "backgroundColor": _rgb(c)}, base_fields)
+                height(r, r + 1, _text_height(row[0], MOBILE_FONT["state"], width))
+            elif kind == "warn":
+                merge(r)
+                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["warn"], True, (0.85, 0.0, 0.0)),
+                                     "backgroundColor": _rgb((1.0, 0.92, 0.92))}, base_fields)
+                height(r, r + 1, _text_height(row[0], MOBILE_FONT["warn"], width))
+            elif kind == "bet":
+                bet_rows.append(r)
+                height(r, r + 1, max(_text_height(row[1], MOBILE_FONT["bet"], MOBILE_WIDTHS[1]), 34))
+            elif kind == "total":
+                merge(r, 0, 2)
+                fmt(r, r + 1, 0, 3, text_fmt(MOBILE_FONT["total"], True), base_fields)
+                height(r, r + 1, 32)
+            elif kind == "prob":
+                merge(r)
+                fmt(r, r + 1, 0, 3, text_fmt(MOBILE_FONT["prob"], False, (0.4, 0.4, 0.4)), base_fields)
+                height(r, r + 1, _text_height(row[0], MOBILE_FONT["prob"], width))
+        if bet_rows:
+            b0, b1 = bet_rows[0], bet_rows[-1] + 1
+            req.append({"setDataValidation": {"range": sheets.grid(ws_id, b0, b1, 0, 1),
+                                              "rule": {"condition": {"type": "BOOLEAN"}, "strict": True}}})
+            fmt(b0, b1, 1, 2, text_fmt(MOBILE_FONT["bet"], True), base_fields)
+            fmt(b0, b1, 2, 3, {**text_fmt(MOBILE_FONT["bet"], True), "horizontalAlignment": "RIGHT",
+                               "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}, base_fields)
+            fmt(b1, b1 + 1, 2, 3, {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}, "horizontalAlignment": "RIGHT"},
+                "userEnteredFormat.numberFormat,userEnteredFormat.horizontalAlignment")
+        used = len(lines)
+        height(r0 + used, r0 + used + 1, 14)                 # 次のレースとの間の空き1行
+        hide(r0 + used + 1, r_end, True)                     # 使わない行は隠す（行の位置は変えない）
+        if done:
+            hide(r0 + 1, r_end, True)
+        if v["最終"]:
+            new_final.add(v["レースID"])
+    return values, req, new_final
+
+
+def _mobile_state_path() -> Path:
+    return raceday_dir() / "mobile_state.json"
+
+
+def write_mobile(prep: dict | None, replay: bool = False, clock: Clock | None = None, ws=None, force: bool = False,
+                 now: datetime | None = None, collapse: bool = True, title: str | None = None,
+                 views: list[dict] | None = None, date: str | None = None) -> str:
+    """スマホ用タブを書く。force=True（sheet コマンド・見本）は枠を全部書き直す（チェックも消える）。"""
+    from . import sheets
+    title = title or (MOBILE_REPLAY_SHEET_TITLE if replay else MOBILE_SHEET_TITLE)
+    now = now or (clock.now if clock else datetime.now())
+    date = date or prep["日付"]
+    if views is None:
+        views = mobile_views(prep, replay, now, list(clock.warnings) if clock else [])
+    if ws is None:
+        ws = sheets.open_or_add_worksheet(sheets.load_settings(), title,
+                                          rows=MOBILE_TOP + MOBILE_BLOCK * max(len(views), 1), cols=MOBILE_COLS)
+    state_all = read_json(_mobile_state_path()) or {}
+    st = state_all.get(title) or {}
+    order = [v["レースID"] for v in views]
+    reset = force or st.get("日付") != date or st.get("sheetId") != ws.id or st.get("レース") != order
+    written = set() if reset else set(st.get("最終を書いた", []))
+    values, req, new_final = mobile_layout(views, ws.id, date, now, written, reset, collapse,
+                                           "【ドライラン】" if replay else ("【見本】" if title == MOBILE_SAMPLE_SHEET_TITLE else ""))
+    if reset:                                                # 日付が変わった最初の回だけ：赤の書式があるかを1回読む
+        rule = f"=$C$2>{STALE_SHEET_MIN}"
+        try:
+            if not sheets.has_rule(ws, rule):
+                req.append(sheets.red_rule_request(ws, "A2:C2", rule))
+        except Exception:
+            pass                                             # 色付けに失敗しても、文字の警告は出ている
+    sheets.apply_format(ws, req)
+    sheets.write_ranges(ws, values)
+    state_all[title] = {"日付": date, "sheetId": ws.id, "レース": order, "最終を書いた": sorted(written | new_final),
+                        "更新": now.strftime("%Y-%m-%d %H:%M:%S")}
+    write_json(_mobile_state_path(), state_all)
+    return title
+
+
+def _sample_plan(spec, created: str, stage: str, prob: float, short: int = 0, checked: bool = True) -> dict:
+    bets_ = [{"券種": k, "組番": c, "馬番": [int(x) for x in c.replace("→", "-").split("-")], "金額": a} for k, c, a in spec]
+    return {"買い目": bets_, "点数": len(bets_), "合計": sum(b["金額"] for b in bets_), "予測の達成確率": prob,
+            "熱さ": {str(int(TARGET)): prob}, "作成時刻": created, "段階": stage, "本物のオッズで確かめた": checked,
+            "届かない買い目": short, "足りない額の合計": 1_300 * short}
+
+
+def sample_views(date: str, now: datetime) -> list[dict]:
+    """見本：最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み（たたむ）を1つずつ。"""
+    d = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    spec = [("馬連", "2-12", 1_500), ("馬単", "12→2", 900), ("3連複", "1-7-13", 3_500), ("3連複", "2-8-10", 2_600),
+            ("3連単", "3→8→2", 300), ("3連単", "10→11→12", 200)]
+    spec = spec + [("3連単", "12→3→8", 3_000)]
+    races = []
+
+    def race(i, name, hhmm):
+        return {"レースID": f"{date}0511"[:10] + f"{i:02d}", "競馬場名": "東京", "競走名": f"（見本）{name}",
+                "グレード": "G3", "発走時刻": hhmm}
+    t = lambda m: (now + timedelta(minutes=m)).strftime("%H%M")      # noqa: E731
+    c = lambda m: f"{d} {(now + timedelta(minutes=m)):%H:%M}:00"      # noqa: E731
+    fin = _sample_plan(spec, c(-1), "最終", 0.231)
+    races.append((race(1, "最終の例", t(19)), {"final": fin, "latest": fin}, None, []))
+    races.append((race(2, "仮の例", t(45)), {"provisional": _sample_plan(spec[:5], c(-2), "仮", 0.204),
+                                            "latest": _sample_plan(spec[:5], c(-2), "仮", 0.204)}, None, []))
+    races.append((race(3, "途中の例", t(95)), {"latest": _sample_plan(spec[:4], c(-3), "途中", 0.188)}, None, []))
+    races.append((race(4, "予備の例", t(10)), {}, {"作り方": "今のモデルの6頭BOX", "BOX": [1, 3, 5, 8, 11, 12], "作成": c(-900)}, []))
+    races.append((race(5, "最終を作れていない例", t(12)),
+                  {"latest": _sample_plan(spec[:6], c(-30), "仮", 0.192, short=2)}, None,
+                  ["（見本）インターネットの時刻が取れません。PC の時計を信じて続けています"]))
+    races.append((race(6, "まだ買い目なしの例", t(150)), {}, None, []))
+    races.append((race(7, "発走済み（たたむ）の例", t(-30)), {"final": fin, "latest": fin}, None, []))
+    views = [mobile_view(r, date, {s: st.get(s) for s in STAGES}, bk, now, w) for r, st, bk, w in races]
+    return sorted(views, key=lambda v: (v["発走"], v["レースID"]))
+
+
+def write_mobile_sample(ws=None) -> str:
+    now = datetime.now().replace(second=0, microsecond=0)
+    now = min(max(now, now.replace(hour=1, minute=0)), now.replace(hour=21, minute=0))   # 見本の発走が日をまたがないように
+    date = now.strftime("%Y%m%d")
+    return write_mobile(None, ws=ws, force=True, now=now, title=MOBILE_SAMPLE_SHEET_TITLE,
+                        views=sample_views(date, now), date=date)
+
+
+# ---------------------------------------------------------------------------
+# v16 成績タブ「成績」：スマホの1画面に、F の本番・同じレースの6頭BOX・練習（平場・重賞）・最近の重賞
+# ---------------------------------------------------------------------------
+def _pct(x) -> str:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    return "—" if not np.isfinite(x) else f"{x:.1%}"
+
+
+def render_results(score_summary_df: pd.DataFrame | None, score_races_df: pd.DataFrame | None,
+                   practice_df: pd.DataFrame | None, now: datetime | None = None, recent: int = 6) -> list[list]:
+    """3列：区分 / 熱い当たり÷レース / 達成率（予測の平均）。そのあとに最近の重賞（日付とレース名 / 熱いか / 払戻）。"""
+    now = now or datetime.now()
+    rows: list[list] = [[f"成績（{now:%m/%d %H:%M} 更新）", "", ""],
+                        ["", "熱い当たり / レース", "達成率（予測）"]]
+
+    def add(label, n, hot, rate, pred):
+        rows.append([label, sheet_text(f"{int(hot)} / {int(n)}"), sheet_text(f"{_pct(rate)}（{_pct(pred)}）")])
+    ss = score_summary_df if score_summary_df is not None else pd.DataFrame()
+    for _, x in ss.iterrows():
+        name = str(x.get("買い方", ""))
+        if name.startswith("【") or name.startswith("（参考）"):
+            continue
+        label = "F 本番（重賞）" if name.startswith("F") else ("6頭BOX（同じレース）" if "6頭BOX" in name else name)
+        add(label, x["レース数"], x["熱い当たり"], x["達成率"], x.get("予測の達成確率（平均）"))
+    if ss.empty:
+        rows.append(["F 本番（重賞）", "まだ照合なし", ""])
+    pr = practice_df if practice_df is not None else pd.DataFrame()
+    for _, x in pr.iterrows():
+        label = "練習 平場" if x["区分"] == "平場" else "練習 重賞（参考）"
+        add(label, x["レース数"], x["熱い当たり"], x["熱い当たりの割合"], x.get("予測の達成確率（平均）"))
+    if pr.empty:
+        rows.append(["練習", "まだ記録なし", ""])
+    rows += [[], ["最近の重賞（本番）", "熱い？", "払戻"]]
+    sr = score_races_df if score_races_df is not None else pd.DataFrame()
+    if not sr.empty and "照合" in sr.columns:
+        live = sr.loc[(sr["照合"] == "済") & (sr.get("区分", "本番（自動実行）") != REPLAY_LABEL)]
+        live = live.sort_values(["日付", "レースID"], ascending=False).head(recent)
+        for _, x in live.iterrows():
+            hot = str(x.get("熱い")).lower() in ("true", "1", "1.0")
+            hit = str(x.get("的中")).lower() in ("true", "1", "1.0")
+            mark = "熱い" if hot else ("当たり（5万円に届かず）" if hit else "外れ")
+            day = str(x["日付"])[5:].replace("-", "/")
+            rows.append([sheet_text(f"{day} {x['レース']}"), mark, int(round(float(x.get("払戻") or 0)))])
+    if len(rows) and rows[-1][0] == "最近の重賞（本番）":
+        rows.append(["（まだ照合した重賞なし）", "", ""])
+    return [r + [""] * (MOBILE_COLS - len(r)) for r in rows]
+
+
+def write_results(ws=None, now: datetime | None = None) -> str:
+    """保存した score_summary.csv・score_races.csv・practice/summary.csv から「成績」タブを書く（clear して書き直す）。"""
+    from . import sheets
+
+    def load(p):
+        return pd.read_csv(p, encoding="utf-8-sig", dtype={"レースID": str}) if p.exists() else None
+    values = render_results(load(raceday_dir() / "score_summary.csv"), load(raceday_dir() / "score_races.csv"),
+                            load(practice_dir() / "summary.csv"), now)
+    if ws is None:
+        ws = sheets.open_or_add_worksheet(sheets.load_settings(), RESULTS_SHEET_TITLE, rows=40, cols=MOBILE_COLS)
+    sheets.write_grid(ws, values)
+    n = len(values)
+    req = [{"updateDimensionProperties": {"range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                                          "properties": {"pixelSize": w}, "fields": "pixelSize"}}
+           for i, w in enumerate((150, 104, 96))]
+    req.append({"repeatCell": {"range": sheets.grid(ws.id, 0, n), "cell": {"userEnteredFormat": {
+        "textFormat": {"fontSize": 12}, "wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE"}}, "fields": "userEnteredFormat"}})
+    req.append({"repeatCell": {"range": sheets.grid(ws.id, 0, 1), "cell": {"userEnteredFormat": {
+        "textFormat": {"fontSize": 14, "bold": True}}}, "fields": "userEnteredFormat.textFormat"}})
+    heads = [i for i, r in enumerate(values) if r[1] in ("熱い当たり / レース", "熱い？")]
+    for i in heads:
+        req.append({"repeatCell": {"range": sheets.grid(ws.id, i, i + 1), "cell": {"userEnteredFormat": {
+            "textFormat": {"fontSize": 11, "bold": True}, "backgroundColor": _rgb((0.85, 0.90, 0.98))}},
+            "fields": "userEnteredFormat.textFormat,userEnteredFormat.backgroundColor"}})
+    req.append({"repeatCell": {"range": sheets.grid(ws.id, heads[-1] + 1 if heads else 0, n, 2, 3), "cell": {"userEnteredFormat": {
+        "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    try:
+        sheets.apply_format(ws, req)
+    except Exception:
+        pass                                                 # 書式に失敗しても中身は書けている
+    return RESULTS_SHEET_TITLE
+
+
+# ---------------------------------------------------------------------------
 # タスクスケジューラ
 # ---------------------------------------------------------------------------
 TASK_PREFIX = "keiba_raceday_"
@@ -1524,6 +1938,12 @@ def _update_body(args, date: str, prep: dict) -> int:
             print(f"  シートに書けませんでした: {e}")
         except Exception as e:
             print(f"  シートに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
+        try:                                                # v16：スマホ用タブ（失敗しても買い目の保存・詳しいタブには影響しない）
+            print(f"  シート「{write_mobile(prep, clock=clock)}」に書きました")
+        except SystemExit as e:
+            print(f"  スマホ用タブに書けませんでした: {e}")
+        except Exception as e:
+            print(f"  スマホ用タブに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
     if not args.no_drift and network_ok:
         # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない。v14：30 秒まで）
         try:
@@ -1906,6 +2326,7 @@ def _cmd_practice(args) -> int:
         ws = sheets.open_or_add_worksheet(sheets.load_settings(), PRACTICE_SHEET_TITLE)
         sheets.write_grid(ws, values)
         print(f"シート「{PRACTICE_SHEET_TITLE}」に書きました")
+        _write_results_safely()
     return 0
 
 
@@ -1958,13 +2379,28 @@ def _cmd_check_results(args) -> int:
 
 
 def _cmd_sheet(args) -> int:
-    """保存した買い目（latest / provisional / final の JSON）から、シートだけを書き直す。買い目は作り直さない。"""
+    """保存した買い目（latest / provisional / final の JSON）から、シートだけを書き直す。買い目は作り直さない。
+
+    v16：スマホ用タブも書き直す（枠を全部書き直すので、チェックも消える）。--sample は見本のタブだけを書く。
+    """
+    if args.sample:
+        print(f"シート「{write_mobile_sample()}」に見本（最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み）を書きました")
+        return 0
     date = args.date or datetime.now().strftime("%Y%m%d")
     prep = read_json(day_dir(date, args.replay) / "prep.json")
     if prep is None:
         print(f"{date} の prep.json がありません（{day_dir(date, args.replay)}）")
         return 1
-    print(f"シート「{write_sheet(prep, replay=args.replay)}」を、保存した買い目から書き直しました（買い目は作り直していません）")
+    if not args.mobile_only:
+        print(f"シート「{write_sheet(prep, replay=args.replay)}」を、保存した買い目から書き直しました（買い目は作り直していません）")
+    if args.now:
+        now, collapse = _parse_now(date, args.now), True
+    elif date == datetime.now().strftime("%Y%m%d") and not args.replay:
+        now, collapse = datetime.now(), True
+    else:                                                   # 過去の日：その日の終わりの状態で、発走後もたたまずに見せる
+        now, collapse = post_time(date, "2359"), False
+    print(f"シート「{write_mobile(prep, replay=args.replay, force=True, now=now, collapse=collapse)}」も書き直しました"
+          f"（{now:%H:%M} の時点の状態{'' if collapse else '・発走後もたたまない'}。チェックは消えます）")
     return 0
 
 
@@ -2031,6 +2467,7 @@ def _cmd_replay(args) -> int:
         print(sc[cols].to_string(index=False))
     if args.sheet:
         print(f"シート「{write_sheet(prep, replay=True)}」に書きました")
+        print(f"シート「{write_mobile(prep, replay=True, force=True, now=post_time(args.date, '2359'), collapse=False)}」に書きました")
     return 0
 
 
@@ -2114,7 +2551,15 @@ def _cmd_score(args) -> int:
                  [cols] + shown.values.tolist()
         sheets.write_grid(ws, values)
         print(f"シート「{SCORE_SHEET_TITLE}」に書きました")
+        _write_results_safely()
     return 0
+
+
+def _write_results_safely() -> None:
+    try:
+        print(f"シート「{write_results()}」に書きました（スマホで見る成績）")
+    except Exception as e:
+        print(f"シート「{RESULTS_SHEET_TITLE}」に書けませんでした（他の結果は保存済み）: {type(e).__name__}: {e}")
 
 
 def _cmd_freeze(args) -> int:
@@ -2166,7 +2611,10 @@ def main(argv: list[str] | None = None) -> int:
     q.set_defaults(func=_cmd_check_results)
     q = sub.add_parser("sheet", help="保存した買い目からシートだけを書き直す（買い目は作り直さない）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
-    q.add_argument("--replay", action="store_true", help="ドライランの分（シート「当日の買い目（再現）」）")
+    q.add_argument("--replay", action="store_true", help="ドライランの分（シート「当日の買い目（再現）」「スマホ（再現）」）")
+    q.add_argument("--now", default=None, help="スマホ用タブをこの時刻の状態で書く（HHMM。確認用）")
+    q.add_argument("--mobile-only", action="store_true", help="スマホ用タブだけを書き直す")
+    q.add_argument("--sample", action="store_true", help="スマホ用タブの見本（各状態）をタブ「スマホ（見本）」に書く")
     q.set_defaults(func=_cmd_sheet)
     q = sub.add_parser("keepawake", help="（update が起こす）最後の発走のあとまで待機中のスリープを防ぐ")
     q.add_argument("--date", required=True)

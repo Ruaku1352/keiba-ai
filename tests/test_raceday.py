@@ -602,8 +602,10 @@ def test_sheet_command_rewrites_from_saved(root, monkeypatch):
     before = (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8")
     got = {}
     monkeypatch.setattr(raceday, "write_sheet", lambda p, replay=False, **k: got.setdefault("p", p) and raceday.SHEET_TITLE)
+    monkeypatch.setattr(raceday, "write_mobile", lambda p, replay=False, **k: got.setdefault("m", k) and raceday.MOBILE_SHEET_TITLE)
     assert raceday.main(["sheet", "--date", DATE]) == 0
     assert got["p"]["日付"] == DATE
+    assert got["m"]["force"] and not got["m"]["collapse"]                    # 過去の日：全部書き直す・たたまない
     assert (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8") == before   # 作り直さない
 
 
@@ -1265,3 +1267,225 @@ def test_practice_uses_prep_coefficients_when_present(env, capsys):
 
 def test_parse_dates():
     assert raceday.parse_dates("20261107-20261109,20261115") == ["20261107", "20261108", "20261109", "20261115"]
+
+
+# ---------------------------------------------------------------------------
+# v16：スマホ用タブ「スマホ」と「成績」
+# ---------------------------------------------------------------------------
+class _FakeBook:
+    def __init__(self):
+        self.requests, self.meta_reads = [], 0
+
+    def batch_update(self, body):
+        self.requests.append(body["requests"])
+
+    def fetch_sheet_metadata(self):
+        self.meta_reads += 1
+        return {"sheets": [{"properties": {"sheetId": 7}, "conditionalFormats": []}], "properties": {"timeZone": "Asia/Tokyo"}}
+
+
+class _FakeWS:
+    """値の書き込み（batch_update）と書式（spreadsheet.batch_update）を記録する。"""
+    def __init__(self):
+        self.id, self.title, self.spreadsheet = 7, "スマホ", _FakeBook()
+        self.value_calls, self.cells = [], {}
+
+    def batch_update(self, data, value_input_option):
+        assert value_input_option == "USER_ENTERED"
+        self.value_calls.append(data)
+        for d in data:
+            for (r, c), v in _cells_of(d["range"], d["values"]).items():
+                self.cells[(r, c)] = v
+
+    def clear(self):
+        self.cells = {}
+
+    def update(self, values, range_name, value_input_option):
+        self.batch_update([{"range": range_name, "values": values}], value_input_option)
+
+
+def _cells_of(rng: str, values) -> dict:
+    import re as _re
+    m = _re.match(r"([A-Z]+)(\d+)", rng)
+    c0, r0 = ord(m[1]) - 65, int(m[2])
+    return {(r0 + i, c0 + j): v for i, row in enumerate(values) for j, v in enumerate(row)}
+
+
+def _touched_rows(ws, call) -> set:
+    return {r for d in call for (r, c) in _cells_of(d["range"], d["values"])}
+
+
+def _final_then(prep, now):
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))        # 最終
+    return raceday.mobile_views(prep, False, now)
+
+
+def test_mobile_tab_has_three_columns_and_text_combos(root):
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 14, 50))       # 仮
+    ws = _FakeWS()
+    assert raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 14, 55)) == raceday.MOBILE_SHEET_TITLE
+    assert max(c for (r, c) in ws.cells) < 3                                          # A〜C の3列だけ
+    for reqs in ws.spreadsheet.requests:
+        for q in reqs:
+            for v in q.values():
+                rng = v.get("range") if isinstance(v, dict) else None
+                if rng and "endColumnIndex" in rng:
+                    assert rng["endColumnIndex"] <= 3
+    props = [q["updateSheetProperties"] for q in ws.spreadsheet.requests[0] if "updateSheetProperties" in q]
+    assert props and props[0]["properties"]["gridProperties"]["columnCount"] == 3
+    plan = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "latest.json")
+    bet_cells = [v for (r, c), v in ws.cells.items() if c == 1 and isinstance(v, str) and v[1:].split(" ")[0] in raceday.SMAPPY_ORDER]
+    assert bet_cells == ["'" + f"{b['券種']} {raceday.bet_text(b)}" for b in plan["買い目"]]  # 入れる順のまま・文字として
+    assert not [v for v in ws.cells.values() if _parsed_as_date(v)]
+    amounts = [ws.cells[(r, 2)] for (r, c), v in ws.cells.items() if c == 1 and v in bet_cells]
+    assert amounts == [b["金額"] for b in plan["買い目"]]                               # 付け替えたあとの金額
+    texts = " ".join(str(v) for v in ws.cells.values())
+    assert "仮。最終は 15:20" in texts and "最終更新から" in texts
+    assert ws.cells[(2, 2)].startswith("=ROUND(")                   # C2：最終更新から○分（シートで計算）
+    assert len(ws.value_calls) == 1 and len(ws.spreadsheet.requests) == 1             # 値1回・書式1回にまとめる
+
+
+def test_mobile_states(root):
+    prep = _prep()
+    rid = "202605040511"
+    at = lambda hm: datetime(2026, 11, 1, int(hm[:2]), int(hm[2:]))  # noqa: E731
+    r = prep["レース"][0]
+    v = raceday.mobile_view(r, DATE, {}, None, at("1300"))
+    assert v["種類"] == "待ち" and not v["買い目"]
+    v = raceday.mobile_view(r, DATE, {}, None, at("1450"))
+    assert v["種類"] == "なし"
+    bk = {"作り方": "6頭BOX", "BOX": [1, 2, 3, 4, 5, 6], "作成": "2026-10-31 21:00:00"}
+    v = raceday.mobile_view(r, DATE, {}, bk, at("1525"))
+    assert v["種類"] == "予備" and v["買い目"][0] == ("3連単 BOX 1・2・3・4・5・6", 12_000) and "予備" in v["状態"]
+    raceday.run_once(prep, FakeSource(_snap()), at("1400"))
+    st = {s: raceday.read_json(raceday.day_dir(DATE) / rid / f"{s}.json") for s in raceday.STAGES}
+    assert raceday.mobile_view(r, DATE, st, None, at("1405"))["種類"] == "途中"
+    v = raceday.mobile_view(r, DATE, st, None, at("1525"), ["PC の時計が 3 分ずれている"])
+    assert v["種類"] == "なし" and "最終を作れていない" in v["状態"] and v["警告"][0].startswith("時計・ネット")
+    raceday.run_once(prep, FakeSource(_snap(scale=0.5)), at("1450"))
+    st = {s: raceday.read_json(raceday.day_dir(DATE) / rid / f"{s}.json") for s in raceday.STAGES}
+    v = raceday.mobile_view(r, DATE, st, None, at("1455"))
+    assert v["種類"] == "仮" and any("5万円に届かない" for w in v["警告"])
+    raceday.run_once(prep, FakeSource(_snap()), at("1520"))
+    st = {s: raceday.read_json(raceday.day_dir(DATE) / rid / f"{s}.json") for s in raceday.STAGES}
+    v = raceday.mobile_view(r, DATE, st, None, at("1521"))
+    assert v["種類"] == "最終" and v["状態"] == "最終 15:20 作成。この通りに買う" and not v["済"]
+    assert v["合計"] == (f"合計 {st['final']['点数']}点", st["final"]["合計"])
+    assert raceday.mobile_view(r, DATE, st, None, at("1541"))["済"]
+
+
+def test_mobile_final_block_is_not_rewritten(root):
+    """最終を一度書いた枠は、その後の回では値も書式も書かない（チェックが消えない）。発走後は行を隠すだけ。"""
+    prep = _prep()
+    prep["レース"].append({"レースID": "202605040512", "発走時刻": "1625", "競馬場名": "東京", "競走名": "あとのレース",
+                          "グレード": "G3", "芝ダ": "芝", "距離": 1600, "頭数": 12})
+    prep["対象"] += _race(rid="202605040512", hhmm="1625").to_dict("records")
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))        # 1つめは最終・2つめは途中
+    ws = _FakeWS()
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 21))
+    top, blk = raceday.MOBILE_TOP, raceday.MOBILE_BLOCK
+    first = range(top + 1, top + blk + 1)                                             # 1つめの枠（シートの行番号）
+    final = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "final.json")
+    checks = [r for r in first if ws.cells.get((r, 0)) is False]
+    assert len(checks) == final["点数"]                                                # 買い目の行ごとにチェック欄
+    state = raceday.read_json(raceday._mobile_state_path())["スマホ"]
+    assert state["最終を書いた"] == ["202605040511"]
+    for r in checks:                                                                  # 人がチェックを付けた
+        ws.cells[(r, 0)] = True
+    raceday.run_once(prep, FakeSource(_snap(seed=3)), datetime(2026, 11, 1, 15, 30))
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 30))
+    assert not (_touched_rows(ws, ws.value_calls[-1]) & set(first))                   # 1つめの枠には書かない
+    assert all(ws.cells[(r, 0)] is True for r in checks)
+    second = range(top + blk + 1, top + 2 * blk + 1)
+    assert _touched_rows(ws, ws.value_calls[-1]) & set(second)                         # 2つめ（途中）は書き直す
+
+    def block_reqs(reqs, lo, hi):
+        out = []
+        for q in reqs:
+            for v in q.values():
+                g = v.get("range") if isinstance(v, dict) else None
+                if g and "startRowIndex" in g and g["startRowIndex"] < hi and g["endRowIndex"] > lo:
+                    out.append(q)
+                if g and g.get("dimension") == "ROWS" and g["startIndex"] < hi and g["endIndex"] > lo:
+                    out.append(q)
+        return out
+    assert not block_reqs(ws.spreadsheet.requests[-1], top, top + blk)                 # 書式も触らない
+    # 発走後：題の行の文字と「行を隠す」だけ。チェックの行の値は書かない
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 45))
+    assert _touched_rows(ws, ws.value_calls[-1]) & set(first) == {top + 1}
+    assert ws.cells[(top + 1, 0)].startswith("済 ")
+    hidden = [q for q in block_reqs(ws.spreadsheet.requests[-1], top, top + blk)]
+    assert hidden and all(q["updateDimensionProperties"]["properties"] == {"hiddenByUser": True} for q in hidden)
+    assert all(ws.cells[(r, 0)] is True for r in checks)
+    # sheet コマンド（force）は書き直す（チェックも消える）
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 45), force=True, collapse=False)
+    assert all(ws.cells[(r, 0)] is False for r in checks)
+
+
+def test_mobile_resets_on_new_date(root):
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))
+    ws = _FakeWS()
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 21))
+    assert ws.spreadsheet.meta_reads == 1                                              # 最初の回だけ赤の書式の確認
+    raceday.write_mobile(prep, ws=ws, now=datetime(2026, 11, 1, 15, 31))
+    assert ws.spreadsheet.meta_reads == 1
+    nxt = dict(prep, 日付="20261102")
+    raceday.write_mobile(nxt, ws=ws, now=datetime(2026, 11, 2, 9, 0))
+    assert any("updateCells" in q for q in ws.spreadsheet.requests[-1])                # 日付が変わったら全体を消して書き直す
+    assert raceday.read_json(raceday._mobile_state_path())["スマホ"]["最終を書いた"] == []
+
+
+def test_update_saves_plans_even_if_sheet_fails(root, monkeypatch, capsys):
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    monkeypatch.setattr(raceday, "LiveSource", lambda d, data=None: FakeSource(_snap()))
+
+    def boom(*a, **k):
+        raise RuntimeError("シートの API が落ちた")
+    monkeypatch.setattr(raceday, "write_sheet", boom)
+    monkeypatch.setattr(raceday, "write_mobile", boom)
+    assert raceday.main(["update", "--date", DATE, "--now", "1520", "--no-drift"]) == 0
+    out = capsys.readouterr().out
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").exists()
+    assert "スマホ用タブに書けませんでした（保存した買い目は残っています）" in out
+
+
+def test_mobile_sample_writes_every_state(root):
+    ws = _FakeWS()
+    assert raceday.write_mobile_sample(ws=ws) == raceday.MOBILE_SAMPLE_SHEET_TITLE
+    texts = " ".join(str(v) for v in ws.cells.values())
+    for s in ("この通りに買う", "仮。最終は", "途中（", "予備。当日のオッズが取れていない", "最終を作れていない", "まだ買い目なし", "済 "):
+        assert s in texts, s
+    assert max(c for (r, c) in ws.cells) < 3 and not [v for v in ws.cells.values() if _parsed_as_date(v)]
+    colors = [q["repeatCell"]["cell"]["userEnteredFormat"].get("backgroundColor") for q in ws.spreadsheet.requests[0]
+              if "repeatCell" in q and q["repeatCell"]["cell"]["userEnteredFormat"].get("textFormat", {}).get("fontSize") == 18]
+    assert len({tuple(c.values()) for c in colors}) == 5                               # 緑・黄・灰・橙・赤
+
+
+def test_results_tab(root):
+    summ = pd.DataFrame([{"買い方": "F（券種混合・市場＋3b・余裕×1.4・15点まで）", "レース数": 12, "熱い当たり": 2, "達成率": 2 / 12,
+                          "予測の達成確率（平均）": 0.18},
+                         {"買い方": "（参考）F の付け替える前の金額", "レース数": 12, "熱い当たり": 2, "達成率": 2 / 12},
+                         {"買い方": "今の6頭BOX（predict --sheet の最終の予測。同じレース）", "レース数": 12, "熱い当たり": 1,
+                          "達成率": 1 / 12}])
+    races = pd.DataFrame([{"区分": "本番（自動実行）", "レースID": f"20260504051{i}", "日付": f"2026-11-0{i}", "レース": f"東京1{i}R 記念{i}",
+                           "照合": "済", "熱い": i == 2, "的中": i >= 2, "払戻": 64_000.0 if i == 2 else 3_000.0 * i}
+                          for i in range(1, 4)])
+    pr = pd.DataFrame([{"区分": "平場", "レース数": 200, "熱い当たり": 30, "熱い当たりの割合": 0.15, "予測の達成確率（平均）": 0.17},
+                       {"区分": "重賞（参考）", "レース数": 10, "熱い当たり": 1, "熱い当たりの割合": 0.1, "予測の達成確率（平均）": 0.2}])
+    rows = raceday.render_results(summ, races, pr, datetime(2026, 11, 16, 9, 0))
+    assert all(len(r) == 3 for r in rows)
+    labels = [r[0] for r in rows]
+    assert labels[2:6] == ["F 本番（重賞）", "6頭BOX（同じレース）", "練習 平場", "練習 重賞（参考）"]
+    assert rows[2][1] == "'2 / 12" and rows[2][2] == "'16.7%（18.0%）" and rows[3][2] == "'8.3%（—）"
+    recent = rows[rows.index(["最近の重賞（本番）", "熱い？", "払戻"]) + 1:]
+    assert [r[1] for r in recent] == ["外れ", "熱い", "当たり（5万円に届かず）"][::-1] and recent[1][2] == 64_000
+    assert not [v for r in rows for v in r if _parsed_as_date(v)]
+    # 保存した CSV から書く
+    summ.to_csv(raceday.raceday_dir() / "score_summary.csv", index=False, encoding="utf-8-sig")
+    races.to_csv(raceday.raceday_dir() / "score_races.csv", index=False, encoding="utf-8-sig")
+    ws = _FakeWS()
+    assert raceday.write_results(ws=ws) == raceday.RESULTS_SHEET_TITLE
+    assert ws.cells[(3, 0)] == "F 本番（重賞）" and max(c for (r, c) in ws.cells) < 3
