@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>当日の買い目</title>
+<style>
+  :root {
+    --bg: #f3f7f3; --card: #ffffff; --text: #232d27; --muted: #5a685f; --line: #dbe4dc;
+    --green: #1f5c3a; --green-ink: #ffffff; --green-soft: #e2efe5; --green-text: #17482d;
+    --final-bg: #dff0e4; --final-text: #14432a; --final-bar: #2e7d4f;
+    --prov-bg: #fbf1cc; --prov-text: #5f4900; --prov-bar: #c9a100;
+    --mid-bg: #e8ece9; --mid-text: #414c45; --mid-bar: #8a968e;
+    --back-bg: #fde6d3; --back-text: #74390a; --back-bar: #d0731f;
+    --bad-bg: #fbe9e6; --bad-text: #8a1f18; --bad-bar: #b8554c;
+    --done-bg: #eef1ee; --shadow: 0 1px 2px rgba(20, 40, 28, .08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111713; --card: #1a221d; --text: #e4eae5; --muted: #a3b0a7; --line: #2c3830;
+      --green: #1b4a31; --green-ink: #eef5ef; --green-soft: #22382b; --green-text: #a9d8b9;
+      --final-bg: #1d3a29; --final-text: #b7e3c5; --final-bar: #4fa873;
+      --prov-bg: #3a3212; --prov-text: #f0d877; --prov-bar: #c9a100;
+      --mid-bg: #2a312c; --mid-text: #c5cec8; --mid-bar: #77837b;
+      --back-bg: #40291a; --back-text: #f5c49b; --back-bar: #d0731f;
+      --bad-bg: #40211e; --bad-text: #f3b5ae; --bad-bar: #c0665d;
+      --done-bg: #1f2622; --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+    font-size: 16px; line-height: 1.5; -webkit-text-size-adjust: 100%; overflow-x: hidden; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; margin: 0; text-align: left; cursor: pointer; }
+  button:focus-visible { outline: 3px solid var(--prov-bar); outline-offset: 2px; }
+
+  #top { position: sticky; top: 0; z-index: 30; }
+  #bar { display: flex; align-items: center; gap: 4px; background: var(--green); color: var(--green-ink);
+    padding: 6px 12px 6px 4px; min-height: 52px; }
+  #menuBtn { width: 48px; height: 44px; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 5px; border-radius: 8px; }
+  #menuBtn span { display: block; width: 22px; height: 2px; background: var(--green-ink); border-radius: 2px; }
+  #title { font-size: 18px; font-weight: 700; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #fresh { font-size: 12px; text-align: right; line-height: 1.3; opacity: .95; white-space: nowrap; }
+  #fresh b { font-size: 14px; }
+  #alerts .alert { background: var(--bad-bg); color: var(--bad-text); border-bottom: 1px solid var(--bad-bar);
+    padding: 8px 14px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  #alerts .alert.note { background: var(--prov-bg); color: var(--prov-text); border-bottom-color: var(--prov-bar); }
+
+  #drawer { position: fixed; left: 0; bottom: 0; width: min(84vw, 320px); background: var(--card); z-index: 25;
+    transform: translateX(-105%); transition: transform .18s ease; border-right: 1px solid var(--line); overflow-y: auto; padding: 8px 0; }
+  #shade { position: fixed; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, .35); z-index: 20; display: none; }
+  body.open #drawer { transform: none; }
+  body.open #shade { display: block; }
+  #drawer button { display: block; width: 100%; padding: 14px 20px; font-size: 17px; border-left: 5px solid transparent; }
+  #drawer button small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
+  #drawer button[aria-current="page"] { background: var(--green-soft); color: var(--green-text); border-left-color: var(--final-bar); font-weight: 700; }
+  @media (prefers-reduced-motion: reduce) { #drawer { transition: none; } }
+
+  main { padding: 12px 12px 48px; max-width: 560px; margin: 0 auto; }
+  .day { color: var(--muted); font-size: 14px; margin: 2px 4px 10px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-left: 6px solid var(--mid-bar); border-radius: 10px;
+    margin: 0 0 14px; box-shadow: var(--shadow); overflow: hidden; }
+  .card.s-final { border-left-color: var(--final-bar); } .card.s-prov { border-left-color: var(--prov-bar); }
+  .card.s-back { border-left-color: var(--back-bar); } .card.s-bad { border-left-color: var(--bad-bar); }
+  .head { padding: 10px 12px 4px; }
+  .race { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
+  .meta { color: var(--muted); font-size: 14px; }
+  .meta b { color: var(--text); font-size: 16px; }
+  .state { display: flex; align-items: flex-start; gap: 8px; padding: 4px 12px 10px; flex-wrap: wrap; }
+  .badge { display: inline-block; font-weight: 800; font-size: 16px; padding: 2px 10px; border-radius: 999px; white-space: nowrap;
+    background: var(--mid-bg); color: var(--mid-text); border: 1.5px solid transparent; }
+  .badge.s-final { background: var(--final-bg); color: var(--final-text); border-color: var(--final-bar); }
+  .badge.s-prov { background: var(--prov-bg); color: var(--prov-text); }
+  .badge.s-back { background: var(--back-bg); color: var(--back-text); }
+  .badge.s-bad { background: var(--bad-bg); color: var(--bad-text); }
+  .desc { font-size: 15px; font-weight: 600; flex: 1; min-width: 55%; padding-top: 2px; overflow-wrap: anywhere; }
+  .warn { background: var(--bad-bg); color: var(--bad-text); border-left: 4px solid var(--bad-bar); margin: 0 12px 8px; padding: 6px 10px;
+    border-radius: 6px; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  .bets { border-top: 1px solid var(--line); }
+  .bet { display: grid; grid-template-columns: 34px 3.6em 1fr auto; align-items: center; gap: 6px; width: 100%;
+    padding: 9px 12px 9px 8px; border-bottom: 1px solid var(--line); min-height: 52px; }
+  .tick { width: 26px; height: 26px; border: 2px solid var(--mid-bar); border-radius: 7px; display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 900; color: transparent; justify-self: center; }
+  .kind { font-size: 14px; font-weight: 700; color: var(--muted); }
+  .combo { font-size: 23px; font-weight: 800; letter-spacing: .02em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; line-height: 1.2; }
+  .yen { font-size: 21px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .yen small { font-size: 13px; font-weight: 600; color: var(--muted); margin-left: 1px; }
+  .bet.on { background: var(--green-soft); }
+  .bet.on .tick { background: var(--final-bar); border-color: var(--final-bar); color: #fff; }
+  .bet.on .combo, .bet.on .yen { color: var(--muted); }
+  .foot { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 10px 12px 4px; flex-wrap: wrap; }
+  .total { font-size: 17px; font-weight: 800; }
+  .count { font-size: 15px; font-weight: 700; color: var(--green-text); }
+  .count.all { background: var(--final-bg); color: var(--final-text); padding: 1px 10px; border-radius: 999px; }
+  .prob { color: var(--muted); font-size: 12px; padding: 0 12px 10px; }
+  .fold { display: flex; width: 100%; align-items: center; gap: 8px; padding: 10px 12px; background: var(--done-bg); color: var(--muted); font-size: 14px; }
+  .fold .name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .fold .chev { font-size: 12px; }
+  .card.done { border-left-color: var(--mid-bar); opacity: .96; }
+
+  h2 { font-size: 15px; color: var(--green-text); margin: 18px 4px 8px; padding-left: 8px; border-left: 4px solid var(--final-bar); }
+  .box { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; box-shadow: var(--shadow); }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: 15px; }
+  .kv:last-child { border-bottom: 0; }
+  .kv span:first-child { color: var(--muted); flex-shrink: 0; }
+  .kv span:last-child { text-align: right; font-weight: 600; overflow-wrap: anywhere; }
+  .dbet { padding: 7px 0; border-bottom: 1px solid var(--line); }
+  .dbet:last-child { border-bottom: 0; }
+  .dbet .l1 { display: flex; justify-content: space-between; gap: 8px; font-weight: 800; font-size: 17px; font-variant-numeric: tabular-nums; }
+  .dbet .l1 small { font-size: 13px; color: var(--muted); font-weight: 700; margin-right: 6px; }
+  .dbet .l2 { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 700; padding: 0 7px; border-radius: 999px; background: var(--prov-bg); color: var(--prov-text); }
+  .tag.mid { background: var(--mid-bg); color: var(--mid-text); }
+  .tag.bad { background: var(--bad-bg); color: var(--bad-text); } .tag.ok { background: var(--final-bg); color: var(--final-text); }
+  .stat { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .stat:last-child { border-bottom: 0; }
+  .stat .n { font-weight: 700; } .stat .big { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; text-align: right; }
+  .stat .sub { color: var(--muted); font-size: 13px; grid-column: 1 / -1; }
+  .res { display: grid; grid-template-columns: 1fr auto; gap: 0 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .res:last-child { border-bottom: 0; }
+  .res .when { color: var(--muted); font-size: 13px; grid-column: 1 / -1; }
+  .res .pay { font-weight: 800; font-variant-numeric: tabular-nums; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 4px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="bar">
+    <button id="menuBtn" aria-label="メニュー" aria-expanded="false" aria-controls="drawer"><span></span><span></span><span></span></button>
+    <div id="title">当日の買い目</div>
+    <div id="fresh" aria-live="polite"></div>
+  </div>
+  <div id="alerts" role="status"></div>
+</div>
+<div id="shade"></div>
+<nav id="drawer" aria-label="メニュー"></nav>
+<main id="main"><p class="empty">読み込んでいます…</p></main>
+<!--PREVIEW_DATA-->
+<script>
+(function () {
+  'use strict';
+  var RELOAD_MS = 30000, STALE_MIN = 15, MARKS_KEY = 'kaime_marks_v1';
+  var VIEWS = [
+    { id: 'today', name: '当日の買い目', sub: '状態・警告・買い目・入力済みの印' },
+    { id: 'detail', name: 'くわしい情報', sub: 'オッズ・払戻・付け替え・当日の傾向・熱さ・仮の買い目' },
+    { id: 'results', name: '成績', sub: 'F の本番・6頭BOX・練習の通算と最近の重賞' },
+    { id: 'system', name: '仕組みの状態', sub: '最終更新・k と m・時計やネットの警告' }
+  ];
+  var STATE_CLASS = { '最終': 's-final', '仮': 's-prov', '途中': '', 'オッズ待ち': '', '予備': 's-back', '買い目なし': 's-bad', '最終を作れていない': 's-bad' };
+  var data = null, lastOk = null, loadError = '', view = 'today', opened = {};
+  var isPreview = typeof window.PREVIEW_DATA !== 'undefined';
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function yen(v) { return v == null || isNaN(v) ? '—' : Math.round(v).toLocaleString('ja-JP'); }
+  function pct(v) { return v == null || isNaN(v) ? '—' : (v * 100).toFixed(1) + '%'; }
+  function hm(d) { return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); }
+  function now() { return data && data['プレビューの今'] ? new Date(data['プレビューの今']) : new Date(); }
+  function minutesSince(iso) { var t = new Date(iso); return isNaN(t) ? null : Math.floor((now() - t) / 60000); }
+  function isDone(r) { var t = new Date(r['発走']); return isNaN(t) ? !!r['発走済み'] : now() >= t; }
+  function ago(min) {
+    if (min == null) return '';
+    if (min < 1) return 'たった今';
+    if (min < 120) return min + '分前';
+    if (min < 2880) return Math.floor(min / 60) + '時間前';
+    return Math.floor(min / 1440) + '日前';
+  }
+
+  /* ---- 入力済みの印（このスマホのブラウザの中だけ。シートには書かない） ---- */
+  function store(key, value) {
+    try {
+      if (value === undefined) return JSON.parse(window.localStorage.getItem(key) || 'null');
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch (e) { /* 保存できなくても表示は続ける */ }
+    return null;
+  }
+  var marks = store(MARKS_KEY) || {};
+  function signature(r) {
+    return [r['状態'], r['作成時刻'] || ''].concat((r['買い目'] || []).map(function (b) {
+      return b['券種'] + ' ' + b['組番'] + ' ' + b['金額'];
+    })).join('|');
+  }
+  function syncMarks() {           /* 買い目が変わったレース・もう無いレースの印は消す */
+    if (!data || !data['レース']) return;
+    var keep = {};
+    data['レース'].forEach(function (r) {
+      var m = marks[r['レースID']], sig = signature(r);
+      keep[r['レースID']] = m && m.sig === sig ? m : { sig: sig, on: {} };
+    });
+    marks = keep;
+    store(MARKS_KEY, marks);
+  }
+  function countOn(r) {
+    var m = marks[r['レースID']] || { on: {} }, n = 0;
+    (r['買い目'] || []).forEach(function (_, i) { if (m.on[i]) n++; });
+    return n;
+  }
+
+  /* ---- 上の帯と警告（メニューを開いていても隠れない） ---- */
+  function pending() { return !!(data && (data['レース'] || []).some(function (r) { return !isDone(r); })); }
+  function renderTop() {
+    var cur = VIEWS.filter(function (v) { return v.id === view; })[0];
+    $('title').textContent = cur.name;
+    var alerts = [], fresh = '';
+    if (data) {
+      var min = minutesSince(data['更新']), t = new Date(data['更新']);
+      fresh = '更新 <b>' + (isNaN(t) ? '—' : hm(t)) + '</b><br>' + esc(ago(min));
+      if (loadError) alerts.push(['', '更新できていない（最後に読めたのは ' + (lastOk ? hm(lastOk) : '—') + '）。前の表示のままです。電波を確かめてください']);
+      if (min != null && min > STALE_MIN && pending()) {
+        alerts.push(['', '最終更新から ' + min + ' 分。' + STALE_MIN + ' 分を超えました：PC が止まっている可能性があります']);
+      }
+      (data['警告'] || []).forEach(function (w) { alerts.push(['', w]); });
+      if (data['見本']) alerts.push(['note', 'これは見本のデータです']);
+      if (data['ドライラン']) alerts.push(['note', 'ドライランのデータです（本番の自動実行ではありません）']);
+    } else if (loadError) {
+      alerts.push(['', 'データを読めていません：' + loadError]);
+    }
+    $('fresh').innerHTML = fresh;
+    $('alerts').innerHTML = alerts.map(function (a) { return '<div class="alert ' + a[0] + '">' + esc(a[1]) + '</div>'; }).join('');
+    var h = $('top').offsetHeight + 'px';
+    $('drawer').style.top = h;
+    $('shade').style.top = h;
+  }
+  function renderMenu() {
+    $('drawer').innerHTML = VIEWS.map(function (v) {
+      return '<button data-view="' + v.id + '"' + (v.id === view ? ' aria-current="page"' : '') + '>' + esc(v.name) +
+        '<small>' + esc(v.sub) + '</small></button>';
+    }).join('');
+  }
+  function setMenu(open) {
+    document.body.classList.toggle('open', open);
+    $('menuBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  /* ---- 当日の買い目 ---- */
+  function dayLine() {
+    if (!data || !data['日付']) return '';
+    var d = new Date(data['日付'] + 'T00:00:00+09:00'), n = now();
+    var same = n.getFullYear() + '-' + ('0' + (n.getMonth() + 1)).slice(-2) + '-' + ('0' + n.getDate()).slice(-2) === data['日付'];
+    var text = (d.getMonth() + 1) + '/' + d.getDate() + '（' + '日月火水木金土'.charAt(d.getDay()) + '）の重賞';
+    return '<p class="day">' + esc(text) + (same ? '' : '　※ 今日のデータではありません') + '</p>';
+  }
+  function badge(r) {
+    var mark = r['状態'] === '最終' ? '✓ ' : '';
+    return '<span class="badge ' + (STATE_CLASS[r['状態']] || '') + '">' + mark + esc(r['状態']) + '</span>';
+  }
+  function raceName(r) { return esc(r['場']) + esc(r['R']) + 'R ' + esc(r['レース名']); }
+  function todayCard(r) {
+    var done = isDone(r), cls = STATE_CLASS[r['状態']] || '', id = r['レースID'], bets = r['買い目'] || [];
+    var m = marks[id] || { on: {} }, on = countOn(r), html = '';
+    if (done && !opened[id]) {
+      var sum = bets.length ? '・' + r['点数'] + '点 ' + yen(r['合計']) + '円' : '';
+      return '<section class="card done"><button class="fold" data-fold="' + esc(id) + '" aria-expanded="false">' +
+        '<span class="tag">発走済み</span><span class="name">' + raceName(r) + '（' + esc(r['状態']) + sum + '）</span>' +
+        '<span class="chev">▼ 開く</span></button></section>';
+    }
+    html += '<section class="card ' + cls + (done ? ' done' : '') + '">';
+    if (done) {
+      html += '<button class="fold" data-fold="' + esc(id) + '" aria-expanded="true"><span class="tag">発走済み</span>' +
+        '<span class="name">タップでたたむ</span><span class="chev">▲</span></button>';
+    }
+    html += '<div class="head"><div class="race">' + raceName(r) + '</div><div class="meta">' + esc(r['グレード']) +
+      '・発走 <b>' + esc(r['発走時刻']) + '</b></div></div>';
+    html += '<div class="state">' + badge(r) + '<span class="desc">' + esc(r['説明']) + '</span></div>';
+    (r['警告'] || []).forEach(function (w) { html += '<div class="warn">' + esc(w) + '</div>'; });
+    if (bets.length) {
+      html += '<div class="bets">';
+      bets.forEach(function (b, i) {
+        var isOn = !!m.on[i];
+        html += '<button class="bet' + (isOn ? ' on' : '') + '" data-race="' + esc(id) + '" data-bet="' + i + '" aria-pressed="' + isOn + '">' +
+          '<span class="tick">✓</span><span class="kind">' + esc(b['券種']) + '</span><span class="combo">' + esc(b['組番']) + '</span>' +
+          '<span class="yen">' + yen(b['金額']) + '<small>円</small></span></button>';
+      });
+      html += '</div><div class="foot"><span class="total">合計 ' + esc(r['点数']) + '点　' + yen(r['合計']) + '円</span>' +
+        '<span class="count' + (on === bets.length ? ' all' : '') + '">' + (on === bets.length ? '✓ ' : '') + on + ' / ' + bets.length + ' 点 入力済み</span></div>';
+      if (r['予測の達成確率'] != null) {
+        html += '<div class="prob">予測の達成確率（5万円以上）' + pct(r['予測の達成確率']) + '</div>';
+      } else { html += '<div class="prob"></div>'; }
+    }
+    return html + '</section>';
+  }
+  function viewToday() {
+    var races = (data && data['レース']) || [];
+    if (!races.length) return dayLine() + '<p class="empty">重賞の買い目のデータはありません</p>';
+    return dayLine() + races.map(todayCard).join('') + '<p class="hint">行をタップすると入力済みの印が付きます（このスマホの中だけに保存。買い目が変わると印は消えます）</p>';
+  }
+
+  /* ---- くわしい情報 ---- */
+  function kv(k, v) { return '<div class="kv"><span>' + esc(k) + '</span><span>' + v + '</span></div>'; }
+  function announced(a) { a = String(a || ''); return a.length === 8 ? a.slice(4, 6) + ':' + a.slice(6) + ' 発表' : '発表時刻なし'; }
+  function viewDetail() {
+    var races = (data && data['レース']) || [];
+    if (!races.length) return '<p class="empty">重賞の買い目のデータはありません</p>';
+    return races.map(function (r) {
+      var html = '<h2>' + raceName(r) + '　' + esc(r['発走時刻']) + '</h2><div class="box">' + kv('状態', badge(r));
+      html += kv('作成', esc(r['作成時刻'] || '—'));
+      if (r['予備の作り方']) html += kv('予備の作り方', esc(r['予備の作り方']));
+      if (r['確率の出し方'] != null) {
+        html += kv('当日の傾向', (r['当日の傾向を使えた'] ? '<span class="tag ok">使えた</span> ' : '<span class="tag">使えていない</span> ') + esc(r['確率の出し方']));
+        html += kv('使ったレース', esc((r['使ったレース'] || []).join('・') || 'なし'));
+        html += kv('オッズ', esc(announced(r['オッズの発表'])) + (r['オッズの取得時刻'] ? '（' + esc(r['オッズの取得時刻']) + ' 取得）' : ''));
+        html += kv('予測の達成確率', pct(r['予測の達成確率']) + (r['付け替え後の達成確率'] != null ? '／付け替え後 ' + pct(r['付け替え後の達成確率']) : ''));
+        var heat = r['熱さ'] || {}, keys = Object.keys(heat).sort(function (a, b) { return b - a; });
+        if (keys.length) html += kv('熱さ（参考）', keys.map(function (k) { return (k / 10000) + '万円以上 ' + pct(heat[k]); }).join(' / '));
+        if (r['付け替えた点数']) html += kv('付け替え', esc(r['付け替えた点数']) + '点（合計・点数は同じ）');
+      }
+      html += '</div>';
+      if ((r['買い目'] || []).length) {
+        html += '<div class="box">';
+        r['買い目'].forEach(function (b) {
+          var parts = [];
+          if (b['推定配当'] != null) parts.push('推定配当 ' + yen(b['推定配当']) + '円');
+          if (b['本物のオッズ'] != null) parts.push('本物のオッズ ' + b['本物のオッズ'].toFixed(1) + '倍');
+          if (b['当たったときの払戻'] != null) parts.push('当たると ' + yen(b['当たったときの払戻']) + '円');
+          var tags = '';
+          if (b['付け替え']) tags += ' <span class="tag">付け替え：元 ' + yen(b['元の金額']) + '円</span>';
+          if (b['届く'] === false) tags += ' <span class="tag bad">5万円に届かない</span>';
+          html += '<div class="dbet"><div class="l1"><span><small>' + esc(b['券種']) + '</small>' + esc(b['組番']) + '</span><span>' + yen(b['金額']) + '円</span></div>' +
+            '<div class="l2">' + esc(parts.join('・')) + tags + '</div></div>';
+        });
+        html += '</div>';
+      }
+      var pv = r['仮の買い目'];
+      if (pv) {
+        html += '<div class="box"><div class="kv"><span>仮の買い目（' + esc(pv['作成時刻']) + '）</span><span>' + esc(pv['点数']) + '点 ' + yen(pv['合計']) + '円</span></div>';
+        (pv['買い目'] || []).forEach(function (b) {
+          html += '<div class="dbet"><div class="l1"><span><small>' + esc(b['券種']) + '</small>' + esc(b['組番']) + '</span><span>' + yen(b['金額']) + '円</span></div></div>';
+        });
+        html += '</div>';
+      }
+      return html;
+    }).join('');
+  }
+
+  /* ---- 成績 ---- */
+  function viewResults() {
+    var s = (data && data['成績']) || {}, total = s['通算'] || [], recent = s['最近の重賞'] || [];
+    var html = '<h2>通算（熱い当たり＝払戻 5万円以上）</h2><div class="box">';
+    if (!total.length) html += '<p class="empty">まだ記録がありません</p>';
+    total.forEach(function (x) {
+      html += '<div class="stat"><span class="n">' + esc(x['名前']) + '</span><span class="big">' + esc(x['熱い当たり']) + ' / ' + esc(x['レース数']) + '</span>' +
+        '<span class="sub">達成率 ' + pct(x['達成率']) + (x['下限'] != null ? '（' + pct(x['下限']) + '〜' + pct(x['上限']) + '）' : '') +
+        '・予測の平均 ' + pct(x['予測の平均']) + '</span></div>';
+    });
+    html += '</div><h2>最近の重賞（本番）</h2><div class="box">';
+    if (!recent.length) html += '<p class="empty">まだ照合した重賞がありません</p>';
+    recent.forEach(function (x) {
+      var cls = x['結果'] === '熱い' ? 'ok' : (x['結果'] === '外れ' ? 'mid' : '');
+      html += '<div class="res"><span class="when">' + esc(String(x['日付']).slice(5).replace('-', '/')) + '　' + esc(x['グレード'] || '') + '</span>' +
+        '<span>' + esc(x['レース']) + ' <span class="tag ' + cls + '">' + (x['結果'] === '熱い' ? '✓ ' : '') + esc(x['結果']) + '</span></span>' +
+        '<span class="pay">' + yen(x['払戻']) + '円</span></div>';
+    });
+    html += '</div>';
+    var t = s['更新'] ? new Date(s['更新']) : null;
+    if (t && !isNaN(t)) html += '<p class="hint">成績の更新：' + (t.getMonth() + 1) + '/' + t.getDate() + ' ' + hm(t) + '（月曜の score・practice のあと）</p>';
+    return html;
+  }
+
+  /* ---- 仕組みの状態 ---- */
+  function viewSystem() {
+    if (!data) return '<p class="empty">データを読めていません</p>';
+    var t = new Date(data['更新']), min = minutesSince(data['更新']);
+    var html = '<h2>更新</h2><div class="box">' +
+      kv('最終更新', isNaN(t) ? '—' : (t.getMonth() + 1) + '/' + t.getDate() + ' ' + hm(t)) +
+      kv('最終更新から', min == null ? '—' : min + ' 分' + (min > STALE_MIN && pending() ? ' <span class="tag bad">' + STALE_MIN + '分を超えた</span>' : '')) +
+      kv('この画面が読んだ時刻', lastOk ? hm(lastOk) : '—') +
+      kv('この画面の読み直し', isPreview ? '見本（読み直さない）' : (loadError ? '<span class="tag bad">失敗している</span>' : '30 秒ごと')) +
+      '</div><h2>設定</h2><div class="box">' +
+      kv('最初の金額の余裕 k', data['k'] != null ? Number(data['k']).toFixed(1) : '—') +
+      kv('付け替えの目標 m', data['m'] != null ? Number(data['m']).toFixed(2) : '—') +
+      kv('データの日付', esc(data['日付'] || '—')) +
+      '</div><h2>時計・ネット</h2><div class="box">' +
+      kv('PC の時計のずれ', data['時計のずれ（分）'] == null ? '分からない（ネットの時刻なし）' : esc(data['時計のずれ（分）']) + ' 分');
+    var w = data['警告'] || [], g = data['止まっていた可能性'] || [];
+    html += kv('警告', w.length ? '<span class="tag bad">' + w.length + ' 件</span>' : '<span class="tag ok">なし</span>');
+    w.forEach(function (x) { html += '<div class="warn" style="margin:6px 0">' + esc(x) + '</div>'; });
+    html += kv('PC が止まっていた可能性', g.length ? esc(g.join('、')) : 'なし') + '</div>';
+    return html;
+  }
+
+  function render() {
+    renderTop();
+    renderMenu();
+    var f = { today: viewToday, detail: viewDetail, results: viewResults, system: viewSystem }[view];
+    if (data) $('main').innerHTML = f();
+    else if (loadError) $('main').innerHTML = '<p class="empty">データを読めていません。少し待つと読み直します</p>';
+    renderTop();                     /* 中身で高さが変わったあとの位置合わせ */
+  }
+
+  /* ---- データを読む（30 秒ごと。失敗したら前の表示を残す） ---- */
+  function accept(text) {
+    var d = typeof text === 'string' ? JSON.parse(text) : text;
+    if (!d || typeof d !== 'object' || !d['更新']) throw new Error('データの形が違います');
+    data = d; lastOk = new Date(); loadError = '';
+    syncMarks();
+  }
+  function load() {
+    if (isPreview) {
+      if (!data) { try { accept(window.PREVIEW_DATA); } catch (e) { loadError = e.message; } }
+      render();
+      return;
+    }
+    if (!(window.google && google.script && google.script.run)) { loadError = 'Apps Script につながっていません'; render(); return; }
+    google.script.run
+      .withSuccessHandler(function (text) {
+        try {
+          if (!text) throw new Error('タブ app_data がまだありません（PC で update か sheet を1回動かしてください）');
+          accept(text);
+        } catch (e) { loadError = e.message || String(e); }
+        render();
+      })
+      .withFailureHandler(function (e) { loadError = (e && e.message) || '読み込みに失敗'; render(); })
+      .getAppData();
+  }
+
+  $('menuBtn').addEventListener('click', function () { setMenu(!document.body.classList.contains('open')); });
+  $('shade').addEventListener('click', function () { setMenu(false); });
+  $('drawer').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-view]');
+    if (!b) return;
+    view = b.getAttribute('data-view');
+    setMenu(false);
+    render();
+    window.scrollTo(0, 0);
+  });
+  $('main').addEventListener('click', function (e) {
+    var fold = e.target.closest('button[data-fold]'), bet = e.target.closest('button[data-bet]');
+    if (fold) { var id = fold.getAttribute('data-fold'); opened[id] = !opened[id]; render(); return; }
+    if (!bet) return;
+    var rid = bet.getAttribute('data-race'), i = bet.getAttribute('data-bet');
+    var m = marks[rid] || (marks[rid] = { sig: '', on: {} });
+    if (m.on[i]) delete m.on[i]; else m.on[i] = true;
+    store(MARKS_KEY, marks);
+    render();
+  });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
+  window.addEventListener('resize', renderTop);
+  load();
+  window.setInterval(load, RELOAD_MS);
+})();
+</script>
+</body>
+</html>

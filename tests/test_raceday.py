@@ -603,8 +603,9 @@ def test_sheet_command_rewrites_from_saved(root, monkeypatch):
     got = {}
     monkeypatch.setattr(raceday, "write_sheet", lambda p, replay=False, **k: got.setdefault("p", p) and raceday.SHEET_TITLE)
     monkeypatch.setattr(raceday, "write_mobile", lambda p, replay=False, **k: got.setdefault("m", k) and raceday.MOBILE_SHEET_TITLE)
+    monkeypatch.setattr(raceday, "write_app", lambda p, **k: got.setdefault("a", p) and raceday.APP_SHEET_TITLE)
     assert raceday.main(["sheet", "--date", DATE]) == 0
-    assert got["p"]["日付"] == DATE
+    assert got["p"]["日付"] == DATE and got["a"]["日付"] == DATE
     assert got["m"]["force"] and not got["m"]["collapse"]                    # 過去の日：全部書き直す・たたまない
     assert (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8") == before   # 作り直さない
 
@@ -1489,3 +1490,116 @@ def test_results_tab(root):
     ws = _FakeWS()
     assert raceday.write_results(ws=ws) == raceday.RESULTS_SHEET_TITLE
     assert ws.cells[(3, 0)] == "F 本番（重賞）" and max(c for (r, c) in ws.cells) < 3
+
+
+# ---------------------------------------------------------------------------
+# v17：ウェブアプリ（Apps Script）の画面用データ「app_data」と、PC で見る見本の HTML
+# ---------------------------------------------------------------------------
+class _AppWS:
+    def __init__(self):
+        self.calls = []
+
+    def update(self, values, range_name, value_input_option):
+        self.calls.append((values, range_name, value_input_option))
+
+
+def test_app_data_shape_and_text_combos(root):
+    import json
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 14, 50))       # 仮
+    raceday.run_once(prep, FakeSource(_snap(seed=5)), datetime(2026, 11, 1, 15, 20))  # 最終
+    clock = raceday.Clock(datetime(2026, 11, 1, 15, 21), datetime(2026, 11, 1, 15, 21), 0.2, ["PC の時計が 3 分ずれている"])
+    data = raceday.build_app_data(prep, clock=clock)
+    assert {"版", "日付", "更新", "k", "m", "警告", "止まっていた可能性", "レース", "成績"} <= set(data)
+    assert data["日付"] == "2026-11-01" and data["更新"] == "2026-11-01T15:21:00+09:00" and (data["k"], data["m"]) == (1.4, 1.0)
+    assert data["警告"] == ["PC の時計が 3 分ずれている"]
+    r = data["レース"][0]
+    need = {"レースID", "場", "R", "レース名", "グレード", "発走", "発走時刻", "状態", "説明", "作成時刻", "警告", "買い目", "点数", "合計",
+            "予測の達成確率", "当日の傾向を使えた", "発走済み", "使ったレース", "オッズの発表", "熱さ", "仮の買い目"}
+    assert need <= set(r), need - set(r)
+    final = raceday.read_json(raceday.day_dir(DATE) / "202605040511" / "final.json")
+    assert r["状態"] == "最終" and r["発走"] == "2026-11-01T15:40:00+09:00" and r["作成時刻"] == "15:20" and not r["発走済み"]
+    assert [(b["券種"], b["組番"], b["金額"]) for b in r["買い目"]] == [(b["券種"], raceday.bet_text(b), b["金額"]) for b in final["買い目"]]
+    assert all(isinstance(b["組番"], str) and isinstance(b["付け替え"], bool) for b in r["買い目"])
+    assert any("→" in b["組番"] for b in r["買い目"]) or all(b["券種"] in ("馬連", "3連複") for b in r["買い目"])
+    assert (r["点数"], r["合計"]) == (final["点数"], final["合計"])
+    # シートには RAW で1回だけ。つなぐと元の JSON に戻る（組番は文字のまま）
+    ws = _AppWS()
+    assert raceday.write_app_data(data, ws=ws) == raceday.APP_SHEET_TITLE
+    assert len(ws.calls) == 1 and ws.calls[0][2] == "RAW" and ws.calls[0][1] == f"A1:A{raceday.APP_ROWS}"
+    back = json.loads("".join(row[0] for row in ws.calls[0][0]))
+    assert back["レース"][0]["買い目"] == r["買い目"]
+    assert raceday.read_json(raceday._app_data_path())["日付"] == "2026-11-01"
+    # 発走後・状態の名前
+    assert raceday.build_app_data(prep, now=datetime(2026, 11, 1, 15, 41))["レース"][0]["発走済み"]
+    states = {x["状態"] for x in raceday.sample_app_data(datetime(2026, 11, 1, 12, 0))["レース"]}
+    assert states == {"最終", "仮", "途中", "予備", "最終を作れていない", "オッズ待ち"}
+
+
+def test_app_data_is_split_under_cell_limit(root, monkeypatch):
+    import json
+    monkeypatch.setattr(raceday, "APP_CHUNK", 500)
+    data = raceday.sample_app_data(datetime(2026, 11, 1, 12, 0))
+    ws = _AppWS()
+    raceday.write_app_data(data, ws=ws)
+    values = ws.calls[0][0]
+    assert len(ws.calls) == 1 and all(len(row[0]) <= 500 for row in values) and len([v for v in values if v[0]]) > 5
+    assert json.loads("".join(row[0] for row in values))["レース"] == raceday._jsonable(data)["レース"]
+    assert raceday.APP_CHUNK < 50_000
+
+
+def test_update_writes_other_tabs_even_if_app_data_fails(root, monkeypatch, capsys):
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    monkeypatch.setattr(raceday, "LiveSource", lambda d, data=None: FakeSource(_snap()))
+    wrote = []
+    monkeypatch.setattr(raceday, "write_sheet", lambda p, **k: wrote.append("sheet") or raceday.SHEET_TITLE)
+    monkeypatch.setattr(raceday, "write_mobile", lambda p, **k: wrote.append("mobile") or raceday.MOBILE_SHEET_TITLE)
+
+    def boom(*a, **k):
+        raise RuntimeError("app_data に書けない")
+    monkeypatch.setattr(raceday, "write_app", boom)
+    assert raceday.main(["update", "--date", DATE, "--now", "1520", "--no-drift"]) == 0
+    out = capsys.readouterr().out
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").exists() and wrote == ["sheet", "mobile"]
+    assert "画面用のデータを書けませんでした（保存した買い目・他のタブは残っています）" in out
+
+
+def test_refresh_app_results_keeps_races(root):
+    prep = _prep()
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))
+    raceday.write_app(prep, now=datetime(2026, 11, 1, 15, 21), ws=_AppWS())
+    pd.DataFrame([{"買い方": "F（券種混合）", "レース数": 3, "熱い当たり": 1, "達成率": 1 / 3, "予測の達成確率（平均）": 0.2}]) \
+        .to_csv(raceday.raceday_dir() / "score_summary.csv", index=False, encoding="utf-8-sig")
+    ws = _AppWS()
+    raceday.refresh_app_results(ws=ws, now=datetime(2026, 11, 2, 10, 0))
+    data = raceday.read_json(raceday._app_data_path())
+    assert data["更新"] == "2026-11-01T15:21:00+09:00" and len(data["レース"]) == 1          # レースの分はそのまま
+    assert data["成績"]["通算"][0]["名前"] == "F 本番（重賞）" and data["成績"]["通算"][0]["熱い当たり"] == 1 and len(ws.calls) == 1
+
+
+def test_app_preview_html(root, capsys):
+    import json
+    out = root / "preview.html"
+    assert raceday.main(["app-preview", "--out", str(out)]) == 0                       # 見本
+    html = out.read_text(encoding="utf-8")
+    assert "window.PREVIEW_DATA = {" in html and raceday.APP_PREVIEW_MARK not in html and "getAppData" in html
+    blob = html.split("window.PREVIEW_DATA = ", 1)[1].split(";</script>", 1)[0]
+    assert {x["状態"] for x in json.loads(blob.replace("<\\/", "</"))["レース"]} >= {"最終", "仮", "途中", "予備"}
+    # 過去の日の保存した買い目から
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))
+    before = (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8")
+    assert raceday.main(["app-preview", "--date", DATE, "--now", "1525", "--out", str(out)]) == 0
+    d = json.loads(out.read_text(encoding="utf-8").split("window.PREVIEW_DATA = ", 1)[1].split(";</script>", 1)[0].replace("<\\/", "</"))
+    assert d["レース"][0]["状態"] == "最終" and d["プレビューの今"] == "2026-11-01T15:26:00+09:00"
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").read_text(encoding="utf-8") == before
+
+
+def test_apps_script_files_have_no_ids():
+    base = Path(__file__).resolve().parents[1] / "apps_script"
+    code, html = (base / "Code.gs").read_text(encoding="utf-8"), (base / "index.html").read_text(encoding="utf-8")
+    assert "getActiveSpreadsheet()" in code and "openById" not in code and "docs.google.com" not in code + html
+    assert "script.google.com" not in code + html and raceday.APP_SHEET_TITLE in code
+    assert html.count(raceday.APP_PREVIEW_MARK) == 1 and "prefers-color-scheme: dark" in html

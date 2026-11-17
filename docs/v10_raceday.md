@@ -377,3 +377,13 @@ fetch → fetch-odds → results --sheet → raceday score --sheet → raceday d
   - 過去の日は、その日の終わりの状態で、発走後もたたまずに見せる。`--now 1520` でその時刻の状態に。`--mobile-only` でスマホ用タブだけ
   - ドライランの分は `--replay`（タブ「スマホ（再現）」）。`replay --sheet` でも書く
 - 見本：`py -m src.raceday sheet --sample` → タブ「スマホ（見本）」に、最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み（たたむ）を1つずつ
+
+## v17（11/17）：スマホ用のウェブアプリ画面（Google Apps Script）
+
+くわしくは `docs/v17_webapp.md`（仕組み・画面・PC で見る見本・設定の手順）。
+
+- タブ「app_data」に画面用のデータ（JSON）を書く：`update` の各回・`sheet --date`・`score --sheet`・`practice --sheet`。シートへの書き込みは1回
+- `apps_script\Code.gs`・`apps_script\index.html` をシートの Apps Script に貼り付けて、ウェブアプリ（実行：自分／アクセス：自分のみ）としてデプロイ
+- PC で見る見本：`py -m src.raceday app-preview [--date 20261115 --now 1520] --open`
+- 「スマホ」タブの色：濃い塗りつぶしをやめ、薄い背景＋濃い文字に（最終は「✓ 最終 …」と印も付く）。
+  「最終更新から ○分」が 15 分を超えたときの色も薄い赤に（日付が変わった最初の回か `sheet --date`・`sheet --sample` で、前の濃い赤の書式を消して付け直す）

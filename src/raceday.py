@@ -979,9 +979,12 @@ MOBILE_BLOCK = 24                   # 1レースの枠（題・状態・警告3�
 MOBILE_WARN_MAX = 3
 MOBILE_WIDTHS = (34, 214, 86)       # 列の幅（ピクセル）。合計 334：スマホの縦の画面に収まる
 MOBILE_FONT = {"title": 13, "state": 18, "warn": 13, "bet": 16, "total": 15, "prob": 11, "top": 14, "help": 10}
-MOBILE_COLORS = {"最終": (0.20, 0.66, 0.33), "仮": (1.00, 0.85, 0.20), "途中": (0.75, 0.75, 0.75),
-                 "待ち": (0.75, 0.75, 0.75), "予備": (1.00, 0.55, 0.10), "なし": (0.86, 0.15, 0.15)}
-_WHITE_TEXT = {"最終", "なし"}
+# v17：広い面を濃い色で塗らない。薄い背景＋濃い文字（背景, 文字）。色だけに頼らず、状態は必ず言葉でも書いてある
+MOBILE_COLORS = {"最終": ((0.86, 0.94, 0.88), (0.09, 0.28, 0.18)), "仮": ((0.99, 0.95, 0.80), (0.42, 0.32, 0.00)),
+                 "途中": ((0.92, 0.93, 0.92), (0.27, 0.32, 0.29)), "待ち": ((0.92, 0.93, 0.92), (0.27, 0.32, 0.29)),
+                 "予備": ((0.99, 0.90, 0.82), (0.48, 0.24, 0.03)), "なし": ((0.98, 0.91, 0.90), (0.55, 0.11, 0.09))}
+MOBILE_WARN_COLORS = ((0.98, 0.91, 0.90), (0.55, 0.11, 0.09))
+MOBILE_MARK = {"最終": "✓ "}
 _WEEKDAYS = "月火水木金土日"
 
 
@@ -1056,7 +1059,7 @@ def mobile_views(prep: dict, replay: bool, now: datetime, warnings=()) -> list[d
 
 def _block_lines(v: dict) -> list[tuple[str, list]]:
     """枠の中の行：(種類, [A, B, C])。merge する行は A に文字を置く。"""
-    lines = [("title", [v["題"], "", ""]), ("state", [v["状態"], "", ""])]
+    lines = [("title", [v["題"], "", ""]), ("state", [MOBILE_MARK.get(v["種類"], "") + v["状態"], "", ""])]
     lines += [("warn", ["!! " + w, "", ""]) for w in v["警告"]]
     lines += [("bet", [False, sheet_text(t), a]) for t, a in v["買い目"]]
     if v["合計"]:
@@ -1171,13 +1174,12 @@ def mobile_layout(views: list[dict], ws_id: int, date: str, now: datetime, writt
             elif kind == "state":
                 c = MOBILE_COLORS[v["種類"]]
                 merge(r)
-                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["state"], True, (1, 1, 1) if v["種類"] in _WHITE_TEXT else (0, 0, 0)),
-                                     "backgroundColor": _rgb(c)}, base_fields)
+                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["state"], True, c[1]), "backgroundColor": _rgb(c[0])}, base_fields)
                 height(r, r + 1, _text_height(row[0], MOBILE_FONT["state"], width))
             elif kind == "warn":
                 merge(r)
-                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["warn"], True, (0.85, 0.0, 0.0)),
-                                     "backgroundColor": _rgb((1.0, 0.92, 0.92))}, base_fields)
+                fmt(r, r + 1, 0, 3, {**text_fmt(MOBILE_FONT["warn"], True, MOBILE_WARN_COLORS[1]),
+                                     "backgroundColor": _rgb(MOBILE_WARN_COLORS[0])}, base_fields)
                 height(r, r + 1, _text_height(row[0], MOBILE_FONT["warn"], width))
             elif kind == "bet":
                 bet_rows.append(r)
@@ -1235,9 +1237,9 @@ def write_mobile(prep: dict | None, replay: bool = False, clock: Clock | None = 
                                            "【ドライラン】" if replay else ("【見本】" if title == MOBILE_SAMPLE_SHEET_TITLE else ""))
     if reset:                                                # 日付が変わった最初の回だけ：赤の書式があるかを1回読む
         rule = f"=$C$2>{STALE_SHEET_MIN}"
-        try:
-            if not sheets.has_rule(ws, rule):
-                req.append(sheets.red_rule_request(ws, "A2:C2", rule))
+        try:                                                 # v17：前の濃い赤の書式は消して、薄い赤＋濃い赤の文字に
+            req += [{"deleteConditionalFormatRule": {"sheetId": ws.id, "index": 0}}] * sheets.rule_count(ws)
+            req.append(sheets.red_rule_request(ws, "A2:C2", rule, MOBILE_WARN_COLORS[0], MOBILE_WARN_COLORS[1]))
         except Exception:
             pass                                             # 色付けに失敗しても、文字の警告は出ている
     sheets.apply_format(ws, req)
@@ -1249,14 +1251,22 @@ def write_mobile(prep: dict | None, replay: bool = False, clock: Clock | None = 
 
 
 def _sample_plan(spec, created: str, stage: str, prob: float, short: int = 0, checked: bool = True) -> dict:
-    bets_ = [{"券種": k, "組番": c, "馬番": [int(x) for x in c.replace("→", "-").split("-")], "金額": a} for k, c, a in spec]
+    bets_ = []
+    for i, (k, c, a) in enumerate(spec):
+        odds_ = round(TARGET / a * (0.8 if i < short else 1.15 + 0.07 * i), 1)
+        moved = i in (2, 3) and not short
+        bets_.append({"券種": k, "組番": c, "馬番": [int(x) for x in c.replace("→", "-").split("-")], "金額": a,
+                      "元の金額": a + (400 if i == 2 else -400) if moved else a, "推定配当": round(odds_ * 100 * 0.95, -1),
+                      "本物のオッズ": odds_, "当たったときの払戻": round(odds_ * a, -1), "届く": odds_ * a >= TARGET})
     return {"買い目": bets_, "点数": len(bets_), "合計": sum(b["金額"] for b in bets_), "予測の達成確率": prob,
-            "熱さ": {str(int(TARGET)): prob}, "作成時刻": created, "段階": stage, "本物のオッズで確かめた": checked,
-            "届かない買い目": short, "足りない額の合計": 1_300 * short}
+            "熱さ": {str(int(TARGET)): prob + 0.004, "40000": prob + 0.03, "30000": prob + 0.07}, "作成時刻": created, "段階": stage,
+            "本物のオッズで確かめた": checked, "届かない買い目": short, "足りない額の合計": 1_300 * short,
+            "確率の出し方": "当日の傾向を使った", "使ったレース": ["3R", "5R", "7R"], "オッズの発表": created[5:7] + created[8:10] + created[11:13] + created[14:16],
+            "オッズの取得時刻": created, "オッズの出どころ": "速報（JV-Link）", "付け替え": {"点数": 0 if short else 2, "回した金額": 400}}
 
 
-def sample_views(date: str, now: datetime) -> list[dict]:
-    """見本：最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み（たたむ）を1つずつ。"""
+def _sample_races(date: str, now: datetime) -> list[tuple]:
+    """見本：最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み（たたむ）を1つずつ。(レース, 段階ごとの買い目, 予備, 警告)"""
     d = f"{date[:4]}-{date[4:6]}-{date[6:]}"
     spec = [("馬連", "2-12", 1_500), ("馬単", "12→2", 900), ("3連複", "1-7-13", 3_500), ("3連複", "2-8-10", 2_600),
             ("3連単", "3→8→2", 300), ("3連単", "10→11→12", 200)]
@@ -1279,7 +1289,11 @@ def sample_views(date: str, now: datetime) -> list[dict]:
                   ["（見本）インターネットの時刻が取れません。PC の時計を信じて続けています"]))
     races.append((race(6, "まだ買い目なしの例", t(150)), {}, None, []))
     races.append((race(7, "発走済み（たたむ）の例", t(-30)), {"final": fin, "latest": fin}, None, []))
-    views = [mobile_view(r, date, {s: st.get(s) for s in STAGES}, bk, now, w) for r, st, bk, w in races]
+    return races
+
+
+def sample_views(date: str, now: datetime) -> list[dict]:
+    views = [mobile_view(r, date, {s: st.get(s) for s in STAGES}, bk, now, w) for r, st, bk, w in _sample_races(date, now)]
     return sorted(views, key=lambda v: (v["発走"], v["レースID"]))
 
 
@@ -1373,6 +1387,217 @@ def write_results(ws=None, now: datetime | None = None) -> str:
     except Exception:
         pass                                                 # 書式に失敗しても中身は書けている
     return RESULTS_SHEET_TITLE
+
+
+# ---------------------------------------------------------------------------
+# v17 スマホ用のウェブアプリ（Google Apps Script）の画面用データ：タブ「app_data」に JSON で書く
+#
+# - PC はシートに書くだけ。Apps Script（apps_script/Code.gs）がこのタブを読み、apps_script/index.html が表示する
+# - 当日の計算・保存する JSON には触らない（保存した JSON を読むだけ）。書けなくても、買い目の保存・他のタブには影響しない
+# - シートへの書き込みは1回（A1:A20 に、4万字ずつに分けた JSON。RAW で文字のまま）
+# ---------------------------------------------------------------------------
+APP_SHEET_TITLE = "app_data"
+APP_CHUNK = 40_000                  # 1つのセルの上限（5万字）より小さく分ける
+APP_ROWS = 20
+APP_VERSION = 1
+APP_HTML = Path(__file__).resolve().parents[1] / "apps_script" / "index.html"
+APP_PREVIEW_MARK = "<!--PREVIEW_DATA-->"
+
+
+def _iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
+
+
+def _num(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+def app_race(race: dict, date: str, st: dict, backup: dict | None, now: datetime) -> dict:
+    """1レース分の画面用データ。状態の決め方はスマホ用タブ（mobile_view）と同じ。"""
+    v = mobile_view(race, date, st, backup, now, [])
+    rid = race["レースID"]
+    post = v["発走"]
+    cur = st.get("final") or st.get("latest")
+    plan = cur or ((backup or {}).get("買い目") if v["種類"] == "予備" else None)
+    state = {"最終": "最終", "仮": "仮", "途中": "途中", "予備": "予備", "待ち": "オッズ待ち",
+             "なし": "最終を作れていない" if cur else "買い目なし"}[v["種類"]]
+    out = {"レースID": rid, "場": race.get("競馬場名", ""), "R": int(rid[-2:]), "レース名": race.get("競走名", ""),
+           "グレード": race.get("グレード", ""), "発走": _iso(post), "発走時刻": f"{post:%H:%M}",
+           "最終の予定": f"{post - timedelta(minutes=FINAL_BEFORE):%H:%M}", "状態": state, "説明": v["状態"],
+           "発走済み": bool(v["済"]), "警告": list(v["警告"]), "買い目": [], "点数": None, "合計": None,
+           "作成時刻": None, "予測の達成確率": None}
+    if plan:
+        heat = plan.get("熱さ") or {}
+        out.update({
+            "買い目": [{"券種": b["券種"], "組番": bet_text(b), "金額": int(b["金額"]),
+                       "元の金額": int(b.get("元の金額", b["金額"])),
+                       "付け替え": int(b.get("元の金額", b["金額"])) != int(b["金額"]),
+                       "推定配当": _num(b.get("推定配当")), "本物のオッズ": _num(b.get("本物のオッズ")),
+                       "当たったときの払戻": _num(b.get("当たったときの払戻")), "届く": b.get("届く")} for b in plan["買い目"]],
+            "点数": int(plan["点数"]), "合計": int(plan["合計"]), "作成時刻": (plan.get("作成時刻") or "")[11:16] or None,
+            "予測の達成確率": _num(plan.get("予測の達成確率")),
+            "付け替え後の達成確率": _num(heat.get(int(TARGET), heat.get(str(int(TARGET))))),
+            "当日の傾向を使えた": plan.get("確率の出し方") == "当日の傾向を使った", "確率の出し方": plan.get("確率の出し方", ""),
+            "使ったレース": list(plan.get("使ったレース") or []), "オッズの発表": plan.get("オッズの発表") or "",
+            "オッズの取得時刻": (plan.get("オッズの取得時刻") or "")[11:19], "オッズの出どころ": plan.get("オッズの出どころ", ""),
+            "熱さ": {str(k): _num(x) for k, x in heat.items()}, "付け替えた点数": int((plan.get("付け替え") or {}).get("点数") or 0)})
+    elif v["種類"] == "予備" and backup and backup.get("BOX"):
+        out.update({"買い目": [{"券種": "3連単", "組番": v["買い目"][0][0].replace("3連単 ", ""), "金額": 12_000,
+                              "元の金額": 12_000, "付け替え": False}], "点数": 120, "合計": 12_000})
+    if v["種類"] == "予備" and backup:
+        out["予備の作り方"] = backup.get("作り方", "")
+        out["作成時刻"] = (backup.get("作成") or "")[5:16] or out["作成時刻"]
+    pv = st.get("provisional")
+    if pv and cur and pv.get("作成時刻") != cur.get("作成時刻"):
+        out["仮の買い目"] = {"作成時刻": pv["作成時刻"][11:16], "点数": pv["点数"], "合計": pv["合計"],
+                           "買い目": [{"券種": b["券種"], "組番": bet_text(b), "金額": int(b["金額"])} for b in pv["買い目"]]}
+    return out
+
+
+def results_data(now: datetime | None = None, recent: int = 6) -> dict:
+    """成績（保存した score_summary.csv・score_races.csv・practice/summary.csv から。ドライランの分は入れない）。"""
+    def load(p):
+        try:
+            return pd.read_csv(p, encoding="utf-8-sig", dtype={"レースID": str}) if p.exists() else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+    ss, sr, pr = load(raceday_dir() / "score_summary.csv"), load(raceday_dir() / "score_races.csv"), load(practice_dir() / "summary.csv")
+    total = []
+
+    def add(name, x, rate, pred):
+        total.append({"名前": name, "レース数": int(x["レース数"]), "熱い当たり": int(x["熱い当たり"]), "達成率": _num(x.get(rate)),
+                      "下限": _num(x.get("下限")), "上限": _num(x.get("上限")), "予測の平均": _num(x.get(pred))})
+    for _, x in ss.iterrows():
+        name = str(x.get("買い方", ""))
+        if name.startswith("【") or name.startswith("（参考）"):
+            continue
+        add("F 本番（重賞）" if name.startswith("F") else ("6頭BOX（同じレース）" if "6頭BOX" in name else name), x,
+            "達成率", "予測の達成確率（平均）")
+    for _, x in pr.iterrows():
+        add("練習 平場" if x["区分"] == "平場" else "練習 重賞（参考）", x, "熱い当たりの割合", "予測の達成確率（平均）")
+    races = []
+    if not sr.empty and "照合" in sr.columns:
+        live = sr.loc[(sr["照合"] == "済") & (sr.get("区分", "本番（自動実行）") != REPLAY_LABEL)]
+        for _, x in live.sort_values(["日付", "レースID"], ascending=False).head(recent).iterrows():
+            hot = str(x.get("熱い")).lower() in ("true", "1", "1.0")
+            hit = str(x.get("的中")).lower() in ("true", "1", "1.0")
+            races.append({"日付": str(x["日付"]), "レース": str(x["レース"]), "グレード": str(x.get("グレード", "") or ""),
+                          "結果": "熱い" if hot else ("当たり（5万円に届かず）" if hit else "外れ"),
+                          "払戻": int(round(_num(x.get("払戻")) or 0)), "投資": int(round(_num(x.get("投資")) or 0))})
+    return {"更新": _iso(now or datetime.now()), "通算": total, "最近の重賞": races}
+
+
+def build_app_data(prep: dict, replay: bool = False, clock: Clock | None = None, now: datetime | None = None) -> dict:
+    date = prep["日付"]
+    ddir = day_dir(date, replay)
+    now = now or (clock.now if clock else datetime.now())
+    k, m = plan_settings(prep.get("係数", {}))
+    races = []
+    for r in prep["レース"]:
+        rid = r["レースID"]
+        st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
+        races.append(app_race(r, date, st, read_json(ddir / rid / "backup.json"), now))
+    races.sort(key=lambda x: (x["発走"], x["レースID"]))
+    gaps = read_json(ddir / "gaps.json") or []
+    return {"版": APP_VERSION, "日付": f"{date[:4]}-{date[4:6]}-{date[6:]}", "更新": _iso(now), "k": k, "m": m,
+            "ドライラン": bool(replay), "警告": list(clock.warnings) if clock else [],
+            "止まっていた可能性": [f"{g['から']}〜{g['まで']}" for g in gaps],
+            "時計のずれ（分）": None if not clock or clock.offset_min is None else round(clock.offset_min, 2),
+            "レース": races, "成績": results_data(now)}
+
+
+def _app_data_path() -> Path:
+    return raceday_dir() / "app_data.json"
+
+
+def write_app_data(data: dict, ws=None, save: bool = True) -> str:
+    """画面用データをタブ「app_data」に書く（シートへの書き込みは1回）。手元にも app_data.json として残す。"""
+    from . import sheets
+    text = json.dumps(_jsonable(data), ensure_ascii=False, separators=(",", ":"))
+    chunks = [text[i:i + APP_CHUNK] for i in range(0, len(text), APP_CHUNK)]
+    rows = max(APP_ROWS, len(chunks))
+    if save:
+        write_json(_app_data_path(), data)
+    if ws is None:
+        ws = sheets.open_or_add_worksheet(sheets.load_settings(), APP_SHEET_TITLE, rows=rows, cols=1)
+    ws.update(values=[[c] for c in chunks] + [[""]] * (rows - len(chunks)), range_name=f"A1:A{rows}", value_input_option="RAW")
+    return APP_SHEET_TITLE
+
+
+def write_app(prep: dict, replay: bool = False, clock: Clock | None = None, now: datetime | None = None, ws=None) -> str:
+    return write_app_data(build_app_data(prep, replay, clock, now), ws=ws)
+
+
+def refresh_app_results(ws=None, now: datetime | None = None) -> str:
+    """score --sheet・practice --sheet のあと：手元の画面用データの成績だけを新しくして書き直す（レースの分はそのまま）。"""
+    now = now or datetime.now()
+    data = read_json(_app_data_path()) or {"版": APP_VERSION, "日付": f"{now:%Y-%m-%d}", "更新": _iso(now), "k": MARGIN, "m": 1.0,
+                                           "ドライラン": False, "警告": [], "止まっていた可能性": [], "レース": []}
+    data["成績"] = results_data(now)
+    return write_app_data(data, ws=ws)
+
+
+def _sample_results(now: datetime) -> dict:
+    d = lambda n: f"{now - timedelta(days=n):%Y-%m-%d}"       # noqa: E731
+    return {"更新": _iso(now), "通算": [
+        {"名前": "F 本番（重賞）", "レース数": 14, "熱い当たり": 2, "達成率": 2 / 14, "下限": 0.040, "上限": 0.399, "予測の平均": 0.183},
+        {"名前": "6頭BOX（同じレース）", "レース数": 14, "熱い当たり": 1, "達成率": 1 / 14, "下限": 0.013, "上限": 0.315, "予測の平均": None},
+        {"名前": "練習 平場", "レース数": 212, "熱い当たり": 27, "達成率": 27 / 212, "下限": 0.089, "上限": 0.179, "予測の平均": 0.171},
+        {"名前": "練習 重賞（参考）", "レース数": 9, "熱い当たり": 1, "達成率": 1 / 9, "下限": 0.020, "上限": 0.435, "予測の平均": 0.190}],
+        "最近の重賞": [
+        {"日付": d(1), "レース": "東京11R （見本）A記念", "グレード": "G1", "結果": "外れ", "払戻": 0, "投資": 12_000},
+        {"日付": d(2), "レース": "京都11R （見本）Bステークス", "グレード": "G2", "結果": "熱い", "払戻": 64_300, "投資": 12_000},
+        {"日付": d(8), "レース": "福島11R （見本）C賞", "グレード": "G3", "結果": "当たり（5万円に届かず）", "払戻": 21_800, "投資": 11_900}]}
+
+
+def sample_app_data(now: datetime | None = None) -> dict:
+    """見本の画面用データ（各状態を1つずつ）。"""
+    now = now or datetime.now().replace(second=0, microsecond=0)
+    now = min(max(now, now.replace(hour=1, minute=0)), now.replace(hour=21, minute=0))
+    date = now.strftime("%Y%m%d")
+    races, warns = [], []
+    for r, st, bk, w in _sample_races(date, now):
+        races.append(app_race(r, date, {s: st.get(s) for s in STAGES}, bk, now))
+        warns += w
+    races.sort(key=lambda x: (x["発走"], x["レースID"]))
+    return {"版": APP_VERSION, "日付": f"{now:%Y-%m-%d}", "更新": _iso(now), "k": MARGIN, "m": 1.0, "ドライラン": False, "見本": True,
+            "警告": warns, "止まっていた可能性": ["13:20〜14:28"], "時計のずれ（分）": 0.1, "レース": races,
+            "成績": _sample_results(now)}
+
+
+def app_preview_html(data: dict) -> str:
+    """apps_script/index.html に画面用データを埋め込んだ HTML（Apps Script を通さずに、PC のブラウザで同じ画面を見る）。"""
+    html = APP_HTML.read_text(encoding="utf-8")
+    if APP_PREVIEW_MARK not in html:
+        raise SystemExit(f"{APP_HTML} に {APP_PREVIEW_MARK} がありません")
+    blob = json.dumps(_jsonable(data), ensure_ascii=False).replace("</", "<\\/")
+    return html.replace(APP_PREVIEW_MARK, f"<script>window.PREVIEW_DATA = {blob};</script>")
+
+
+def _cmd_app_preview(args) -> int:
+    if args.date:
+        prep = read_json(day_dir(args.date, args.replay) / "prep.json")
+        if prep is None:
+            print(f"{args.date} の prep.json がありません（{day_dir(args.date, args.replay)}）")
+            return 1
+        now = _parse_now(args.date, args.now) if args.now else post_time(args.date, "2359")
+        data = build_app_data(prep, args.replay, None, now)
+        data["プレビューの今"] = _iso(now + timedelta(minutes=1))       # 画面の中の「今」をこの時刻に止める
+        what = f"{args.date} の保存した買い目（{now:%H:%M} の時点の状態）"
+    else:
+        data = sample_app_data()
+        what = "見本（最終・仮・途中・予備・最終を作れていない・まだ買い目なし・発走済み）"
+    out = Path(args.out) if args.out else raceday_dir() / "app_preview.html"
+    out.write_text(app_preview_html(data), encoding="utf-8")
+    print(f"書き出しました: {out.resolve()}\n  中身: {what}\n  ブラウザで開いてください（買い目は作り直していません。シートにも書いていません）")
+    if args.open:
+        import webbrowser
+        webbrowser.open(out.resolve().as_uri())
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1944,6 +2169,12 @@ def _update_body(args, date: str, prep: dict) -> int:
             print(f"  スマホ用タブに書けませんでした: {e}")
         except Exception as e:
             print(f"  スマホ用タブに書けませんでした（保存した買い目は残っています）: {type(e).__name__}: {e}")
+        try:                                                # v17：ウェブアプリの画面用データ（失敗しても買い目の保存・他のタブには影響しない）
+            print(f"  シート「{write_app(prep, clock=clock)}」に画面用のデータを書きました")
+        except SystemExit as e:
+            print(f"  画面用のデータを書けませんでした: {e}")
+        except Exception as e:
+            print(f"  画面用のデータを書けませんでした（保存した買い目・他のタブは残っています）: {type(e).__name__}: {e}")
     if not args.no_drift and network_ok:
         # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない。v14：30 秒まで）
         try:
@@ -2401,6 +2632,11 @@ def _cmd_sheet(args) -> int:
         now, collapse = post_time(date, "2359"), False
     print(f"シート「{write_mobile(prep, replay=args.replay, force=True, now=now, collapse=collapse)}」も書き直しました"
           f"（{now:%H:%M} の時点の状態{'' if collapse else '・発走後もたたまない'}。チェックは消えます）")
+    if not args.replay:                                     # ドライランの分は画面用データに書かない（本番の画面を上書きしない）
+        try:
+            print(f"シート「{write_app(prep, now=now)}」に画面用のデータを書きました（ウェブアプリ用）")
+        except (Exception, SystemExit) as e:
+            print(f"画面用のデータを書けませんでした（他のタブは書けています）: {type(e).__name__}: {e}")
     return 0
 
 
@@ -2560,6 +2796,10 @@ def _write_results_safely() -> None:
         print(f"シート「{write_results()}」に書きました（スマホで見る成績）")
     except Exception as e:
         print(f"シート「{RESULTS_SHEET_TITLE}」に書けませんでした（他の結果は保存済み）: {type(e).__name__}: {e}")
+    try:
+        print(f"シート「{refresh_app_results()}」の成績を新しくしました（ウェブアプリ用）")
+    except (Exception, SystemExit) as e:
+        print(f"画面用のデータを書けませんでした（他の結果は保存済み）: {type(e).__name__}: {e}")
 
 
 def _cmd_freeze(args) -> int:
@@ -2650,6 +2890,13 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--m", type=float, default=None, help="付け替えの目標 m（5万円 × m。既定 1.00）")
     q.set_defaults(func=_cmd_freeze)
     sub.add_parser("unfreeze", help="係数の固定をやめる").set_defaults(func=_cmd_unfreeze)
+    q = sub.add_parser("app-preview", help="v17 ウェブアプリの画面を、PC のブラウザで見る HTML に書き出す（シートには書かない）")
+    q.add_argument("--date", default=None, help="YYYYMMDD：その日の保存した買い目から（省略すると各状態の見本）")
+    q.add_argument("--now", default=None, help="この時刻の状態で（HHMM。--date と一緒に）")
+    q.add_argument("--replay", action="store_true", help="ドライランの分から")
+    q.add_argument("--out", default=None, help="書き出す場所（既定 data/raceday/app_preview.html）")
+    q.add_argument("--open", action="store_true", help="書き出したあとブラウザで開く")
+    q.set_defaults(func=_cmd_app_preview)
     args = parser.parse_args(argv)
     return args.func(args)
 

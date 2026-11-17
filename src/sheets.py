@@ -262,7 +262,15 @@ def has_rule(ws, formula: str) -> bool:
     return False
 
 
-def red_rule_request(ws, cell_range: str, formula: str) -> dict:
+def rule_count(ws) -> int:
+    """このタブの条件付き書式の数（メタデータを1回読む）。"""
+    for sh in ws.spreadsheet.fetch_sheet_metadata().get("sheets", []):
+        if sh.get("properties", {}).get("sheetId") == ws.id:
+            return len(sh.get("conditionalFormats", []))
+    return 0
+
+
+def red_rule_request(ws, cell_range: str, formula: str, background=(0.9, 0.1, 0.1), text=(1, 1, 1)) -> dict:
     """条件付き書式「formula が真なら赤」を足す要求（batch_update の requests の1つ）。"""
     import re
     m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", cell_range)
@@ -272,8 +280,8 @@ def red_rule_request(ws, cell_range: str, formula: str) -> dict:
     return {"addConditionalFormatRule": {"index": 0, "rule": {
         "ranges": [grid_],
         "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
-                        "format": {"backgroundColor": {"red": 0.9, "green": 0.1, "blue": 0.1},
-                                   "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}}}}}
+                        "format": {"backgroundColor": dict(zip(("red", "green", "blue"), background)),
+                                   "textFormat": {"bold": True, "foregroundColor": dict(zip(("red", "green", "blue"), text))}}}}}}
 
 
 def ensure_red_rule(ws, cell_range: str, formula: str) -> bool:
