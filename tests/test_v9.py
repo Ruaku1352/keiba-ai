@@ -188,6 +188,17 @@ def test_cli_rebalance(v8_env, capsys):
         assert (none["差（同じ k の付け替えなしとの）"] >= -1e-12).all()             # ずれなしは悪くならない
     assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--drift", "data", "--draws", "1"]) == 0
     assert "仮の分布で引きます" in capsys.readouterr().out                           # 集めたデータがまだ無い
+    # v18：--drift-source jusho（重賞 → 平場 → 仮の分布）。券種 × 帯ごとの引いた数も出す
+    from src import raceday
+    pd.DataFrame({"日付": "20261101", "レースID": "x", "区分": ["重賞"] * 30 + ["平場"] * 30, "券種": "3連複", "帯": "10〜50倍",
+                  "r": 0.95}).to_csv(raceday.drift_samples_path(), index=False, encoding="utf-8-sig", compression="gzip")
+    assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance", "--drift", "data", "--drift-source", "jusho",
+                    "--draws", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "--drift-source jusho" in out and "引いた数: 重賞 " in out and "券種 × 帯ごとに引いた数" in out
+    cells = pd.read_csv(v8_env.parent / "v9" / "rebalance" / "rebalance_data_jusho_drift_draws.csv", encoding="utf-8-sig")
+    assert {"券種", "帯", "重賞", "平場", "仮の分布"} <= set(cells.columns)
+    assert (v8_env.parent / "v9" / "rebalance" / "rebalance_data_jusho.csv").exists()
 
 
 
@@ -267,10 +278,54 @@ def test_cli_rebalance_k_and_decide(v8_env, capsys):
     assert (t["点数（平均）"] <= 15).all() and plan_pts.notna().all()
     # 決定：集めたデータが無ければ実行しない
     assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 1
-    samples = pd.DataFrame({"日付": "20261101", "レースID": "x", "券種": "馬連", "帯": "10〜50倍", "r": np.full(40, 0.95)})
+    samples = pd.DataFrame({"日付": "20261101", "レースID": "x", "区分": "平場", "券種": "馬連", "帯": "10〜50倍",
+                            "r": np.full(40, 0.95)})
     samples.to_csv(raceday.drift_samples_path(), index=False, encoding="utf-8-sig", compression="gzip")
     assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 0
     out = capsys.readouterr().out
     assert "■ 決定：k = " in out and "freeze --k" in out
+    first = out[out.index("ずれの出どころ"):]                                        # v18：最初に出どころと引いた数
+    assert first.startswith("ずれの出どころ: --drift-source jusho") and "重賞 0 / 平場 " in first
+    assert first.index("引いた数") < first.index("ルール") < first.index("■ 決定")
+    log = pd.read_csv(v8_env.parent / "v9" / "rebalance_decision.csv", encoding="utf-8-sig")
+    assert log["ずれの出どころ"].iloc[0] == "jusho" and log["引いた数（平場）"].iloc[0] > 0 and log["引いた数（重賞）"].iloc[0] == 0
     assert v9.main(["--data", str(v8_env), "--rounds", "10", "rebalance-decide", "--draws", "1"]) == 1   # 1回だけ
     assert "すでに行われています" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# v18：ずれの出どころ（重賞 → 平場 → 仮の分布）
+# ---------------------------------------------------------------------------
+def test_drift_sampler_jusho_falls_back_to_flat_then_assumed():
+    n = v9.MIN_DRIFT_SAMPLES
+    samples = pd.concat([
+        pd.DataFrame({"区分": "重賞", "券種": "馬連", "帯": "10〜50倍", "r": np.full(n, 0.9)}),          # 重賞が足りる
+        pd.DataFrame({"区分": "平場", "券種": "馬連", "帯": "10〜50倍", "r": np.full(n, 1.3)}),
+        pd.DataFrame({"区分": "重賞", "券種": "3連複", "帯": "10〜50倍", "r": np.full(n - 1, 0.7)}),      # 重賞が 29 個 → 平場で補う
+        pd.DataFrame({"区分": "平場", "券種": "3連複", "帯": "10〜50倍", "r": np.full(n, 1.2)}),
+        pd.DataFrame({"区分": "重賞", "券種": "馬単", "帯": "10〜50倍", "r": np.full(n - 1, 0.6)}),       # どちらも足りない → 仮
+        pd.DataFrame({"区分": "平場", "券種": "馬単", "帯": "10〜50倍", "r": np.full(n - 1, 0.6)}),
+        pd.DataFrame({"区分": "不明", "券種": "3連単", "帯": "10〜50倍", "r": np.full(n, 0.5)})])          # 不明は使わない
+    s = v9.DriftSampler("data", samples, seed=1, source="jusho")
+    assert s.draw("馬連", 20.0) == pytest.approx(0.9)
+    assert s.draw("3連複", 20.0) == pytest.approx(1.2)
+    r = s.draw("馬単", 20.0)
+    assert r != pytest.approx(0.6)
+    s.draw("3連単", 20.0)
+    assert s.used == {"重賞": 1, "平場": 1, "仮の分布": 2}
+    t = s.cell_table().set_index("券種")
+    assert list(t.index) == ["馬連", "馬単", "3連複", "3連単"]                         # 券種の順
+    assert t.loc["3連複", "平場"] == 1 and t.loc["馬単", "仮の分布"] == 1 and t.loc["馬連", "重賞"] == 1
+    # all：今までどおり区分を問わない
+    a = v9.DriftSampler("data", samples, seed=1, source="all")
+    a.draw("3連単", 20.0)
+    assert a.used == {"集めたデータ": 1, "仮の分布": 0}
+    # 区分の無い古いサンプルでは jusho は使えない（流し直しを促す）
+    with pytest.raises(SystemExit):
+        v9.DriftSampler("data", samples.drop(columns=["区分"]), source="jusho")
+
+
+def test_drift_source_same_key_same_draw():
+    samples = pd.DataFrame({"区分": "重賞", "券種": "馬連", "帯": "10〜50倍", "r": np.linspace(0.5, 1.5, 40)})
+    a = v9.DriftSampler("data", samples, seed=4, source="jusho").draw("馬連", 20.0, key=("R", 0, "馬連", (1, 2)))
+    assert v9.DriftSampler("data", samples, seed=4, source="jusho").draw("馬連", 20.0, key=("R", 0, "馬連", (1, 2))) == a

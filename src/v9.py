@@ -467,39 +467,83 @@ def _band(odds: float) -> str:
     return realodds.ODDS_BIN_LABELS[i]
 
 
+DRIFT_SOURCES = ("all", "jusho")
+DRIFT_SOURCE_LABELS = {"all": "全部のサンプル（区分を問わない）",
+                       "jusho": "重賞のサンプル（足りない組は平場、平場も足りなければ仮の分布）"}
+DRIFT_USED_KEYS = {"all": ("集めたデータ", "仮の分布"), "jusho": ("重賞", "平場", "仮の分布")}
+
+
 class DriftSampler:
     """r（確定 ÷ 20分前）を、券種 × オッズの帯ごとに引く。集めたデータが足りない組は仮の分布（log r ~ 正規(0, 0.10)）。
 
+    source="all"：区分を問わず全部のサンプルから（v12〜v17 の動き）。
+    source="jusho"（v18）：重賞（G1/G2/G3/G）のサンプルから。その組の重賞が MIN_DRIFT_SAMPLES 個未満なら同じ組の平場から、
+    平場も足りなければ仮の分布から。
     key（レース・券種・組・何回目）を渡すと、同じ買い目には条件（k・m）が違っても同じ r を引く（対応のある比較のため）。
     """
 
-    def __init__(self, mode: str, samples: pd.DataFrame | None, seed: int = 0):
+    def __init__(self, mode: str, samples: pd.DataFrame | None, seed: int = 0, source: str = "all"):
+        if source not in DRIFT_SOURCES:
+            raise ValueError(f"ずれの出どころは {DRIFT_SOURCES} のどれか: {source}")
         self.mode = mode
+        self.source = source
         self.seed = seed
         self.rng = np.random.default_rng(seed)
-        self.groups: dict = {}
+        self.groups: dict = {}                    # 出どころ → {(券種, 帯): log r}
         if mode == "data" and samples is not None and not samples.empty:
-            for (k, b), g in samples.groupby(["券種", "帯"]):
-                if len(g) >= MIN_DRIFT_SAMPLES:
-                    self.groups[(k, b)] = np.log(g["r"].to_numpy(dtype="float64"))
-        self.used = {"集めたデータ": 0, "仮の分布": 0}
+            if source == "all":
+                self.groups["集めたデータ"] = self._groups(samples)
+            else:
+                if "区分" not in samples.columns:
+                    raise SystemExit("ずれのサンプルに「区分」（重賞・平場）がありません。`py -m src.raceday drift` を流し直してください")
+                for name in ("重賞", "平場"):
+                    self.groups[name] = self._groups(samples.loc[samples["区分"] == name])
+        self.order = [k for k in DRIFT_USED_KEYS[source] if k != "仮の分布"]
+        self.used = {k: 0 for k in DRIFT_USED_KEYS[source]}
+        self.cells: dict = {}                     # (券種, 帯) → {出どころ: 引いた数}
         self._cache: dict = {}
+
+    @staticmethod
+    def _groups(samples: pd.DataFrame) -> dict:
+        out = {}
+        for (k, b), g in samples.groupby(["券種", "帯"]):
+            if len(g) >= MIN_DRIFT_SAMPLES:
+                out[(k, b)] = np.log(g["r"].to_numpy(dtype="float64"))
+        return out
 
     def draw(self, kind: str, final_odds: float, key=None) -> float:
         if key is not None and key in self._cache:
             return self._cache[key]
         rng = self.rng if key is None else np.random.default_rng([self.seed, zlib.crc32(repr(key).encode())])
         # 帯は本来 20分前のオッズで決めるが、試算では確定オッズの帯で代わりにする
-        lr = self.groups.get((kind, _band(final_odds)))
-        if lr is not None:
-            self.used["集めたデータ"] += 1
-            r = float(np.exp(lr[rng.integers(len(lr))]))
-        else:
-            self.used["仮の分布"] += 1
-            r = float(np.exp(rng.normal(0.0, ASSUMED_LOG_SD)))
+        cell = (kind, _band(final_odds))
+        name, lr = "仮の分布", None
+        for src in self.order:
+            lr = self.groups.get(src, {}).get(cell)
+            if lr is not None:
+                name = src
+                break
+        self.used[name] += 1
+        self.cells.setdefault(cell, {k: 0 for k in self.used})[name] += 1
+        r = float(np.exp(lr[rng.integers(len(lr))])) if lr is not None else float(np.exp(rng.normal(0.0, ASSUMED_LOG_SD)))
         if key is not None:
             self._cache[key] = r
         return r
+
+    def cell_table(self) -> pd.DataFrame:
+        """券種 × 帯ごとに、どの出どころから何個引いたか。"""
+        from . import realodds
+        kinds = ["馬連", "馬単", "3連複", "3連単"]
+        rows = [{"券種": k, "帯": b, **v} for (k, b), v in self.cells.items()]
+        if not rows:
+            return pd.DataFrame(columns=["券種", "帯", *self.used])
+        t = pd.DataFrame(rows)
+        t["_k"] = t["券種"].map(lambda x: kinds.index(x) if x in kinds else 99)
+        t["_b"] = t["帯"].map(lambda x: realodds.ODDS_BIN_LABELS.index(x) if x in realodds.ODDS_BIN_LABELS else 99)
+        return t.sort_values(["_k", "_b"]).drop(columns=["_k", "_b"]).reset_index(drop=True)
+
+    def used_text(self) -> str:
+        return " / ".join(f"{k} {v:,}" for k, v in self.used.items())
 
 
 def simulate_bets(rows_in: list[dict], m: float | None, sampler: DriftSampler | None, key=None) -> dict:
@@ -530,15 +574,19 @@ def evaluate_f(race: dict) -> dict:
 
 
 def kxm_summary(races: list[dict], drift: str, draws: int, seed: int, samples: pd.DataFrame | None,
-                ks=REBALANCE_K, ms=REBALANCE_M, base=(MARGIN, 1.00)) -> tuple[pd.DataFrame, dict, dict]:
+                ks=REBALANCE_K, ms=REBALANCE_M, base=(MARGIN, 1.00), drift_source: str = "all",
+                sampler_out: list | None = None) -> tuple[pd.DataFrame, dict, dict]:
     """区分 × k × m（付け替えなし・m ごと）× ずれ（なし・あり）の表と、k を行・m を列にした熱い当たりの割合の表。
 
     今の形（k = 1.4・m = 1.00・ずれあり。--drift none ならずれなし）との対応のある比較。ずれありは draws 回の平均
     （同じ回は、同じ買い目に同じ r を引く。区間も各回の平均）。
     """
     stoch = drift != "none"
-    label_drift = f"あり（{'集めたデータ' if drift == 'data' else '仮の分布 log r ~ 正規(0, 0.10)'}・{draws}回の平均）"
-    sampler = DriftSampler(drift, samples, seed=seed) if stoch else None
+    data_label = "集めたデータ" if drift_source == "all" else "重賞のずれ（足りない組は平場・仮の分布）"
+    label_drift = f"あり（{data_label if drift == 'data' else '仮の分布 log r ~ 正規(0, 0.10)'}・{draws}回の平均）"
+    sampler = DriftSampler(drift, samples, seed=seed, source=drift_source) if stoch else None
+    if sampler_out is not None and sampler is not None:
+        sampler_out.append(sampler)
     n_draw = draws if stoch else 1
     out, pivots = [], {}
     for kind in dict.fromkeys(r["区分"] for r in races):
@@ -653,17 +701,24 @@ def _cmd_rebalance(args) -> int:
         print("odds_targets.csv がありません（v8 odds-targets と fetch-odds --targets のあとに）")
         return 1
     stoch = args.drift != "none"
+    source = args.drift_source if args.drift == "data" else "all"
     clock.step(f"付け替えを試算中（k {len(ks)} × m {len(REBALANCE_M)}＋付け替えなし × ずれ"
                f"{'なし・あり ' + str(args.draws) + '回' if stoch else 'なし'}）...")
-    table, pivots, used = kxm_summary(races, args.drift, args.draws, args.seed, samples, ks=ks)
+    smp: list = []
+    table, pivots, used = kxm_summary(races, args.drift, args.draws, args.seed, samples, ks=ks, drift_source=source,
+                                      sampler_out=smp)
     clock.step("完了\n")
     print("※ 当日の運用（最初の金額の余裕 k・付け替えの目標 m）の確認。記述だけで、F の買い方・確率の案としては数えない")
     base_label = "k = 1.4・m = 1.00・" + ("ずれあり" if stoch else "ずれなし")
     if stoch:
-        src = "集めたデータ（券種 × オッズの帯。足りない組は仮の分布）" if args.drift == "data" and samples is not None \
-            else "仮の分布（log r ~ 正規(0, 0.10)）"
-        print(f"ずれあり の r（確定 ÷ 20分前）の出どころ: {src}。引いた数: 集めたデータ {used['集めたデータ']:,} / 仮の分布 {used['仮の分布']:,}"
+        if args.drift == "data" and samples is not None:
+            src = f"集めたデータ・{DRIFT_SOURCE_LABELS[source]}（--drift-source {source}。券種 × オッズの帯。足りない組は仮の分布）"
+        else:
+            src = "仮の分布（log r ~ 正規(0, 0.10)）"
+        print(f"ずれあり の r（確定 ÷ 20分前）の出どころ: {src}。引いた数: {smp[0].used_text()}"
               f"。乱数の種 {args.seed}。同じ回では、同じ買い目に k・m によらず同じ r を引く")
+        if args.drift == "data" and samples is not None:
+            _print_cells(smp[0])
     print(f"今の形 = {base_label}。対応のある比較の差の区間は 95%（ずれありは各回の平均）")
     for kind, g in table.groupby("区分", sort=False):
         print(f"\n=== {kind}（{int(g['レース数'].iloc[0]):,} レース）：熱い当たりの割合（k を行・m を列。"
@@ -682,6 +737,8 @@ def _cmd_rebalance(args) -> int:
     if args.drift == "data" and samples is not None:
         flat = table.loc[(table["区分"] == "平場") & (table["付け替え"] != "付け替えなし")
                          & table["ずれ"].str.startswith("あり")]
+        if not flat.empty and source != DECIDE_DRIFT_SOURCE:
+            print(f"\n■ （参考）--drift-source {source}。rebalance-decide はずれを --drift-source {DECIDE_DRIFT_SOURCE} で引く（v18）")
         if not flat.empty:
             best = flat.sort_values("熱い当たりの割合", ascending=False).iloc[0]
             b14 = flat.loc[flat["k"] == MARGIN].sort_values("熱い当たりの割合", ascending=False).iloc[0]
@@ -691,14 +748,26 @@ def _cmd_rebalance(args) -> int:
         print("\n■ 仮の分布での下見なので、ここでは何も決めない（12月中旬に `py -m src.v9 rebalance-decide` で、集めたデータで決める）")
     out = v9_dir() / "rebalance"
     out.mkdir(parents=True, exist_ok=True)
-    table.to_csv(out / f"rebalance_{args.drift}.csv", index=False, encoding="utf-8-sig")
+    name = args.drift if args.drift != "data" or source == "all" else f"data_{source}"   # all は今までと同じ名前
+    table.to_csv(out / f"rebalance_{name}.csv", index=False, encoding="utf-8-sig")
     for kind, piv in pivots.items():
-        piv.to_csv(out / f"rebalance_{args.drift}_pivot_{kind}.csv", encoding="utf-8-sig")
-    print(f"\n  保存: {out / f'rebalance_{args.drift}.csv'}（k × m の表は rebalance_{args.drift}_pivot_*.csv）")
+        piv.to_csv(out / f"rebalance_{name}_pivot_{kind}.csv", encoding="utf-8-sig")
+    if stoch and smp:
+        smp[0].cell_table().to_csv(out / f"rebalance_{name}_drift_draws.csv", index=False, encoding="utf-8-sig")
+    print(f"\n  保存: {out / f'rebalance_{name}.csv'}（k × m の表は rebalance_{name}_pivot_*.csv）")
     return 0
 
 
-DECIDE_RULE = ("平場・ずれあり（集めたデータ）で熱い当たりの割合が一番高い (k*, m*) と、k = 1.4 の中で一番高い m₁.₄ を選ぶ。"
+def _print_cells(sampler: DriftSampler) -> None:
+    t = sampler.cell_table()
+    print("  券種 × 帯ごとに引いた数（帯は確定オッズの帯で代わりにしている）:")
+    with pd.option_context("display.width", 200, "display.max_rows", 200):
+        print("    " + t.to_string(index=False).replace("\n", "\n    ") if not t.empty else "    （なし）")
+
+
+DECIDE_DRIFT_SOURCE = "jusho"          # v18（11/18）：実データのずれでの試算を1回も回す前に決めた
+DECIDE_RULE = ("試算するレースは平場、ずれ（r）は重賞のサンプルから（券種 × 帯の重賞が 30 個未満なら平場、平場も足りなければ仮の分布。v18）。"
+               "平場・ずれありで熱い当たりの割合が一番高い (k*, m*) と、k = 1.4 の中で一番高い m₁.₄ を選ぶ。"
                "k* = 1.4 なら k は変えず m = m*。k* < 1.4 なら重賞で (k*, m*) と (1.4, m₁.₄) を対応のある比較で1回だけ比べ、"
                "差の 95% 区間の下限が 0 を超えたら (k*, m*)、超えなければ (1.4, m₁.₄)")
 
@@ -732,19 +801,20 @@ def _cmd_rebalance_decide(args) -> int:
         return 1
     flat_races = [r for r in races if r["区分"] == "平場"]
     clock.step("平場で (k*, m*) を選び中 ...")
-    flat_table, _, used = kxm_summary(flat_races, "data", args.draws, args.seed, samples, ks=ks)
+    smp: list = []
+    flat_table, _, used = kxm_summary(flat_races, "data", args.draws, args.seed, samples, ks=ks,
+                                      drift_source=DECIDE_DRIFT_SOURCE, sampler_out=smp)
     c = decide_k_m(flat_table)
-    print(f"ルール（結果を見る前に決めたもの）：{DECIDE_RULE}")
-    print(f"ずれのデータから引いた数: 集めたデータ {used['集めたデータ']:,} / 仮の分布 {used['仮の分布']:,}")
-    print(f"平場：(k*, m*) = ({c['k*']:.1f}, {c['m*']:.2f})、m₁.₄ = {c['m1.4']:.2f}")
-    row = {"実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "k*": c["k*"], "m*": c["m*"], "m1.4": c["m1.4"],
-           "やり直しの理由": args.rerun_reason or ""}
+    lines = [f"平場：(k*, m*) = ({c['k*']:.1f}, {c['m*']:.2f})、m₁.₄ = {c['m1.4']:.2f}"]
+    row = {"実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ずれの出どころ": DECIDE_DRIFT_SOURCE,
+           "k*": c["k*"], "m*": c["m*"], "m1.4": c["m1.4"], "やり直しの理由": args.rerun_reason or ""}
+    sampler = None
     if not c["重賞で確かめる"]:
         row.update({"決めた k": MARGIN, "決めた m": c["m*"], "重賞の比較": "なし（k* = 1.4）"})
     else:
         clock.step("重賞で (k*, m*) と (1.4, m₁.₄) を1回だけ比べ中 ...")
         graded = [r for r in races if r["区分"] == "重賞"]
-        sampler = DriftSampler("data", samples, seed=args.seed)
+        sampler = DriftSampler("data", samples, seed=args.seed, source=DECIDE_DRIFT_SOURCE)
         diffs = []
         for j in range(args.draws):
             a = np.array([simulate_bets(r["プラン"][c["k*"]]["買い目"], c["m*"], sampler, key=(r["レースID"], j))["熱い"] for r in graded])
@@ -752,10 +822,21 @@ def _cmd_rebalance_decide(args) -> int:
             diffs.append(tri.paired_proportion_test(a, b))
         d = {k: float(np.mean([t[k] for t in diffs])) for k in ("差", "差下限", "差上限", "xだけ", "yだけ")}
         adopt = d["差下限"] > 0
-        print(f"重賞（{len(graded):,} レース）：(k*, m*) − (1.4, m₁.₄) = {d['差']:+.2%}  95% 区間 [{d['差下限']:+.2%}, {d['差上限']:+.2%}]"
-              f"（{args.draws}回の平均）")
+        lines.append(f"重賞（{len(graded):,} レース）：(k*, m*) − (1.4, m₁.₄) = {d['差']:+.2%}  95% 区間 [{d['差下限']:+.2%}, {d['差上限']:+.2%}]"
+                     f"（{args.draws}回の平均）")
         row.update({"決めた k": c["k*"] if adopt else MARGIN, "決めた m": c["m*"] if adopt else c["m1.4"],
                     "重賞の比較": f"差 {d['差']:+.4f} [{d['差下限']:+.4f}, {d['差上限']:+.4f}]"})
+    # v18：出力の最初に、使ったずれの出どころと、重賞・平場・仮の分布から何個引いたか
+    print(f"ずれの出どころ: --drift-source {DECIDE_DRIFT_SOURCE}（{DRIFT_SOURCE_LABELS[DECIDE_DRIFT_SOURCE]}）")
+    print(f"  平場で選ぶ段で引いた数: {smp[0].used_text()}")
+    if sampler is not None:
+        print(f"  重賞で確かめる段で引いた数: {sampler.used_text()}")
+    _print_cells(smp[0])
+    for k in DRIFT_USED_KEYS[DECIDE_DRIFT_SOURCE]:
+        row[f"引いた数（{k}）"] = smp[0].used[k] + (sampler.used[k] if sampler is not None else 0)
+    print(f"ルール（結果を見る前に決めたもの）：{DECIDE_RULE}")
+    for x in lines:
+        print(x)
     print(f"\n■ 決定：k = {row['決めた k']:.1f}・m = {row['決めた m']:.2f}。"
           f"`py -m src.raceday freeze --k {row['決めた k']} --m {row['決めた m']}` で当日の仕組みに入れる")
     pd.concat([prev, pd.DataFrame([row])], ignore_index=True).to_csv(log_path, index=False, encoding="utf-8-sig")
@@ -782,6 +863,9 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--until", default=UNTIL, help=f"重賞の対象の最後の日（既定 {UNTIL}）")
     q.add_argument("--drift", default="assumed", choices=["assumed", "data", "none"],
                    help="ずれあり の r：assumed=仮の分布（既定）/ data=raceday drift で集めたデータ / none=ずれなしだけ")
+    q.add_argument("--drift-source", default="all", choices=list(DRIFT_SOURCES),
+                   help="--drift data のときの r の出どころ：all=全部のサンプル（既定・今までの動き）/ "
+                        "jusho=重賞のサンプル（券種 × 帯の重賞が 30 個未満なら平場、平場も足りなければ仮の分布。rebalance-decide はこれ）")
     q.add_argument("--draws", type=int, default=10, help="ずれありで r を引く回数（平均を出す。既定 10）")
     q.add_argument("--seed", type=int, default=0, help="乱数の種（既定 0）")
     q.add_argument("--k", default="1.4", help="最初の金額の余裕 k（カンマ区切り。例 1.0,1.1,1.2,1.3,1.4。1.4 は必ず入る）")
