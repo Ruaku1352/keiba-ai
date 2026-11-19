@@ -1603,3 +1603,182 @@ def test_apps_script_files_have_no_ids():
     assert "getActiveSpreadsheet()" in code and "openById" not in code and "docs.google.com" not in code + html
     assert "script.google.com" not in code + html and raceday.APP_SHEET_TITLE in code
     assert html.count(raceday.APP_PREVIEW_MARK) == 1 and "prefers-color-scheme: dark" in html
+
+
+# ---------------------------------------------------------------------------
+# v19：当たったのに5万円に届かない の調査（practice --explain）
+# ---------------------------------------------------------------------------
+def test_practice_explain_runs_and_checks(env, capsys):
+    ds, date, ids, have = _practice_env(env)
+    assert raceday.main(["--data", str(env), "practice", "--date", date]) == 0
+    capsys.readouterr()
+    assert raceday.main(["--data", str(env), "practice", "--explain"]) == 0
+    out = capsys.readouterr().out
+    print(out)
+    for s in ("=== 1.", "=== 2.", "=== 3.", "=== 4.", "=== 5.", "本物のオッズ（20分前）があった", "印が付いていなかったもの"):
+        assert s in out, s
+    assert "保存したオッズと違う" not in out or "食い違い: 0 点" in out
+    assert "食い違い: 0 点" in out and "印が付いていなかったもの 0 点" in out                  # 合成データではバグの印なし
+    hits = pd.read_csv(raceday.practice_dir() / "explain_hits.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    rec = pd.read_csv(raceday.practice_dir() / "records.csv", dtype={"レースID": str}, encoding="utf-8-sig")
+    assert set(hits["レースID"]) <= set(rec.loc[rec["的中"], "レースID"])
+    assert set(rec.loc[rec["的中"], "レースID"]) <= set(hits["レースID"])                  # 的中したレースは全部、当たった買い目が出る
+
+
+# ---------------------------------------------------------------------------
+# v19 2：10分前ごろのオッズ集め・20分前と10分前の比較
+# ---------------------------------------------------------------------------
+def test_collect_drift10_window_and_separate_dir(root):
+    sch = pd.DataFrame({"レースID": ["202605040501", "202605040502"], "キー": ["2026110105040501", "2026110105040502"],
+                        "発走": ["1000", "1020"]})
+    calls = []
+
+    def fetch(keys):
+        calls.append(list(keys))
+        d = odds.odds_dir() / "rt" / DATE
+        for k in keys:
+            _write_snapshot(d, k[:4] + k[8:], DATE, 1.0, "0B30", "2026-11-01 09:50:00")
+        return {"レコード": 5 * len(keys), "保存ファイル": [str(p) for p in d.glob("*.npz")]}
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        c = raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 45), fetch=fetch, schedule=sch, at="10")  # 1R 15分前・2R 35分前
+        assert c["レース"] == 0 and not calls                                         # 15 ちょうどは 20分前の方
+        c = raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 50), fetch=fetch, schedule=sch, at="10")  # 1R 10分前
+        assert calls == [["2026110105040501"]] and c["レース"] == 1
+        raceday.collect_drift_odds(DATE, datetime(2026, 11, 1, 9, 54), fetch=fetch, schedule=sch, at="10")
+        assert len(calls) == 1                                                        # 各レース1回
+        assert list(raceday.drift_dir(None, DATE, "10").glob("O6_drift10_*.npz"))
+        assert not list(raceday.drift_dir(None, DATE).glob("*.npz"))                  # 20分前の分とは混ぜない
+        assert (raceday.day_dir(DATE) / "drift10_collected.csv").exists()
+        assert not (raceday.day_dir(DATE) / "drift_collected.csv").exists()
+    finally:
+        cfg.JV_DATA_DIR = old
+
+
+def test_update_collects_drift10_after_drift20_and_survives_failure(root, monkeypatch, capsys):
+    prep = _prep()
+    raceday.write_json(raceday.day_dir(DATE) / "prep.json", prep)
+    monkeypatch.setattr(raceday, "LiveSource", lambda d, data=None: FakeSource(_snap()))
+    order = []
+
+    def collect(date, now, data=None, at="20", **k):
+        order.append(at)
+        if at == "10":
+            raise RuntimeError("10分前 だめ")
+        return {"レース": 0}
+    monkeypatch.setattr(raceday, "collect_drift_odds", collect)
+    assert raceday.main(["update", "--date", DATE, "--now", "1520", "--no-sheet"]) == 0
+    out = capsys.readouterr().out
+    assert order == ["20", "10"] and "10分前ごろのオッズを集められませんでした（買い目には影響なし）" in out
+    assert (raceday.day_dir(DATE) / "202605040511" / "final.json").exists()
+    # 20分前の分が時間内に終わらなかったら、10分前の分は試さない（JV-Link を同時に使わない）
+    order.clear()
+    monkeypatch.setattr(raceday, "call_with_timeout", lambda fn, t: (False, None) if t == 30 else (True, fn()))
+    raceday.main(["update", "--date", DATE, "--now", "1530", "--no-sheet"])
+    assert order == []
+
+
+def test_drift_compare_20_vs_10(root, capsys):
+    import src.config as cfg
+    old = cfg.JV_DATA_DIR
+    cfg.JV_DATA_DIR = str(root / "jvlink")
+    try:
+        rid = "202605040511"
+        _write_snapshot(raceday.drift_dir(None, DATE), rid, DATE, 1.0, "drift", "2026-11-01 15:20:00")
+        _write_snapshot(raceday.drift_dir(None, DATE, "10"), rid, DATE, 0.92, "drift10", "2026-11-01 15:30:00")
+        _write_snapshot(odds.odds_dir(), rid, DATE, 0.9, "final", "")
+        p20, p10 = raceday.drift_pairs(), raceday.drift_pairs(at="10")
+        assert np.allclose(p10["r"], 0.9 / 0.92, atol=0.03) and "組" in p20.columns
+        cmp = raceday.drift_compare(p20.assign(区分="重賞", グレード="G1"), p10.assign(区分="重賞", グレード="G1"))
+        f = cmp.loc[(cmp["区分"] == "重賞") & (cmp["券種"] == "4券種（F の帯）")].iloc[0]
+        assert f["確定でも届く割合（10分前）"] >= f["確定でも届く割合（20分前）"]
+        assert f["r の中央値（確定÷10分前）"] > f["r の中央値（確定÷20分前）"]
+        chk = raceday.final10_drift_check(cmp)
+        assert chk["満たす"] == (chk["10分前"] > chk["20分前"])
+        assert raceday.main(["drift"]) == 0
+        out = capsys.readouterr().out
+        assert "20分前 と 10分前 を並べる" in out and raceday.drift10_samples_path().exists()
+        assert (raceday.raceday_dir() / "drift_compare_10.csv").exists()
+    finally:
+        cfg.JV_DATA_DIR = old
+
+
+def test_practice_at10_compares_same_races(env, capsys):
+    import shutil
+    ds, date, ids, have = _practice_env(env)
+    d20, d10 = raceday.drift_dir(env, date), raceday.drift_dir(env, date, "10")
+    d10.mkdir(parents=True, exist_ok=True)
+    for f in d20.glob("*.npz"):                                                       # 10分前も同じオッズ（だから結果も同じ）
+        shutil.copy(f, d10 / f.name.replace("_drift_", "_drift10_"))
+    assert raceday.main(["--data", str(env), "practice", "--date", date, "--at", "10"]) == 0
+    out = capsys.readouterr().out
+    assert "最終の時刻の決め方の 2" in out and "満たす" in out
+    t = pd.read_csv(raceday.practice_dir() / raceday.COMPARE10_PATH, dtype={"レースID": str}, encoding="utf-8-sig")
+    assert set(t["レースID"]) <= set(have) and len(t) > 0
+    assert (t["熱い（10分前）"] == t["熱い（20分前）"]).all()
+    assert not (raceday.practice_dir() / "records.csv").exists()                     # ふだんの記録は変えない
+    assert (raceday.practice_dir() / date / "plans_at10.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# v19 3・4：最終の時刻の設定と決め方
+# ---------------------------------------------------------------------------
+def test_final_minutes_setting_changes_stage_sheet_and_task(root):
+    post = datetime(2026, 11, 1, 15, 40)
+    assert raceday.stage_of(post - timedelta(minutes=15), post) == "final"
+    assert raceday.stage_of(post - timedelta(minutes=15), post, 10) == "provisional"
+    assert raceday.stage_of(post - timedelta(minutes=10), post, 10) == "final"
+    prep = _prep()
+    assert raceday.final_minutes(prep["係数"]) == 20
+    prep["係数"] = dict(prep["係数"], 最終の分前=10)
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 20))
+    d = raceday.day_dir(DATE) / "202605040511"
+    assert not (d / "final.json").exists() and (d / "provisional.json").exists()
+    v = raceday.mobile_views(prep, False, datetime(2026, 11, 1, 15, 21))[0]
+    assert v["種類"] == "仮" and v["状態"] == "仮。最終は 15:30"
+    assert raceday.build_app_data(prep, now=datetime(2026, 11, 1, 15, 21))["レース"][0]["最終の予定"] == "15:30"
+    assert any("最終は発走10分前" in str(c) for row in raceday.render_sheet(prep, clock=raceday.Clock(
+        datetime(2026, 11, 1, 15, 21), datetime(2026, 11, 1, 15, 21), 0.0)) for c in row)
+    raceday.run_once(prep, FakeSource(_snap()), datetime(2026, 11, 1, 15, 30))
+    assert (d / "final.json").exists()
+    xml = raceday.task_xml(DATE, prep, "pythonw.exe", "C:\\keiba")
+    assert "2026-11-01T15:30:00" in xml and "2026-11-01T14:40:00" in xml and "2026-11-01T15:20:00" not in xml
+
+
+def test_freeze_and_prep_final_minutes(root, capsys):
+    raceday.write_json(raceday.raceday_dir() / "coefs" / "coefs_20261031.json", dict(COEFS))
+    assert raceday.main(["freeze", "--k", "1.2", "--m", "1.05", "--final-minutes", "10"]) == 0
+    fz = raceday.read_json(raceday.frozen_path())
+    assert (fz["k"], fz["m"], fz["最終の分前"]) == (1.2, 1.05, 10) and "最終は発走 10 分前" in capsys.readouterr().out
+    assert raceday.main(["freeze"]) == 0                                              # 指定しなければ前の値（元の係数）か既定
+    assert raceday.read_json(raceday.frozen_path())["最終の分前"] == 20
+    with pytest.raises(SystemExit):
+        raceday.check_final_minutes(60)
+    with pytest.raises(SystemExit):
+        raceday.check_final_minutes(3)
+
+
+def test_decide_final_rule_once(root, capsys):
+    # データが無ければ 20分前のまま
+    assert raceday.main(["decide-final"]) == 0
+    assert "最終は発走 20 分前" in capsys.readouterr().out
+    assert raceday.main(["decide-final"]) == 1                                        # 1回だけ
+    # 両方満たせば 10分前
+    cmp = pd.DataFrame([{"区分": "重賞", "券種": "4券種（F の帯）", "20分前のオッズの帯": "10〜300倍", "組の数": 500, "レース数": 20,
+                         "確定でも届く割合（20分前）": 0.55, "確定でも届く割合（10分前）": 0.62}])
+    cmp.to_csv(raceday.raceday_dir() / "drift_compare_10.csv", index=False, encoding="utf-8-sig")
+    t = pd.DataFrame({"日付": "20261121", "レースID": [f"r{i}" for i in range(10)], "区分": "平場",
+                      "熱い（20分前）": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], "熱い（10分前）": [1, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                      "当たったのに届かず（20分前）": 0, "当たったのに届かず（10分前）": 0, "的中（20分前）": 1, "的中（10分前）": 2})
+    t.to_csv(raceday.practice_dir() / raceday.COMPARE10_PATH, index=False, encoding="utf-8-sig")
+    assert raceday.main(["decide-final", "--rerun-reason", "テスト"]) == 0
+    out = capsys.readouterr().out
+    assert "最終は発走 10 分前" in out and "--final-minutes 10" in out
+    assert raceday.decided_final_minutes() == 10
+    # 平場で下回れば 20分前
+    t["熱い（10分前）"] = 0
+    t.to_csv(raceday.practice_dir() / raceday.COMPARE10_PATH, index=False, encoding="utf-8-sig")
+    raceday.main(["decide-final", "--rerun-reason", "テスト2"])
+    assert raceday.decided_final_minutes() == 20

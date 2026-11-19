@@ -426,6 +426,22 @@ def compute_plan(race: pd.DataFrame, snap: dict, coefs: dict, day_results: pd.Da
             "γ": g, "δ": d}
 
 
+FINAL_MINUTES_RANGE = (5, 30)    # v19：最終の時刻（発走の何分前）に使える範囲
+
+
+def final_minutes(coefs: dict | None) -> int:
+    """v19：最終の買い目を作る時刻（発走の何分前）。係数の設定（固定・prep）から。無ければ今の既定 20 分。"""
+    v = (coefs or {}).get("最終の分前")
+    return int(v) if v not in (None, "") else FINAL_BEFORE
+
+
+def check_final_minutes(v: int) -> int:
+    v = int(v)
+    if not FINAL_MINUTES_RANGE[0] <= v <= FINAL_MINUTES_RANGE[1] or v >= PROVISIONAL_BEFORE:
+        raise SystemExit(f"最終の時刻は発走の {FINAL_MINUTES_RANGE[0]}〜{FINAL_MINUTES_RANGE[1]} 分前で指定してください: {v}")
+    return v
+
+
 def plan_settings(coefs: dict) -> tuple[float, float]:
     """最初の金額の余裕 k と付け替えの目標 m（係数の設定から。無ければ今の既定 k = 1.4・m = 1.00）。"""
     return float(coefs.get("k", MARGIN)), float(coefs.get("m", 1.0))
@@ -741,11 +757,11 @@ class ReplaySource:
         return snap
 
 
-def stage_of(now: datetime, post: datetime) -> str:
+def stage_of(now: datetime, post: datetime, final_before: int = FINAL_BEFORE) -> str:
     m = (post - now).total_seconds() / 60
     if m <= 0:
         return "発走後"
-    if m <= FINAL_BEFORE:
+    if m <= final_before:
         return "final"
     if m <= PROVISIONAL_BEFORE:
         return "provisional"
@@ -761,6 +777,7 @@ def run_once(prep: dict, source, now: datetime, clock: Clock | None = None, repl
     targets = pd.DataFrame(prep["対象"])
     targets["レースID"] = targets["レースID"].astype(str)
     races = prep["レース"]
+    fb = final_minutes(prep.get("係数"))
     pending = [r for r in races if not (ddir / r["レースID"] / "final.json").exists()
                and post_time(date, r["発走時刻"]) > now]
     logs = []
@@ -772,7 +789,7 @@ def run_once(prep: dict, source, now: datetime, clock: Clock | None = None, repl
     for r in races:
         rid = r["レースID"]
         post = post_time(date, r["発走時刻"])
-        stage = stage_of(now, post)
+        stage = stage_of(now, post, fb)
         rdir = ddir / rid
         row = {"実行時刻": now.strftime("%Y-%m-%d %H:%M:%S"), "PCの時刻": (clock.pc_local if clock else now).strftime("%H:%M:%S"),
                "時計のずれ（分）": None if not clock or clock.offset_min is None else round(clock.offset_min, 2),
@@ -894,6 +911,7 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
     now_dt = clock.now if clock else datetime.now()
     now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     k, m = plan_settings(prep.get("係数", {}))
+    fb = final_minutes(prep.get("係数"))
     rows: list[list] = [[f"当日の買い目（F）{'【ドライラン】' if replay else ''}", sheet_text(f"{date[:4]}-{date[4:6]}-{date[6:]}"),
                          f"最終更新 {now}", f"k = {k:.1f}・m = {m:.2f}", "お金は賭けない記録（練習）。有馬記念は同じ仕組みで買う"]]
     # v14：シートを開いたときにシートの側で計算する「最終更新から ○分」（PC が止まっていても分かる）。B2 の分が 15 を超えたら赤
@@ -917,7 +935,7 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
         rows.append([])
         head = f"■ {r['競馬場名']}{int(rid[-2:])}R {r['競走名']}（{r['グレード']}）"
         if cur is None:
-            if now_dt >= post - timedelta(minutes=FINAL_BEFORE) and backup:
+            if now_dt >= post - timedelta(minutes=fb) and backup:
                 rows.append([head, f"発走 {post:%H:%M}", "状態: 当日の買い目は一度も作れなかった → 予備を表示"])
                 rows += _backup_rows(backup)
             else:
@@ -928,10 +946,10 @@ def render_sheet(prep: dict, replay: bool = False, clock: Clock | None = None) -
             continue
         if st["final"]:
             state = "最終（これ以降は更新しない）"
-        elif now_dt >= post - timedelta(minutes=FINAL_BEFORE):
+        elif now_dt >= post - timedelta(minutes=fb):
             state = f"{cur['段階']}（最終の買い目を作れていない。{cur['作成時刻'][11:16]} の買い目のまま）"
         else:
-            state = f"{cur['段階']}（最終は発走{FINAL_BEFORE}分前）"
+            state = f"{cur['段階']}（最終は発走{fb}分前）"
         rows.append([head, f"発走 {cur['発走']}", f"状態: {state}", f"作成 {cur['作成時刻'][11:16]}（発走 {cur['分前']:.0f} 分前）"])
         rows += _plan_rows(cur)
         if st["provisional"] and st["provisional"]["作成時刻"] != cur["作成時刻"]:
@@ -993,11 +1011,11 @@ def _rgb(c) -> dict:
 
 
 def mobile_view(race: dict, date: str, st: dict, backup: dict | None, now: datetime,
-                warnings: list[str] | tuple = ()) -> dict:
+                warnings: list[str] | tuple = (), final_before: int = FINAL_BEFORE) -> dict:
     """1レース分の表示の中身（状態・警告・買い目）。保存した JSON を読むだけ（作り直さない）。"""
     rid = race["レースID"]
     post = post_time(date, race["発走時刻"])
-    final_at = post - timedelta(minutes=FINAL_BEFORE)
+    final_at = post - timedelta(minutes=final_before)
     head = f"{race['競馬場名']}{int(rid[-2:])}R {race['競走名']}（{race['グレード']}）発走 {post:%H:%M}"
     cur = st.get("final") or st.get("latest")
     plan, box = None, None
@@ -1053,7 +1071,8 @@ def mobile_views(prep: dict, replay: bool, now: datetime, warnings=()) -> list[d
     for r in prep["レース"]:
         rid = r["レースID"]
         st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
-        out.append(mobile_view(r, date, st, read_json(ddir / rid / "backup.json"), now, warnings))
+        out.append(mobile_view(r, date, st, read_json(ddir / rid / "backup.json"), now, warnings,
+                               final_minutes(prep.get("係数"))))
     return sorted(out, key=lambda v: (v["発走"], v["レースID"]))
 
 
@@ -1416,9 +1435,10 @@ def _num(v):
     return v if np.isfinite(v) else None
 
 
-def app_race(race: dict, date: str, st: dict, backup: dict | None, now: datetime) -> dict:
+def app_race(race: dict, date: str, st: dict, backup: dict | None, now: datetime,
+             final_before: int = FINAL_BEFORE) -> dict:
     """1レース分の画面用データ。状態の決め方はスマホ用タブ（mobile_view）と同じ。"""
-    v = mobile_view(race, date, st, backup, now, [])
+    v = mobile_view(race, date, st, backup, now, [], final_before)
     rid = race["レースID"]
     post = v["発走"]
     cur = st.get("final") or st.get("latest")
@@ -1427,7 +1447,7 @@ def app_race(race: dict, date: str, st: dict, backup: dict | None, now: datetime
              "なし": "最終を作れていない" if cur else "買い目なし"}[v["種類"]]
     out = {"レースID": rid, "場": race.get("競馬場名", ""), "R": int(rid[-2:]), "レース名": race.get("競走名", ""),
            "グレード": race.get("グレード", ""), "発走": _iso(post), "発走時刻": f"{post:%H:%M}",
-           "最終の予定": f"{post - timedelta(minutes=FINAL_BEFORE):%H:%M}", "状態": state, "説明": v["状態"],
+           "最終の予定": f"{post - timedelta(minutes=final_before):%H:%M}", "状態": state, "説明": v["状態"],
            "発走済み": bool(v["済"]), "警告": list(v["警告"]), "買い目": [], "点数": None, "合計": None,
            "作成時刻": None, "予測の達成確率": None}
     if plan:
@@ -1500,10 +1520,11 @@ def build_app_data(prep: dict, replay: bool = False, clock: Clock | None = None,
     for r in prep["レース"]:
         rid = r["レースID"]
         st = {s: read_json(ddir / rid / f"{s}.json") for s in STAGES}
-        races.append(app_race(r, date, st, read_json(ddir / rid / "backup.json"), now))
+        races.append(app_race(r, date, st, read_json(ddir / rid / "backup.json"), now, final_minutes(prep.get("係数"))))
     races.sort(key=lambda x: (x["発走"], x["レースID"]))
     gaps = read_json(ddir / "gaps.json") or []
     return {"版": APP_VERSION, "日付": f"{date[:4]}-{date[4:6]}-{date[6:]}", "更新": _iso(now), "k": k, "m": m,
+            "最終の分前": final_minutes(prep.get("係数")),
             "ドライラン": bool(replay), "警告": list(clock.warnings) if clock else [],
             "止まっていた可能性": [f"{g['から']}〜{g['まで']}" for g in gaps],
             "時計のずれ（分）": None if not clock or clock.offset_min is None else round(clock.offset_min, 2),
@@ -1607,7 +1628,7 @@ TASK_PREFIX = "keiba_raceday_"
 
 
 def task_xml(date: str, prep: dict, python: str, workdir: str, start_hhmm: str = "0900") -> str:
-    """タスクの定義（XML）。10分おき＋各レースの発走60分前・20分前ちょうど。ログオン中だけ動く（管理者権限は不要）。"""
+    """タスクの定義（XML）。10分おき＋各レースの発走60分前・最終の時刻（既定 20分前。v19 で設定）ちょうど。ログオン中だけ動く。"""
     posts = [post_time(date, r["発走時刻"]) for r in prep["レース"]]
     start = post_time(date, start_hhmm)
     end = max(posts) if posts else start + timedelta(hours=8)
@@ -1618,7 +1639,7 @@ def task_xml(date: str, prep: dict, python: str, workdir: str, start_hhmm: str =
       <Repetition><Interval>PT{INTERVAL}M</Interval><Duration>PT{max(int((end - start).total_seconds() // 60), 10)}M</Duration><StopAtDurationEnd>true</StopAtDurationEnd></Repetition>
     </TimeTrigger>"""]
     for p in posts:
-        for before in (PROVISIONAL_BEFORE, FINAL_BEFORE):
+        for before in (PROVISIONAL_BEFORE, final_minutes(prep.get("係数"))):
             t = p - timedelta(minutes=before)
             trig.append(f"""    <TimeTrigger><StartBoundary>{t:%Y-%m-%dT%H:%M:%S}</StartBoundary><Enabled>true</Enabled></TimeTrigger>""")
     log = Path(workdir) / "data" / "raceday" / date / "run.log"
@@ -1905,8 +1926,13 @@ def _cmd_prep(args) -> int:
         if args.m is not None:
             p["係数"]["m"] = args.m
         write_json(day_dir(date) / "prep.json", p)
+    if args.final_minutes is not None:                      # v19：練習の日だけ最終の時刻を変える
+        p["係数"]["最終の分前"] = check_final_minutes(args.final_minutes)
+        write_json(day_dir(date) / "prep.json", p)
     k, m = plan_settings(p["係数"])
-    print(f"最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}{'（今の既定）' if (k, m) == (MARGIN, 1.0) else ''}")
+    fb = final_minutes(p["係数"])
+    print(f"最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}{'（今の既定）' if (k, m) == (MARGIN, 1.0) else ''}"
+          f"・最終は発走 {fb} 分前{'（今の既定）' if fb == FINAL_BEFORE else ''}")
     try:
         day_schedule(date, args.data)                     # v12：当日、全レースの20分前ごろのオッズを集めるための一覧
     except Exception as e:
@@ -1946,7 +1972,8 @@ def _schedule(date: str, prep: dict, args) -> int:
         print(f"タスクの登録に失敗しました: {r[2].stderr or r[2].stdout}")
         print("「アクセスが拒否されました」なら、PowerShell を「管理者として実行」して同じコマンドを")
         return 1
-    print(f"タスク「{r[0]}」を登録しました（{args.start[:2]}:{args.start[2:]} から10分おき＋各重賞の発走60分前・20分前）。"
+    print(f"タスク「{r[0]}」を登録しました（{args.start[:2]}:{args.start[2:]} から10分おき＋各重賞の発走60分前・"
+          f"{final_minutes(prep.get('係数'))}分前）。"
           f"確認: schtasks /query /tn {r[0]}  削除: py -m src.raceday schedule --date {date} --remove")
     return 0
 
@@ -2175,11 +2202,13 @@ def _update_body(args, date: str, prep: dict) -> int:
             print(f"  画面用のデータを書けませんでした: {e}")
         except Exception as e:
             print(f"  画面用のデータを書けませんでした（保存した買い目・他のタブは残っています）: {type(e).__name__}: {e}")
+    drift_hung = False
     if not args.no_drift and network_ok:
         # v12：重賞の処理とシートが終わったあとに、20分前ごろのオッズを集める（失敗しても止めない。v14：30 秒まで）
         try:
             done, c = call_with_timeout(lambda: collect_drift_odds(date, now, args.data), 30)
             if not done:
+                drift_hung = True
                 raise TimeoutError("30 秒で終わらなかった")
             if c["レース"]:
                 print(f"  20分前ごろのオッズを集めました: {c['レース']} レース・{c.get('レコード', 0)} レコード（{c.get('秒', '')}秒）")
@@ -2190,6 +2219,21 @@ def _update_body(args, date: str, prep: dict) -> int:
                                                                  "エラー": f"{type(e).__name__}: {e}"}])
             except Exception:
                 pass
+    if not args.no_drift and network_ok and not drift_hung:
+        # v19：続けて10分前ごろのオッズも集める（20分前の分が時間内に終わったときだけ。JV-Link を同時に2つ使わないため）
+        try:
+            done, c = call_with_timeout(lambda: collect_drift_odds(date, now, args.data, at="10"), DRIFT10_TIMEOUT)
+            if not done:
+                raise TimeoutError(f"{DRIFT10_TIMEOUT} 秒で終わらなかった")
+            if c["レース"]:
+                print(f"  10分前ごろのオッズを集めました: {c['レース']} レース・{c.get('レコード', 0)} レコード（{c.get('秒', '')}秒）")
+        except Exception as e:
+            print(f"  10分前ごろのオッズを集められませんでした（買い目には影響なし）: {type(e).__name__}: {e}")
+            try:
+                append_csv(day_dir(date) / "drift_errors.csv", [{"実行時刻": now.strftime("%Y-%m-%d %H:%M:%S"),
+                                                                 "エラー": f"10分前: {type(e).__name__}: {e}"}])
+            except Exception:
+                pass
     return 0
 
 
@@ -2197,11 +2241,21 @@ def _update_body(args, date: str, prep: dict) -> int:
 # v12 2：20分前ごろのオッズのデータ集め（全レース。本来の処理のあとに、失敗しても止めない）
 # ---------------------------------------------------------------------------
 DRIFT_WINDOW = (15, 25)          # 発走まで 15〜25 分のレース
+DRIFT10_WINDOW = (5, 15)         # v19：発走まで 5〜15 分のレース（15 ちょうどは 20分前の方に入れる）
+DRIFT10_TIMEOUT = 25             # v19：10分前ごろのオッズ集めの時間の上限（秒）
+DRIFT_KINDS = {"20": {"dir": "rt_drift", "done": "drift_collected.csv", "tag": "_drift_", "名前": "20分前"},
+               "10": {"dir": "rt_drift10", "done": "drift10_collected.csv", "tag": "_drift10_", "名前": "10分前"}}
 
 
-def drift_dir(data_dir, date: str) -> Path:
-    """集めた20分前ごろのオッズの保存先（重賞の買い目に使う rt とは別にする）。"""
-    return realodds.odds.odds_dir(data_dir) / "rt_drift" / date
+def drift_dir(data_dir, date: str, at: str = "20") -> Path:
+    """集めた20分前ごろ（at="10" なら10分前ごろ）のオッズの保存先（重賞の買い目に使う rt とは別にする）。"""
+    return realodds.odds.odds_dir(data_dir) / DRIFT_KINDS[at]["dir"] / date
+
+
+def _in_drift_window(m: float, at: str) -> bool:
+    if at == "10":
+        return DRIFT10_WINDOW[0] <= m < DRIFT10_WINDOW[1]
+    return DRIFT_WINDOW[0] <= m <= DRIFT_WINDOW[1]
 
 
 def day_schedule(date: str, data_dir=None) -> pd.DataFrame:
@@ -2218,19 +2272,21 @@ def day_schedule(date: str, data_dir=None) -> pd.DataFrame:
     return t
 
 
-def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, schedule: pd.DataFrame | None = None) -> dict:
-    """発走まで 15〜25 分のレース（まだ取っていないもの）の 0B30 を取って保存する。各レース1回。"""
+def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, schedule: pd.DataFrame | None = None,
+                       at: str = "20") -> dict:
+    """発走まで 15〜25 分（at="10" なら 5〜15 分。v19）のレース（まだ取っていないもの）の 0B30 を取って保存する。各レース1回。"""
     from . import jvlink
+    limit = 20 if at == "20" else DRIFT10_TIMEOUT - 7
     fetch = fetch or (lambda keys: jvlink.fetch_rt_odds(keys, dataspec="0B30", out_dir=data_dir, date=date,
-                                                        log=lambda *a, **k: None, deadline=time.time() + 20,
+                                                        log=lambda *a, **k: None, deadline=time.time() + limit,
                                                         max_same_errors=MAX_SAME_ERRORS))
     sch = schedule if schedule is not None else day_schedule(date, data_dir)
-    done_path = day_dir(date) / "drift_collected.csv"
+    done_path = day_dir(date) / DRIFT_KINDS[at]["done"]
     done = set(pd.read_csv(done_path, dtype=str, encoding="utf-8-sig")["レースID"]) if done_path.exists() else set()
     rows = []
     for _, r in sch.iterrows():
         m = (post_time(date, r["発走"]) - now).total_seconds() / 60
-        if DRIFT_WINDOW[0] <= m <= DRIFT_WINDOW[1] and r["レースID"] not in done:
+        if _in_drift_window(m, at) and r["レースID"] not in done:
             rows.append({"レースID": r["レースID"], "キー": r["キー"], "分前": round(m, 1)})
     if not rows:
         return {"レース": 0}
@@ -2238,12 +2294,12 @@ def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, sche
     c = fetch([x["キー"] for x in rows])
     # fetch_rt_odds は rt/<日付> に書くので、集めた分は rt_drift/<日付> に移す（重賞の買い目の読み込みと混ぜない）
     moved = []
-    dst = drift_dir(data_dir, date)
+    dst = drift_dir(data_dir, date, at)
     dst.mkdir(parents=True, exist_ok=True)
     for f in c.get("保存ファイル", []):
         f = Path(f)
         if f.exists():
-            target = dst / f.name.replace("_0B30_", "_drift_")
+            target = dst / f.name.replace("_0B30_", DRIFT_KINDS[at]["tag"])
             f.replace(target)
             moved.append(str(target))
     stamp = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -2251,9 +2307,11 @@ def collect_drift_odds(date: str, now: datetime, data_dir=None, fetch=None, sche
     return {"レース": len(rows), "レコード": c.get("レコード", 0), "秒": round(time.perf_counter() - t0, 1), "保存": moved}
 
 
-def drift_pairs(data_dir=None, since: str | None = None) -> pd.DataFrame:
-    """集めた20分前ごろのオッズと確定オッズ（fetch-odds で保存）を、全部の組で比べる（1組1行）。"""
-    base = realodds.odds.odds_dir(data_dir) / "rt_drift"
+def drift_pairs(data_dir=None, since: str | None = None, at: str = "20") -> pd.DataFrame:
+    """集めた20分前ごろ（at="10" なら10分前ごろ）のオッズと確定オッズ（fetch-odds で保存）を、全部の組で比べる（1組1行）。
+
+    列の名前は at によらず「20分前のオッズ」（at="10" のときは10分前のオッズが入る）。"""
+    base = realodds.odds.odds_dir(data_dir) / DRIFT_KINDS[at]["dir"]
     parts = []
     for d in sorted(base.glob("2*")) if base.exists() else []:
         if since and d.name < since:
@@ -2276,10 +2334,11 @@ def drift_pairs(data_dir=None, since: str | None = None) -> pd.DataFrame:
                 m = m.loc[(m["pre"] > 0) & (m["fin"] > 0)]
                 if m.empty:
                     continue
-                parts.append(pd.DataFrame({"日付": d.name, "レースID": rid, "券種": kind, "20分前のオッズ": m["pre"].to_numpy(),
+                parts.append(pd.DataFrame({"日付": d.name, "レースID": rid, "券種": kind,
+                                           "組": ["-".join(map(str, x)) for x in m["k"]], "20分前のオッズ": m["pre"].to_numpy(),
                                            "確定オッズ": m["fin"].to_numpy()}))
     if not parts:
-        return pd.DataFrame(columns=["日付", "レースID", "券種", "20分前のオッズ", "確定オッズ"])
+        return pd.DataFrame(columns=["日付", "レースID", "券種", "組", "20分前のオッズ", "確定オッズ"])
     t = pd.concat(parts, ignore_index=True)
     grades = race_grades(data_dir, set(t["レースID"]))
     t["グレード"] = t["レースID"].map(grades).fillna("")
@@ -2341,8 +2400,70 @@ def _drift_rows(pairs: pd.DataFrame, label: str) -> list[dict]:
     return rows
 
 
+F_BANDS = ("10〜50倍", "50〜100倍", "100〜300倍")      # v19：F がよく買う帯（最終の時刻の決め方で使う）
+
+
+def drift_compare(p20: pd.DataFrame, p10: pd.DataFrame) -> pd.DataFrame:
+    """v19：同じ組で、確定 ÷ 20分前 と 確定 ÷ 10分前 を並べる（区分 × 券種 × 20分前のオッズの帯。両方ある組だけ）。
+
+    「券種 = 4券種（F の帯）」の行は、F がよく買う 10〜300倍 の帯の4券種まとめ（最終の時刻の決め方に使う）。
+    """
+    if p20.empty or p10.empty:
+        return pd.DataFrame()
+    b = p10[["レースID", "券種", "組", "20分前のオッズ", "r", "確定でも届く"]].rename(
+        columns={"20分前のオッズ": "10分前のオッズ", "r": "r10", "確定でも届く": "届く10"})
+    m = p20.merge(b, on=["レースID", "券種", "組"])
+    if m.empty:
+        return pd.DataFrame()
+
+    def row(label, kind, band, g):
+        return {"区分": label, "券種": kind, "20分前のオッズの帯": band, "組の数": len(g), "レース数": g["レースID"].nunique(),
+                "r の中央値（確定÷20分前）": float(g["r"].median()), "log r の標準偏差（20分前）": float(np.log(g["r"]).std()),
+                "確定でも届く割合（20分前）": float(g["確定でも届く"].mean()),
+                "r の中央値（確定÷10分前）": float(g["r10"].median()), "log r の標準偏差（10分前）": float(np.log(g["r10"]).std()),
+                "確定でも届く割合（10分前）": float(g["届く10"].mean())}
+    rows = []
+    for label, sel in DRIFT_GROUPS:
+        if sel is None:
+            g0 = m
+        elif sel == "G1":
+            g0 = m.loc[m["グレード"] == "G1"]
+        else:
+            g0 = m.loc[m["区分"] == sel]
+        if g0.empty:
+            continue
+        for (kind, band), g in g0.groupby(["券種", "帯"], sort=False):
+            rows.append(row(label, kind, band, g))
+        f = g0.loc[g0["帯"].isin(F_BANDS)]
+        if not f.empty:
+            rows.append(row(label, "4券種（F の帯）", "10〜300倍", f))
+    order = {k: i for i, k in enumerate([*realodds.KIND_TYPES, "4券種（F の帯）"])}
+    band = {x: i for i, x in enumerate([*realodds.ODDS_BIN_LABELS, "10〜300倍"])}
+    grp = {g: i for i, (g, _) in enumerate(DRIFT_GROUPS)}
+    return pd.DataFrame(rows).sort_values(
+        ["区分", "券種", "20分前のオッズの帯"],
+        key=lambda s_: s_.map(grp) if s_.name == "区分" else s_.map(order) if s_.name == "券種" else s_.map(band)).reset_index(drop=True)
+
+
+def final10_drift_check(cmp: pd.DataFrame) -> dict | None:
+    """決め方の 1：重賞・F の帯（10〜300倍）・4券種まとめ・同じ組で、確定でも届く割合が10分前のほうが高いか。"""
+    if cmp is None or cmp.empty:
+        return None
+    x = cmp.loc[(cmp["区分"] == "重賞") & (cmp["券種"] == "4券種（F の帯）")]
+    if x.empty:
+        return None
+    x = x.iloc[0]
+    a, b = float(x["確定でも届く割合（20分前）"]), float(x["確定でも届く割合（10分前）"])
+    return {"組の数": int(x["組の数"]), "レース数": int(x["レース数"]), "20分前": a, "10分前": b, "満たす": b > a}
+
+
 def drift_samples_path() -> Path:
     return raceday_dir() / "drift_samples.csv.gz"
+
+
+def drift10_samples_path() -> Path:
+    """v19：10分前ごろ → 確定 のずれのサンプル（最終を10分前にしたとき、rebalance-decide がこちらを使う）。"""
+    return raceday_dir() / "drift10_samples.csv.gz"
 
 
 def _cmd_drift(args) -> int:
@@ -2364,6 +2485,27 @@ def _cmd_drift(args) -> int:
     pairs[["日付", "レースID", "区分", "グレード", "券種", "帯", "r"]].to_csv(drift_samples_path(), index=False,
                                                                      encoding="utf-8-sig", compression="gzip")
     print(f"\n保存: {raceday_dir() / 'drift_table.csv'}・{drift_samples_path()}（py -m src.v9 rebalance --drift data で使う）")
+    p10 = drift_pairs(args.data, args.since, at="10")
+    if p10.empty:
+        print("\n（10分前ごろのオッズはまだありません。v19 から当日の自動実行で data\\jvlink\\odds\\rt_drift10 に集めます）")
+        return 0
+    p10[["日付", "レースID", "区分", "グレード", "券種", "帯", "r"]].to_csv(drift10_samples_path(), index=False,
+                                                                   encoding="utf-8-sig", compression="gzip")
+    cmp = drift_compare(pairs, p10)
+    print(f"\n=== v19：同じ組で 20分前 と 10分前 を並べる（{p10['レースID'].nunique()} レースに10分前のオッズ。両方ある組だけ。"
+          "帯は20分前のオッズで） ===")
+    if cmp.empty:
+        print("（20分前と10分前の両方がある組がありません）")
+        return 0
+    with pd.option_context("display.width", 300, "display.max_columns", 30, "display.max_rows", 200):
+        print(cmp.to_string(index=False))
+    cmp.to_csv(raceday_dir() / "drift_compare_10.csv", index=False, encoding="utf-8-sig")
+    chk = final10_drift_check(cmp)
+    if chk:
+        print(f"\n■ 最終の時刻の決め方の 1（重賞・10〜300倍・4券種まとめ・{chk['組の数']:,} 組・{chk['レース数']} レース）："
+              f"確定でも届く割合 20分前 {chk['20分前']:.1%} → 10分前 {chk['10分前']:.1%} → "
+              + ("満たす（10分前のほうが高い）" if chk["満たす"] else "満たさない"))
+    print(f"保存: {raceday_dir() / 'drift_compare_10.csv'}・{drift10_samples_path()}")
     return 0
 
 
@@ -2400,16 +2542,17 @@ def parse_dates(spec: str) -> list[str]:
     return sorted(set(out))
 
 
-def drift_race_ids(data_dir, date: str) -> set[str]:
+def drift_race_ids(data_dir, date: str, at: str = "20") -> set[str]:
     ids: set[str] = set()
-    d = drift_dir(data_dir, date)
+    d = drift_dir(data_dir, date, at)
     for f in d.glob("O1_*.npz") if d.exists() else []:
         with np.load(f, allow_pickle=False) as z:
             ids |= set(map(str, z["race_id"]))
     return ids
 
 
-def practice_day(ds, raw: dict, date: str, data_dir=None, refit: bool = False, verbose: bool = True) -> tuple[pd.DataFrame, dict]:
+def practice_day(ds, raw: dict, date: str, data_dir=None, refit: bool = False, verbose: bool = True,
+                 at: str = "20", only: set | None = None, plans_name: str = "plans.json") -> tuple[pd.DataFrame, dict]:
     """1日分：平地の全レースのうち、集めた20分前ごろのオッズがあるレースで F を作り、実際の払戻で答え合わせ。
 
     係数はその日の prep.json（あれば）、無ければ前日までの平場で推定。当日の傾向は確定データに本番と同じ決まり（40分以上前）を当てはめる。
@@ -2418,7 +2561,9 @@ def practice_day(ds, raw: dict, date: str, data_dir=None, refit: bool = False, v
     rr = ds.race_result
     day = rr.loc[pd.to_datetime(rr["レース日付"]) == pd.Timestamp(date)]
     day = day.loc[day["芝・ダート区分"].isin(["芝", "ダート"])]               # 障害は除く
-    have = drift_race_ids(data_dir, date)
+    have = drift_race_ids(data_dir, date, at)
+    if only is not None:
+        have &= set(only)
     ids = [r for r in day["レースID"].astype(str).unique() if r in have]
     info = {"日付": date, "平地のレース": int(day["レースID"].nunique()), "20分前のオッズあり": len(ids)}
     if not ids:
@@ -2435,12 +2580,12 @@ def practice_day(ds, raw: dict, date: str, data_dir=None, refit: bool = False, v
     payout = jvmap.prepare_payout(raw["HR"]).set_index("レースID")
     rows, plans, skipped = [], [], {"オッズが読めない・買い目を作れない": 0, "結果・払戻が無い": 0}
     for rid in ids:
-        snap = realodds.load_race_odds(drift_dir(data_dir, date), rid)
+        snap = realodds.load_race_odds(drift_dir(data_dir, date, at), rid)
         race = tg.loc[tg["レースID"] == rid]
         if not snap or race.empty:
             skipped["オッズが読めない・買い目を作れない"] += 1
             continue
-        snap["出どころ"] = "集めた20分前ごろのオッズ（rt_drift）"
+        snap["出どころ"] = f"集めた{DRIFT_KINDS[at]['名前']}ごろのオッズ（{DRIFT_KINDS[at]['dir']}）"
         try:
             plan = compute_plan(race, snap, coefs, day, results_ok=True)
         except Exception:
@@ -2466,7 +2611,7 @@ def practice_day(ds, raw: dict, date: str, data_dir=None, refit: bool = False, v
                      "オッズの取得時刻": plan["オッズの取得時刻"], "k": k, "m": m})
         plans.append(plan)
     info.update(skipped)
-    write_json(practice_dir() / date / "plans.json", plans)
+    write_json(practice_dir() / date / plans_name, plans)
     return pd.DataFrame(rows), info
 
 
@@ -2505,7 +2650,382 @@ def practice_summary(records: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+# ---------------------------------------------------------------------------
+# v19 1：「当たったのに5万円に届かない」の調査（記述だけ。F・当日の仕組みは変えない）
+# ---------------------------------------------------------------------------
+EXPLAIN_F_BAND = ("10〜50倍", "50〜100倍", "100〜300倍")      # F がよく買う帯（当たった組と全部の組の r を比べる範囲）
+ODDS_MATCH_TOL = 0.051                                        # 倍。保存したオッズは 0.1 倍刻み
+
+
+def _combo_key(kind: str, horses) -> tuple:
+    h = tuple(int(x) for x in horses)
+    return tuple(sorted(h)) if kind in ("馬連", "3連複") else h
+
+
+def _odds_lookup(snap: dict | None, kind: str) -> dict:
+    """スナップショットの券種 → {組: オッズ（倍）}。"""
+    if not snap or kind not in snap:
+        return {}
+    combos, pay = snap[kind]
+    return {_combo_key(kind, c): float(v) / 100 for c, v in zip(combos, pay)}
+
+
+def _minutes_before(date: str, hhmm, when: datetime | None) -> float | None:
+    if when is None or hhmm is None or str(hhmm) in ("", "nan"):
+        return None
+    return round((post_time(date, str(hhmm).zfill(4)) - when).total_seconds() / 60, 1)
+
+
+def _announced_dt(date: str, ann) -> datetime | None:
+    a = str(ann or "")
+    if len(a) != 8:
+        return None
+    try:
+        return datetime(int(date[:4]), int(a[:2]), int(a[2:4]), int(a[4:6]), int(a[6:]))
+    except ValueError:
+        return None
+
+
+def _v9_hit_miss() -> pd.DataFrame:
+    """検証（v9 rebalance の保存した表）の平場・k = 1.4：的中したレースのうち 5万円に届かなかった割合。"""
+    base = predict.data_root() / "v9" / "rebalance"
+    rows = []
+    for f in sorted(base.glob("rebalance_*.csv")) if base.exists() else []:
+        if "_pivot_" in f.name or f.name.endswith("_drift_draws.csv"):
+            continue
+        t = pd.read_csv(f, encoding="utf-8-sig")
+        need = {"区分", "k", "付け替え", "ずれ", "レース数", "熱い当たりの割合", "当たったのに届かず"}
+        if not need <= set(t.columns):
+            continue
+        t = t.loc[(t["区分"] == "平場") & (np.isclose(t["k"], MARGIN))
+                  & t["付け替え"].isin(["付け替えなし", "m = 1.00"])]
+        for _, x in t.iterrows():
+            n = int(x["レース数"])
+            hot = float(x["熱い当たりの割合"]) * n
+            miss = float(x["当たったのに届かず"])
+            name = "F（確定オッズで評価・付け替えなし）" if x["付け替え"] == "付け替えなし" else \
+                f"F・m = 1.00・ずれ{str(x['ずれ'] or '').split('（')[0]}"
+            rows.append({"ファイル": f.name, "検証の形": name, "レース数": n, "熱い当たり": round(hot, 1),
+                         "当たったのに届かず": round(miss, 1),
+                         "的中のうち届かずの割合": miss / (hot + miss) if hot + miss > 0 else np.nan})
+    return pd.DataFrame(rows).drop_duplicates(["検証の形", "レース数", "熱い当たり", "当たったのに届かず"]) if rows else pd.DataFrame()
+
+
+def explain_practice(data_dir=None, dates: list[str] | None = None) -> dict:
+    """練習の記録（records.csv と plans.json）から：届かなかったレースの当たった買い目ごとの中身と、バグかずれかを見分けるための確認。"""
+    from . import results
+    path = practice_dir() / "records.csv"
+    if not path.exists():
+        return {}
+    rec = pd.read_csv(path, dtype={"レースID": str, "日付": str}, encoding="utf-8-sig")
+    if dates:
+        rec = rec.loc[rec["日付"].isin(set(dates))]
+    if rec.empty:
+        return {}
+    ids = list(rec["レースID"])
+    raw = jvmap.load_raw(data_dir, record_types=("RA", "SE", "HR"))
+    res = results.race_results(raw, ids)
+    payout = jvmap.prepare_payout(raw["HR"]).set_index("レースID")
+    fin_dir = realodds.odds.odds_dir(data_dir)
+    hits, misses_cause, odd_rows, winners_r, all_r = [], [], [], [], []
+    chk = {"買い目": 0, "本物のオッズあり": 0, "本物のオッズなし": 0, "20分前で届いていない": 0,
+           "20分前で届いていないのに印が無い": 0, "保存したオッズと違う": 0, "払戻と確定オッズが合わない": 0,
+           "記録はあるのに買い目の保存が無いレース": 0}
+    timing = []
+    for date, g in rec.groupby("日付", sort=True):
+        plans = {str(p.get("レースID")): p for p in (read_json(practice_dir() / date / "plans.json") or [])}
+        cpath = day_dir(date) / "drift_collected.csv"
+        coll = pd.read_csv(cpath, dtype=str, encoding="utf-8-sig").drop_duplicates("レースID").set_index("レースID") \
+            if cpath.exists() else pd.DataFrame()
+        spath = day_dir(date) / "all_races.csv"
+        sch = pd.read_csv(spath, dtype=str, encoding="utf-8-sig").set_index("レースID")["発走"].to_dict() if spath.exists() else {}
+        for _, x in g.iterrows():
+            rid = x["レースID"]
+            plan = plans.get(rid)
+            if plan is None:
+                chk["記録はあるのに買い目の保存が無いレース"] += 1
+                continue
+            pre = realodds.load_race_odds(drift_dir(data_dir, date), rid, require_win=False)
+            fin = realodds.load_race_odds(fin_dir, rid, final_only=True, require_win=False)
+            got = None
+            try:
+                got = datetime.strptime(str(plan.get("オッズの取得時刻") or "")[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+            post = sch.get(rid)
+            m_coll = float(coll.loc[rid, "分前"]) if not coll.empty and rid in coll.index and str(coll.loc[rid, "分前"]) != "nan" else None
+            m_got = _minutes_before(date, post, got)
+            m_ann = _minutes_before(date, post, _announced_dt(date, plan.get("オッズの発表")))
+            timing.append({"日付": date, "レースID": rid, "区分": x["区分"], "集めたときの分前": m_coll,
+                           "オッズを取った時刻の分前": m_got, "オッズの発表の分前": m_ann})
+            h = res.loc[res["レースID"] == rid]
+            scratched = {int(v) for v in h.loc[h["異常区分"].isin(results.REFUND_IJYO), "馬番"].dropna()} if not h.empty else set()
+            wins = bets.winning_combos(payout.loc[rid]) if rid in payout.index else {}
+            look_pre = {k: _odds_lookup(pre, k) for k in realodds.KIND_TYPES}
+            look_fin = {k: _odds_lookup(fin, k) for k in realodds.KIND_TYPES}
+            race_hits = []
+            for b in plan["買い目"]:
+                kind = b["券種"]
+                key = _combo_key(kind, b["馬番"])
+                amount = int(b["金額"])
+                real = b.get("本物のオッズ")
+                chk["買い目"] += 1
+                pre_o = look_pre.get(kind, {}).get(key)
+                reach_pre = None
+                if real is None:
+                    chk["本物のオッズなし"] += 1
+                else:
+                    chk["本物のオッズあり"] += 1
+                    if pre_o is None or abs(pre_o - float(real)) > ODDS_MATCH_TOL + 1e-3 * float(real):
+                        chk["保存したオッズと違う"] += 1
+                        odd_rows.append({"日付": date, "レースID": rid, "券種": kind, "組番": bet_text(b),
+                                         "買い目の本物のオッズ": real, "保存した20分前のオッズ": pre_o})
+                    reach_pre = float(real) * amount >= TARGET - 1e-6
+                    if not reach_pre:
+                        chk["20分前で届いていない"] += 1
+                        if b.get("届く") is not False:
+                            chk["20分前で届いていないのに印が無い"] += 1
+                win = wins.get(kind, {}).get(key)
+                if not win:
+                    continue
+                fin_o = look_fin.get(kind, {}).get(key)
+                dead = len(wins.get(kind, {})) > 1
+                refund = bool(set(int(v) for v in b["馬番"]) & scratched)
+                pay = win * amount / 100
+                if fin_o is not None and not dead and abs(fin_o * 100 - win) > max(10.0, 0.02 * win):
+                    chk["払戻と確定オッズが合わない"] += 1
+                orig = int(b.get("元の金額", amount))
+                race_hits.append({
+                    "日付": date, "レースID": rid, "場": x.get("場", ""), "R": x.get("R", ""), "区分": x["区分"],
+                    "届かず": bool(x["当たったのに届かず"]), "券種": kind, "組番": bet_text(b),
+                    "金額（付け替え後）": amount, "金額（付け替え前）": orig, "付け替えた": orig != amount,
+                    "推定配当（100円）": b.get("推定配当"), "本物のオッズがあった": real is not None,
+                    "20分前のオッズ": real, "20分前の払戻見込み": None if real is None else round(float(real) * amount),
+                    "20分前で届いていた": reach_pre, "オッズを取った時刻": str(plan.get("オッズの取得時刻") or "")[11:19],
+                    "発走の何分前": m_got if m_got is not None else m_coll,
+                    "確定オッズ": fin_o, "r（確定÷20分前）": (fin_o / float(real)) if fin_o and real else
+                    ((win / 100) / float(real) if real else None),
+                    "実際の払戻（100円）": win, "実際の払戻": round(pay), "5万円に足りなかった額": max(0, round(TARGET - pay)),
+                    "同着": dead, "返還・取消": refund})
+            hits += race_hits
+            if x["当たったのに届かず"] and race_hits:
+                if any(r["同着"] for r in race_hits):
+                    cause = "同着（払戻が分かれた）"
+                elif any(r["返還・取消"] for r in race_hits):
+                    cause = "返還・取消"
+                elif any(not r["本物のオッズがあった"] for r in race_hits):
+                    cause = "本物のオッズが無く、推定配当で金額を決めた"
+                elif any(r["20分前で届いていた"] is False for r in race_hits):
+                    cause = "20分前のオッズでも届いていなかった（予算の中で回しきれなかった）"
+                else:
+                    cause = "オッズのずれ（20分前のオッズでは届いていた → 確定で下がった）"
+                misses_cause.append({"日付": date, "レースID": rid, "場": x.get("場", ""), "R": x.get("R", ""),
+                                     "払戻": round(sum(r["実際の払戻"] for r in race_hits)), "見立て": cause})
+            # 当たった組と全部の組の r（20分前 → 確定）。F の買い目に関係なく、そのレースの全部の組で
+            for kind in realodds.KIND_TYPES:
+                lp, lf = look_pre.get(kind, {}), look_fin.get(kind, {})
+                for key, w in wins.get(kind, {}).items():
+                    p0 = lp.get(key)
+                    if p0:
+                        winners_r.append({"区分": x["区分"], "券種": kind, "帯": _band_of(p0), "r": (w / 100) / p0})
+                for key, p0 in lp.items():
+                    f0 = lf.get(key)
+                    if f0 and p0 > 0:
+                        all_r.append((x["区分"], kind, _band_of(p0), f0 / p0))
+    out = {"記録": rec, "当たった買い目": pd.DataFrame(hits), "届かなかったレース": pd.DataFrame(misses_cause),
+           "確認": chk, "オッズの食い違い": pd.DataFrame(odd_rows), "時刻": pd.DataFrame(timing),
+           "当たった組の r": pd.DataFrame(winners_r),
+           "全部の組の r": pd.DataFrame(all_r, columns=["区分", "券種", "帯", "r"]), "検証": _v9_hit_miss()}
+    return out
+
+
+def _band_of(odds_: float) -> str:
+    i = int(np.searchsorted(realodds.ODDS_BINS[1:-1], odds_, side="right"))
+    return realodds.ODDS_BIN_LABELS[i]
+
+
+def _cmd_practice_explain(args) -> int:
+    dates = parse_dates(args.date) if args.date else None
+    print("※ 記述だけ。F・当日の仕組みは変えない（「当たったのに5万円に届かない」がオッズのずれか、バグかを切り分ける）")
+    e = explain_practice(args.data, dates)
+    if not e:
+        print("練習の記録がありません（先に `py -m src.raceday practice --date …`）")
+        return 1
+    rec, hits, causes, chk = e["記録"], e["当たった買い目"], e["届かなかったレース"], e["確認"]
+    print(f"対象: {rec['日付'].nunique()} 日・{len(rec)} レース（{', '.join(sorted(rec['日付'].unique()))}）")
+    show = ["日付", "場", "R", "券種", "組番", "金額（付け替え後）", "金額（付け替え前）", "付け替えた", "推定配当（100円）",
+            "本物のオッズがあった", "20分前のオッズ", "20分前の払戻見込み", "オッズを取った時刻", "発走の何分前", "確定オッズ",
+            "r（確定÷20分前）", "実際の払戻", "5万円に足りなかった額", "同着", "返還・取消"]
+    print("\n=== 1. 当たったのに5万円に届かなかったレース：当たった買い目ごと ===")
+    miss_hits = hits.loc[hits["届かず"]] if not hits.empty else hits
+    if miss_hits.empty:
+        print("（ありません）")
+    else:
+        with pd.option_context("display.width", 300, "display.max_columns", 40, "display.max_rows", 200):
+            print(miss_hits[show].to_string(index=False))
+        print("\n  レースごとの見立て:")
+        for _, c in causes.iterrows():
+            print(f"    {c['日付']} {c['場']}{c['R']}R 払戻 {c['払戻']:,}円 → {c['見立て']}")
+    print("\n=== 2. 確かめたこと（練習の全部の買い目） ===")
+    n = max(chk["買い目"], 1)
+    print(f"  買い目 {chk['買い目']:,} 点のうち、本物のオッズ（20分前）があった {chk['本物のオッズあり']:,} 点・"
+          f"無いまま推定配当で金額を決めた {chk['本物のオッズなし']:,} 点（{chk['本物のオッズなし'] / n:.1%}）")
+    print(f"  付けた金額 × 20分前のオッズ が 5万円に届いていなかった買い目: {chk['20分前で届いていない']:,} 点"
+          f"（うち「届かない」の印が付いていなかったもの {chk['20分前で届いていないのに印が無い']:,} 点 ← 0 でなければ計算か付け替えのバグ）")
+    print(f"  買い目の「本物のオッズ」と、保存した20分前のオッズの食い違い: {chk['保存したオッズと違う']:,} 点（0 でなければ組の読み違いのバグ）")
+    print(f"  当たった組の実際の払戻と、確定オッズの食い違い（同着を除く）: {chk['払戻と確定オッズが合わない']:,} 点")
+    if chk["記録はあるのに買い目の保存が無いレース"]:
+        print(f"  記録はあるのに plans.json に買い目が無いレース: {chk['記録はあるのに買い目の保存が無いレース']}（その日の practice を回し直す）")
+    t = e["時刻"]
+    if not t.empty:
+        lo, hi = DRIFT_WINDOW
+        mc = pd.to_numeric(t["集めたときの分前"], errors="coerce")
+        mg = pd.to_numeric(t["オッズを取った時刻の分前"], errors="coerce")
+        ma = pd.to_numeric(t["オッズの発表の分前"], errors="coerce")
+        out_w = int(((mc < lo) | (mc > hi)).sum())
+        if mc.notna().any():
+            print(f"  20分前のオッズを集めた時刻：発走の {mc.min():.1f}〜{mc.max():.1f} 分前（中央値 {mc.median():.1f}）。"
+                  f"決めた範囲（{lo}〜{hi} 分前）の外 {out_w} レース・分からない {int(mc.isna().sum())} レース")
+        else:
+            print("  20分前のオッズを集めた時刻：記録（drift_collected.csv）がありません")
+        if mg.notna().any():
+            print(f"  オッズを取った時刻（保存した版）：発走の {mg.min():.1f}〜{mg.max():.1f} 分前（中央値 {mg.median():.1f}）")
+        if ma.notna().any():
+            print(f"  オッズの発表時刻：発走の {ma.min():.1f}〜{ma.max():.1f} 分前（中央値 {ma.median():.1f}）")
+    print("\n=== 3. 的中したレースのうち5万円に届かなかった割合：練習と検証 ===")
+    for kind, g in rec.groupby("区分"):
+        hit = int(g["的中"].astype(bool).sum())
+        miss = int(g["当たったのに届かず"].astype(bool).sum())
+        print(f"  練習・{kind}：{len(g)} レース・的中 {hit}・うち届かず {miss}（{miss / hit:.0%}）" if hit else
+              f"  練習・{kind}：{len(g)} レース・的中 0")
+    v = e["検証"]
+    if v.empty:
+        print("  検証：保存した表がありません。`py -m src.v9 rebalance --drift none`（30〜60分）のあとに、もう一度")
+    else:
+        for _, x in v.iterrows():
+            print(f"  検証・平場（{x['ファイル']}）{x['検証の形']}：{x['レース数']:,} レース・熱い {x['熱い当たり']:.0f}・"
+                  f"届かず {x['当たったのに届かず']:.0f}（的中のうち {x['的中のうち届かずの割合']:.0%}）")
+    wr, ar = e["当たった組の r"], e["全部の組の r"]
+    print(f"\n=== 4. 20分前 → 確定 のずれ：当たった組と全部の組（{'・'.join(EXPLAIN_F_BAND)}。F がよく買う帯） ===")
+    if wr.empty or ar.empty:
+        print("（確定オッズか20分前のオッズがありません）")
+    else:
+        for kind in ("平場", "重賞（参考）"):
+            w = wr.loc[(wr["区分"] == kind) & wr["帯"].isin(EXPLAIN_F_BAND), "r"]
+            a = ar.loc[(ar["区分"] == kind) & ar["帯"].isin(EXPLAIN_F_BAND), "r"]
+            if len(w) and len(a):
+                print(f"  {kind}：当たった組 {len(w)} 組の r の中央値 {w.median():.3f}（r < 1 の割合 {(w < 1).mean():.0%}）／"
+                      f"全部の組 {len(a):,} 組の r の中央値 {a.median():.3f}（r < 1 の割合 {(a < 1).mean():.0%}）")
+        print("    r < 1 = 20分前より確定のほうが低い（20分前でぎりぎり5万円に届く金額だと、確定では届かない）")
+    print("\n=== 5. 見立て ===")
+    bug = chk["20分前で届いていないのに印が無い"] + chk["保存したオッズと違う"] + chk["払戻と確定オッズが合わない"]
+    if bug:
+        print("  !!! バグの疑い：上の 2 の「0 でなければバグ」のどれかが 0 ではない。食い違いの組を data\\raceday\\practice\\explain_*.csv で確かめる")
+    else:
+        print("  計算・付け替え・組の読み・払戻の照合に食い違いは見つからなかった（バグの印なし）")
+    if not causes.empty:
+        cnt = causes["見立て"].value_counts()
+        print("  届かなかったレースの見立て: " + " / ".join(f"{k} {v}" for k, v in cnt.items()))
+        drift_n = int(cnt.get("オッズのずれ（20分前のオッズでは届いていた → 確定で下がった）", 0))
+        if not bug and drift_n >= len(causes) / 2:
+            print("  → 主な原因は「オッズのずれ」と見る：20分前のオッズでちょうど5万円に届く金額にしてあり、当たる組は締切までにオッズが下がりやすい。"
+                  "検証は確定オッズで金額を決めるので、このずれが入っていない（m の決定と、最終を10分前にするかの確認で扱う）")
+    out = practice_dir()
+    hits.to_csv(out / "explain_hits.csv", index=False, encoding="utf-8-sig")
+    causes.to_csv(out / "explain_misses.csv", index=False, encoding="utf-8-sig")
+    if not e["オッズの食い違い"].empty:
+        e["オッズの食い違い"].to_csv(out / "explain_odds_mismatch.csv", index=False, encoding="utf-8-sig")
+    print(f"\n保存: {out / 'explain_hits.csv'}（当たった買い目すべて）・{out / 'explain_misses.csv'}")
+    return 0
+
+
+COMPARE10_PATH = "compare_at10.csv"
+
+
+def practice_compare10(ds, raw: dict, date: str, data_dir=None, refit: bool = False) -> tuple[pd.DataFrame, dict]:
+    """v19：同じレース（20分前と10分前の両方のオッズがあるレース）で、20分前に作った F と10分前に作った F を比べる。"""
+    both = drift_race_ids(data_dir, date, "20") & drift_race_ids(data_dir, date, "10")
+    info = {"日付": date, "両方あり": len(both)}
+    if not both:
+        return pd.DataFrame(), info
+    a, _ = practice_day(ds, raw, date, data_dir, refit, verbose=False, at="20", only=both, plans_name="plans_at20.json")
+    b, _ = practice_day(ds, raw, date, data_dir, refit, verbose=False, at="10", only=both, plans_name="plans_at10.json")
+    if a.empty or b.empty:
+        return pd.DataFrame(), info
+    cols = ["レースID", "点数", "投資", "払戻", "的中", "熱い", "当たったのに届かず", "予測の達成確率", "付け替えた点数"]
+    m = a[["日付", "レースID", "場", "R", "レース名", "区分", *cols[1:]]].merge(b[cols], on="レースID", suffixes=("（20分前）", "（10分前）"))
+    info["比べたレース"] = len(m)
+    return m, info
+
+
+def compare10_summary(t: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for kind, g in t.groupby("区分", sort=False):
+        x, y = g["熱い（10分前）"].astype(bool).to_numpy(), g["熱い（20分前）"].astype(bool).to_numpy()
+        d = tri_paired(x, y)
+        rows.append({"区分": kind, "レース数": len(g), "熱い当たりの割合（20分前）": y.mean(), "熱い当たりの割合（10分前）": x.mean(),
+                     "差（10分前 − 20分前）": d["差"], "差の下限": d["差下限"], "差の上限": d["差上限"],
+                     "10分前だけ熱い": d["xだけ"], "20分前だけ熱い": d["yだけ"],
+                     "当たったのに届かず（20分前）": int(g["当たったのに届かず（20分前）"].astype(bool).sum()),
+                     "当たったのに届かず（10分前）": int(g["当たったのに届かず（10分前）"].astype(bool).sum()),
+                     "的中（20分前）": int(g["的中（20分前）"].astype(bool).sum()), "的中（10分前）": int(g["的中（10分前）"].astype(bool).sum())})
+    return pd.DataFrame(rows)
+
+
+def tri_paired(x, y) -> dict:
+    from . import trifecta
+    return trifecta.paired_proportion_test(np.asarray(x, dtype=bool), np.asarray(y, dtype=bool))
+
+
+def _cmd_practice_at10(args) -> int:
+    dates = parse_dates(args.date)
+    print("※ 記述だけ。F は変えない。同じレース（20分前と10分前の両方のオッズがあるレース）で、最終を作る時刻だけを変えて比べる")
+    ds = jvmap.build_dataset(args.data)
+    raw = jvmap.load_raw(args.data)
+    news = []
+    for d in dates:
+        t, info = practice_compare10(ds, raw, d, args.data, args.refit)
+        print(f"[{d}] 両方のオッズがあるレース {info['両方あり']}・比べたレース {info.get('比べたレース', 0)}")
+        if not t.empty:
+            news.append(t)
+    path = practice_dir() / COMPARE10_PATH
+    old = pd.read_csv(path, dtype={"レースID": str, "日付": str}, encoding="utf-8-sig") if path.exists() else pd.DataFrame()
+    new = pd.concat(news, ignore_index=True) if news else pd.DataFrame()
+    if not new.empty:
+        new = new.astype({"レースID": str, "日付": str})
+        old = old.loc[~old["レースID"].isin(set(new["レースID"]))] if not old.empty else old
+    allr = pd.concat([old, new], ignore_index=True) if not old.empty else new
+    if allr.empty:
+        print("\n比べられるレースがありません（10分前ごろのオッズは v19 から当日の自動実行で集めます）")
+        return 1
+    allr = allr.sort_values(["日付", "レースID"]).reset_index(drop=True)
+    allr.to_csv(path, index=False, encoding="utf-8-sig")
+    summ = compare10_summary(allr)
+    print(f"\n=== 通算（{allr['日付'].nunique()} 日・{len(allr)} レース。対応のある比較・差の区間は 95%） ===")
+    with pd.option_context("display.width", 300, "display.max_columns", 30):
+        print(summ.to_string(index=False))
+    flat = summ.loc[summ["区分"] == "平場"]
+    if not flat.empty:
+        f = flat.iloc[0]
+        ok = f["熱い当たりの割合（10分前）"] >= f["熱い当たりの割合（20分前）"]
+        print(f"\n■ 最終の時刻の決め方の 2（平場・{int(f['レース数'])} レース）：熱い当たりの割合 20分前 {f['熱い当たりの割合（20分前）']:.1%} → "
+              f"10分前 {f['熱い当たりの割合（10分前）']:.1%} → " + ("満たす（下回らない）" if ok else "満たさない（下回った）"))
+    summ.to_csv(practice_dir() / "compare_at10_summary.csv", index=False, encoding="utf-8-sig")
+    print(f"保存: {path}")
+    return 0
+
+
 def _cmd_practice(args) -> int:
+    if args.explain:
+        return _cmd_practice_explain(args)
+    if args.at == "10":
+        if not args.date:
+            print("--date を指定してください")
+            return 1
+        return _cmd_practice_at10(args)
+    if not args.date:
+        print("--date を指定してください（--explain なら省略できる）")
+        return 1
     dates = parse_dates(args.date)
     print("※ 記述だけ。F は変えない（見張りと確認のための記録。結果を見て F の買い方・確率・係数を変えることはしない）")
     print("  重賞の正式な記録は本番の自動実行（final.json と score）。ここに入る重賞は参考として分けて数える")
@@ -2666,7 +3186,7 @@ def replay_day(ds, date: str, data_dir=None, at: str | None = None, refit: bool 
             times.add(t)
             t += timedelta(minutes=INTERVAL)
         for p in posts:
-            times |= {p - timedelta(minutes=PROVISIONAL_BEFORE), p - timedelta(minutes=FINAL_BEFORE)}
+            times |= {p - timedelta(minutes=PROVISIONAL_BEFORE), p - timedelta(minutes=final_minutes(prep.get("係数")))}
         times = sorted(times)
     for now in times:
         run_once(prep, source, now, None, replay=True, log=lambda *_: None)
@@ -2802,6 +3322,76 @@ def _write_results_safely() -> None:
         print(f"画面用のデータを書けませんでした（他の結果は保存済み）: {type(e).__name__}: {e}")
 
 
+FINAL_DECISION_RULE = ("最終を10分前にするのは、次の2つを両方満たすときだけ（結果を見る前に決めたもの。v19・11/19）："
+                       "1. 重賞・F がよく買う帯（10〜300倍）・4券種まとめ・同じ組で、「確定でも届く割合」が10分前のほうが20分前より高い"
+                       "（raceday drift の比較）。2. 平場の練習の比べ方（practice --at 10）で、10分前の熱い当たりの割合が20分前を下回らない。"
+                       "どちらかが満たされなければ（データが無い場合も）20分前のまま")
+
+
+def final_decision_path() -> Path:
+    return raceday_dir() / "final_minutes_decision.csv"
+
+
+def decided_final_minutes() -> int | None:
+    """decide-final で決めた最終の時刻（まだなら None）。rebalance-decide がどちらのずれのサンプルを使うかに使う。"""
+    p = final_decision_path()
+    if not p.exists():
+        return None
+    t = pd.read_csv(p, encoding="utf-8-sig")
+    return int(t["決めた最終の分前"].iloc[-1]) if not t.empty else None
+
+
+def _cmd_decide_final(args) -> int:
+    prev = pd.read_csv(final_decision_path(), encoding="utf-8-sig") if final_decision_path().exists() else pd.DataFrame()
+    if not prev.empty and not args.rerun_reason:
+        print("最終の時刻の決定はすでに行われています（やり直さない）:")
+        print(prev.to_string(index=False))
+        return 1
+    print(f"ルール：{FINAL_DECISION_RULE}")
+    cp = raceday_dir() / "drift_compare_10.csv"
+    cmp = pd.read_csv(cp, encoding="utf-8-sig") if cp.exists() else pd.DataFrame()
+    c1 = final10_drift_check(cmp)
+    if c1 is None:
+        print(f"1. データなし（{cp} に重賞の比べがありません。月曜の fetch-odds のあとに `py -m src.raceday drift`）→ 満たさない")
+    else:
+        print(f"1. 重賞・10〜300倍・4券種（{c1['組の数']:,} 組・{c1['レース数']} レース）：確定でも届く割合 20分前 {c1['20分前']:.1%}"
+              f" → 10分前 {c1['10分前']:.1%} → {'満たす' if c1['満たす'] else '満たさない'}")
+    pp = practice_dir() / COMPARE10_PATH
+    t = pd.read_csv(pp, dtype={"レースID": str}, encoding="utf-8-sig") if pp.exists() else pd.DataFrame()
+    summ = compare10_summary(t) if not t.empty else pd.DataFrame()
+    flat = summ.loc[summ["区分"] == "平場"] if not summ.empty else summ
+    c2 = None
+    if flat.empty:
+        print(f"2. データなし（{pp} に平場がありません。`py -m src.raceday practice --date … --at 10`）→ 満たさない")
+    else:
+        f = flat.iloc[0]
+        c2 = {"レース数": int(f["レース数"]), "20分前": float(f["熱い当たりの割合（20分前）"]),
+              "10分前": float(f["熱い当たりの割合（10分前）"])}
+        c2["満たす"] = c2["10分前"] >= c2["20分前"]
+        print(f"2. 平場の練習（{c2['レース数']} レース）：熱い当たりの割合 20分前 {c2['20分前']:.1%} → 10分前 {c2['10分前']:.1%}"
+              f" → {'満たす' if c2['満たす'] else '満たさない'}"
+              f"（差 {f['差（10分前 − 20分前）']:+.1%}・95% 区間 [{f['差の下限']:+.1%}, {f['差の上限']:+.1%}]）")
+    ten = bool(c1 and c1["満たす"] and c2 and c2["満たす"])
+    fb = 10 if ten else FINAL_BEFORE
+    row = {"実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "1 重賞の届く割合 20分前": c1["20分前"] if c1 else None, "1 10分前": c1["10分前"] if c1 else None,
+           "1 組の数": c1["組の数"] if c1 else 0, "2 平場の熱い 20分前": c2["20分前"] if c2 else None,
+           "2 10分前": c2["10分前"] if c2 else None, "2 レース数": c2["レース数"] if c2 else 0,
+           "決めた最終の分前": fb, "やり直しの理由": args.rerun_reason or ""}
+    pd.concat([prev, pd.DataFrame([row])], ignore_index=True).to_csv(final_decision_path(), index=False, encoding="utf-8-sig")
+    km = predict.data_root() / "v9" / "rebalance_decision.csv"
+    kmt = pd.read_csv(km, encoding="utf-8-sig") if km.exists() else pd.DataFrame()
+    print(f"\n■ 決定：最終は発走 {fb} 分前。記録: {final_decision_path()}")
+    if fb != FINAL_BEFORE:
+        print("  このあと k・m を決める `py -m src.v9 rebalance-decide` は、10分前ごろ → 確定 のずれ（drift10_samples）で試算する")
+    if not kmt.empty:
+        k, m = float(kmt["決めた k"].iloc[-1]), float(kmt["決めた m"].iloc[-1])
+        print(f"  当日の仕組みに入れる: py -m src.raceday freeze --k {k} --m {m} --final-minutes {fb}")
+    else:
+        print(f"  k・m を決めたあと（rebalance-decide）に: py -m src.raceday freeze --k … --m … --final-minutes {fb}")
+    return 0
+
+
 def _cmd_freeze(args) -> int:
     src = Path(args.source) if args.source else None
     if src is None:
@@ -2813,8 +3403,11 @@ def _cmd_freeze(args) -> int:
     c = read_json(src)
     k = args.k if args.k is not None else float(c.get("k", MARGIN))
     m = args.m if args.m is not None else float(c.get("m", 1.0))
-    write_json(frozen_path(), {**c, "k": k, "m": m, "固定した日": datetime.now().strftime("%Y-%m-%d"), "元": src.name})
-    print(f"係数を固定しました（{src.name} → {frozen_path().name}。最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}）。"
+    fb = check_final_minutes(args.final_minutes) if args.final_minutes is not None else final_minutes(c)
+    write_json(frozen_path(), {**c, "k": k, "m": m, "最終の分前": fb, "固定した日": datetime.now().strftime("%Y-%m-%d"),
+                               "元": src.name})
+    print(f"係数を固定しました（{src.name} → {frozen_path().name}。最初の金額の余裕 k = {k:.2f}・付け替えの目標 m = {m:.2f}・"
+          f"最終は発走 {fb} 分前）。"
           "これ以降の prep はこの係数を使います")
     return 0
 
@@ -2838,6 +3431,8 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--no-backup", action="store_true", help="予備の買い目を作らない")
     q.add_argument("--k", type=float, default=None, help="この日だけ最初の金額の余裕 k を変える（既定は固定した値か 1.4）")
     q.add_argument("--m", type=float, default=None, help="この日だけ付け替えの目標 m を変える（既定は固定した値か 1.00）")
+    q.add_argument("--final-minutes", type=int, default=None,
+                   help="この日だけ最終の買い目を作る時刻（発走の何分前）を変える（既定は固定した値か 20）")
     q.set_defaults(func=_cmd_prep)
     q = sub.add_parser("update", help="当日：速報 → 当日の傾向 → 買い目 → シート（タスクスケジューラから）")
     q.add_argument("--date", default=None, help="YYYYMMDD（既定は今日）")
@@ -2880,16 +3475,23 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--since", default=None, help="この日以降（YYYYMMDD）")
     q.set_defaults(func=_cmd_drift)
     q = sub.add_parser("practice", help="v15 全レースの練習の記録（月曜に。集めた20分前ごろのオッズで F を作り、実際の払戻で答え合わせ）")
-    q.add_argument("--date", required=True, help="YYYYMMDD・カンマ区切り・範囲（20261107-20261115）")
+    q.add_argument("--date", default=None, help="YYYYMMDD・カンマ区切り・範囲（20261107-20261115）。--explain なら省略で全部の記録")
     q.add_argument("--refit", action="store_true", help="その日の prep.json が無いとき、保存した係数を使わず推定し直す")
+    q.add_argument("--explain", action="store_true", help="v19：当たったのに5万円に届かなかったレースの調査（記述だけ。記録は変えない）")
+    q.add_argument("--at", default="20", choices=["20", "10"],
+                   help="v19：10 なら、同じレースで20分前に作った F と10分前に作った F を比べる（ふだんの記録 records.csv は変えない）")
     q.add_argument("--sheet", action="store_true", help="シート「練習（全レース）」にも書く")
     q.set_defaults(func=_cmd_practice)
     q = sub.add_parser("freeze", help="係数を固定する（12月中旬）")
     q.add_argument("--source", default=None, help="固定する係数のファイル（既定は最新の coefs_*.json）")
     q.add_argument("--k", type=float, default=None, help="最初の金額の余裕 k（既定 1.4）")
     q.add_argument("--m", type=float, default=None, help="付け替えの目標 m（5万円 × m。既定 1.00）")
+    q.add_argument("--final-minutes", type=int, default=None, help="最終の買い目を作る時刻（発走の何分前。既定 20）")
     q.set_defaults(func=_cmd_freeze)
     sub.add_parser("unfreeze", help="係数の固定をやめる").set_defaults(func=_cmd_unfreeze)
+    q = sub.add_parser("decide-final", help="v19 最終の買い目を作る時刻（20分前か10分前か）を、結果を見る前に決めたルールで1回だけ決める（12月中旬）")
+    q.add_argument("--rerun-reason", default=None, help="やり直すときだけ：直した実装のバグの説明")
+    q.set_defaults(func=_cmd_decide_final)
     q = sub.add_parser("app-preview", help="v17 ウェブアプリの画面を、PC のブラウザで見る HTML に書き出す（シートには書かない）")
     q.add_argument("--date", default=None, help="YYYYMMDD：その日の保存した買い目から（省略すると各状態の見本）")
     q.add_argument("--now", default=None, help="この時刻の状態で（HHMM。--date と一緒に）")

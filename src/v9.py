@@ -660,13 +660,19 @@ def _parse_list(s: str) -> tuple[float, ...]:
     return tuple(float(x) for x in str(s).split(",") if x.strip())
 
 
+def _drift_samples_path(args):
+    """v19：--drift-at 10 なら10分前ごろ → 確定 のずれのサンプル、それ以外は今までどおり20分前ごろ。"""
+    from . import raceday
+    return raceday.drift10_samples_path() if getattr(args, "drift_at", "20") == "10" else raceday.drift_samples_path()
+
+
 def _rebalance_inputs(args, ks):
     """rebalance・rebalance-decide 共通：重賞と平場サンプルの F の買い目（k ごと）と、ずれのデータ。"""
     from . import raceday, realodds
     clock = v8._Clock()
     samples = None
     if args.drift == "data":
-        path = raceday.drift_samples_path()
+        path = _drift_samples_path(args)
         if path.exists():
             samples = pd.read_csv(path, encoding="utf-8-sig", compression="gzip")
     ds = v8._load(args, clock)
@@ -694,8 +700,8 @@ def _rebalance_inputs(args, ks):
 def _cmd_rebalance(args) -> int:
     from . import raceday
     ks = tuple(sorted(set(_parse_list(args.k)) | {MARGIN}))
-    if args.drift == "data" and not raceday.drift_samples_path().exists():
-        print(f"集めたずれのデータがありません（{raceday.drift_samples_path()}）。先に `py -m src.raceday drift` を。今回は仮の分布で引きます")
+    if args.drift == "data" and not _drift_samples_path(args).exists():
+        print(f"集めたずれのデータがありません（{_drift_samples_path(args)}）。先に `py -m src.raceday drift` を。今回は仮の分布で引きます")
     races, samples, clock = _rebalance_inputs(args, ks)
     if races is None:
         print("odds_targets.csv がありません（v8 odds-targets と fetch-odds --targets のあとに）")
@@ -790,8 +796,12 @@ def _cmd_rebalance_decide(args) -> int:
         print("k・m の決定はすでに行われています（やり直さない）:")
         print(prev.to_string(index=False))
         return 1
-    if not raceday.drift_samples_path().exists():
-        print(f"集めたずれのデータがありません（{raceday.drift_samples_path()}）。`py -m src.raceday drift` のあとに")
+    fb = raceday.decided_final_minutes()                     # v19：最終を10分前に決めていたら、10分前 → 確定 のずれで試算する
+    args.drift_at = "10" if fb == 10 else "20"
+    if fb is None:
+        print("（最終の時刻はまだ決めていない（`py -m src.raceday decide-final`）。20分前ごろ → 確定 のずれで試算します）")
+    if not _drift_samples_path(args).exists():
+        print(f"集めたずれのデータがありません（{_drift_samples_path(args)}）。`py -m src.raceday drift` のあとに")
         return 1
     args.drift = "data"
     ks = tuple(sorted(set(REBALANCE_K) | {MARGIN}))
@@ -807,6 +817,7 @@ def _cmd_rebalance_decide(args) -> int:
     c = decide_k_m(flat_table)
     lines = [f"平場：(k*, m*) = ({c['k*']:.1f}, {c['m*']:.2f})、m₁.₄ = {c['m1.4']:.2f}"]
     row = {"実行日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ずれの出どころ": DECIDE_DRIFT_SOURCE,
+           "ずれの時刻": f"{args.drift_at}分前 → 確定",
            "k*": c["k*"], "m*": c["m*"], "m1.4": c["m1.4"], "やり直しの理由": args.rerun_reason or ""}
     sampler = None
     if not c["重賞で確かめる"]:
@@ -827,7 +838,8 @@ def _cmd_rebalance_decide(args) -> int:
         row.update({"決めた k": c["k*"] if adopt else MARGIN, "決めた m": c["m*"] if adopt else c["m1.4"],
                     "重賞の比較": f"差 {d['差']:+.4f} [{d['差下限']:+.4f}, {d['差上限']:+.4f}]"})
     # v18：出力の最初に、使ったずれの出どころと、重賞・平場・仮の分布から何個引いたか
-    print(f"ずれの出どころ: --drift-source {DECIDE_DRIFT_SOURCE}（{DRIFT_SOURCE_LABELS[DECIDE_DRIFT_SOURCE]}）")
+    print(f"ずれの出どころ: --drift-source {DECIDE_DRIFT_SOURCE}（{DRIFT_SOURCE_LABELS[DECIDE_DRIFT_SOURCE]}）・"
+          f"{args.drift_at}分前ごろ → 確定 のずれ")
     print(f"  平場で選ぶ段で引いた数: {smp[0].used_text()}")
     if sampler is not None:
         print(f"  重賞で確かめる段で引いた数: {sampler.used_text()}")
@@ -866,6 +878,8 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("--drift-source", default="all", choices=list(DRIFT_SOURCES),
                    help="--drift data のときの r の出どころ：all=全部のサンプル（既定・今までの動き）/ "
                         "jusho=重賞のサンプル（券種 × 帯の重賞が 30 個未満なら平場、平場も足りなければ仮の分布。rebalance-decide はこれ）")
+    q.add_argument("--drift-at", default="20", choices=["20", "10"],
+                   help="v19：--drift data のときのずれの時刻（20=20分前ごろ → 確定・既定 / 10=10分前ごろ → 確定）")
     q.add_argument("--draws", type=int, default=10, help="ずれありで r を引く回数（平均を出す。既定 10）")
     q.add_argument("--seed", type=int, default=0, help="乱数の種（既定 0）")
     q.add_argument("--k", default="1.4", help="最初の金額の余裕 k（カンマ区切り。例 1.0,1.1,1.2,1.3,1.4。1.4 は必ず入る）")

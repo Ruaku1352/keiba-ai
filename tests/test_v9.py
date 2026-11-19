@@ -329,3 +329,12 @@ def test_drift_source_same_key_same_draw():
     samples = pd.DataFrame({"区分": "重賞", "券種": "馬連", "帯": "10〜50倍", "r": np.linspace(0.5, 1.5, 40)})
     a = v9.DriftSampler("data", samples, seed=4, source="jusho").draw("馬連", 20.0, key=("R", 0, "馬連", (1, 2)))
     assert v9.DriftSampler("data", samples, seed=4, source="jusho").draw("馬連", 20.0, key=("R", 0, "馬連", (1, 2))) == a
+
+
+def test_drift_samples_path_follows_final_minutes():
+    """v19：--drift-at 10 なら10分前ごろ → 確定 のずれのサンプル。"""
+    from types import SimpleNamespace
+    from src import raceday
+    assert v9._drift_samples_path(SimpleNamespace(drift_at="10")) == raceday.drift10_samples_path()
+    assert v9._drift_samples_path(SimpleNamespace(drift_at="20")) == raceday.drift_samples_path()
+    assert v9._drift_samples_path(SimpleNamespace()) == raceday.drift_samples_path()
