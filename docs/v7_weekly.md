@@ -72,7 +72,7 @@ v6 の実測：train・predict・replay とも約2分。results も約2分（生
    `.gitignore` 済みなのでコミットされない）:
    ```json
    {
-     "google_service_account_file": "C:\\Users\\tensu\\keiba\\secrets\\google_service_account.json",
+     "google_service_account_file": "C:\\Users\\YOUR_NAME\\keiba\\secrets\\google_service_account.json",
      "spreadsheet_id": "（シートの URL の /d/ と /edit の間）",
      "entry_sheet": "評価入力",
      "record_sheet": "記録"

@@ -148,7 +148,7 @@ PowerShell で、**上から1つずつ**実行して結果を確認する。
 ### 0. 準備
 
 ```powershell
-cd C:\Users\tensu\keiba\Keiba_kaggle
+cd C:\Users\YOUR_NAME\keiba\Keiba_kaggle
 git pull
 py -m pip install -r requirements.txt
 py -m pytest tests -q
@@ -159,7 +159,7 @@ py -m pytest tests -q
 ### 1. SDK の場所を設定してテスト
 
 ```powershell
-$env:JVSDK_DIR = "C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
+$env:JVSDK_DIR = "C:\Users\YOUR_NAME\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit"
 py -m pytest tests -q
 ```
 
@@ -178,12 +178,12 @@ py -m src.jvlink check
 
 ```
 Python      : 3.14.x (64bit)
-JVSDK_DIR   : C:\Users\tensu\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit
+JVSDK_DIR   : C:\Users\YOUR_NAME\keiba\JRA-VAN Data Lab. SDK Ver5.0.0_64bit
 構造体      : ...\JV-Data構造体\Python版\JVData_Struct.py  存在=True
   RA: JV_RA_RACE  保存列数=60
   SE: JV_SE_RACE_UMA  保存列数=48
   HR: JV_HR_PAY  保存列数=85
-保存先      : C:\Users\tensu\keiba\Keiba_kaggle\data\jvlink
+保存先      : C:\Users\YOUR_NAME\keiba\Keiba_kaggle\data\jvlink
 JVInit      : 0（正常）
 ```
 
